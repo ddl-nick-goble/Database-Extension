@@ -125,7 +125,26 @@ def poll_until_running(app_id: str, deadline_s: int = 300) -> dict:
 def verify_http(app_url: str) -> None:
     headers = {"X-Domino-Api-Key": API_KEY}
     base = app_url.rstrip("/")
-    for path in ("/healthz", "/api/status", "/"):
+    # Domino flips the App's status to Running before the gunicorn worker
+    # is actually listening on 8888. The reverse proxy returns 502 in that
+    # window. Wait for /healthz to return 200 before declaring success.
+    log("  waiting for /healthz to return 200...")
+    deadline = time.time() + 120
+    last_code = 0
+    while time.time() < deadline:
+        try:
+            r = requests.get(base + "/healthz", headers=headers, timeout=10, allow_redirects=False)
+            last_code = r.status_code
+            if r.status_code == 200 and r.text.strip().startswith("ok"):
+                log(f"  /healthz → 200 ok")
+                break
+        except requests.RequestException as e:
+            last_code = -1
+            log(f"  /healthz transient error: {e}")
+        time.sleep(3)
+    else:
+        raise SystemExit(f"App /healthz never returned 200 within 120s (last={last_code})")
+    for path in ("/api/status",):
         r = requests.get(base + path, headers=headers, timeout=20, allow_redirects=False)
         snippet = r.text[:120].replace("\n", " ")
         log(f"  GET {path} → {r.status_code}  {snippet}")
@@ -183,7 +202,10 @@ def psql_query(query: str) -> str:
 # 5. Verify snapshot landed
 # --------------------------------------------------------------------------
 def verify_snapshot_path() -> None:
-    snap_dir = Path(DOMINO_DATASETS_DIR) / PROJECT_NAME / f"db-{DB_NAME}" / "snapshots"
+    # The wizard prefixes user-supplied names with "pg-", so the dataset
+    # subdir matches the App's full name (pg-<DB_NAME>).
+    full_name = f"pg-{DB_NAME}"
+    snap_dir = Path(DOMINO_DATASETS_DIR) / PROJECT_NAME / f"db-{full_name}" / "snapshots"
     log(f"  looking at {snap_dir}")
     deadline = time.time() + 90  # snapshotIntervalMin=1, so up to ~90s
     while time.time() < deadline:

@@ -27,7 +27,14 @@ log = logging.getLogger("wizard")
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
 
-DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR", "/mnt/code/dbapps"))
+# Per-DB config files live in the project's default dataset so the DB
+# Apps (which boot in the same project) can read them without depending
+# on /mnt/code being THIS repo. Same default as dbapp.lifecycle.
+_DD_CONFIGS_DEFAULT = (
+    f"{os.environ.get('DOMINO_DATASETS_DIR', '/mnt/data')}/"
+    f"{os.environ.get('DOMINO_PROJECT_NAME', 'default')}/_dd_configs"
+)
+DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR", _DD_CONFIGS_DEFAULT))
 DBAPPS_DIR.mkdir(parents=True, exist_ok=True)
 
 

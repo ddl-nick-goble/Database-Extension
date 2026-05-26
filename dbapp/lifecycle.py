@@ -26,7 +26,16 @@ import sys
 import time
 from pathlib import Path
 
-DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR", "/mnt/code/dbapps"))
+def _default_dbapps_dir() -> Path:
+    """Where per-DB config files live. Default is a subdir of the project's
+    default dataset so any project using dd-postgres-app can read configs
+    without depending on /mnt/code being this repo."""
+    base = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
+    project = os.environ.get("DOMINO_PROJECT_NAME", "default")
+    return Path(base) / project / "_dd_configs"
+
+
+DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR")) if os.environ.get("DD_DBAPPS_DIR") else _default_dbapps_dir()
 
 
 def find_config() -> dict:
@@ -65,16 +74,19 @@ def find_config() -> dict:
             f"[lifecycle] DOMINO_APP_NAME={app_name} but {p} missing — falling back to newest .json\n"
         )
 
-    candidates = sorted(
-        DBAPPS_DIR.glob("*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    # Look in the primary dir, then the legacy /mnt/code/dbapps/ for dev iteration.
+    search_dirs = [DBAPPS_DIR, Path("/mnt/code/dbapps")]
+    candidates: list[Path] = []
+    for d in search_dirs:
+        if d.exists():
+            candidates.extend(d.glob("*.json"))
+    candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         raise RuntimeError(
-            f"No config file found in {DBAPPS_DIR}. Did the wizard fail to write one?"
+            f"No config file found in any of {[str(d) for d in search_dirs]}. "
+            f"Did the wizard fail to write one?"
         )
-    sys.stderr.write(f"[lifecycle] config from most-recent fallback: {candidates[0].name}\n")
+    sys.stderr.write(f"[lifecycle] config from most-recent fallback: {candidates[0]}\n")
     return json.loads(candidates[0].read_text())
 
 
@@ -296,7 +308,18 @@ def schedule_snapshotter(cfg: dict) -> None:
     can chmod 600 it.
     """
     interval = cfg.get("snapshot_interval_min", 60)
-    script = f"/mnt/code/snapshotter/snapshot_{cfg['engine']}.py"
+    # Snapshotter lives next to dbapp/ — /opt/dd/snapshotter/ when baked
+    # into the env, /mnt/code/snapshotter/ for in-repo dev.
+    for candidate in (
+        f"/opt/dd/snapshotter/snapshot_{cfg['engine']}.py",
+        f"/mnt/code/snapshotter/snapshot_{cfg['engine']}.py",
+    ):
+        if Path(candidate).exists():
+            script = candidate
+            break
+    else:
+        sys.stderr.write(f"[lifecycle] WARN: snapshotter not found for engine={cfg['engine']}\n")
+        return
 
     env_path = Path("/var/log/dd/snapshotter.env")
     env_path.parent.mkdir(parents=True, exist_ok=True)

@@ -8,6 +8,18 @@
 #   :8978  pgweb (Postgres admin UI, internal — fronted at /admin/)
 #   :5432  Postgres (internal only)
 #
+# What lives in the image (so dd-postgres-app works in ANY Domino project,
+# not just Database-Extension):
+#   /opt/dd/dbapp/         — lifecycle.py + router.py + dispatcher app.sh
+#   /opt/dd/snapshotter/   — snapshot_postgres.py
+#   /usr/local/bin/pgweb   — Go binary
+#   postgres-16            — apt
+#
+# The Domino App's entry script is still `./app.sh` in the project's
+# /mnt/code (Domino's convention). For DB-hosting projects, that file is a
+# one-line shim: `exec /opt/dd/app.sh`. Any project can copy that single
+# line and start hosting databases — no other repo dependency.
+#
 # Each RUN is a single line — Domino's UI eats `\` continuations across
 # pipes. No probe commands (--version/--help). USER root is required at
 # the top — the DSE base image runs as a non-root user by default and
@@ -21,8 +33,10 @@ RUN curl -fsSL -o /tmp/pgweb.zip https://github.com/sosedoff/pgweb/releases/down
 
 RUN pip install --no-cache-dir 'flask>=3.0' 'flask-sock>=0.7' 'flask-cors>=4.0' 'gunicorn>=21.2' 'requests>=2.31' 'websockets==12.0' 'httpx==0.27.0'
 
-RUN mkdir -p /mnt/db /var/log/dd && chown -R ubuntu:ubuntu /mnt/db /var/log/dd
+RUN mkdir -p /opt/dd && curl -fsSL https://codeload.github.com/ddl-nick-goble/Database-Extension/tar.gz/refs/heads/main -o /tmp/dd-src.tar.gz && tar -xzf /tmp/dd-src.tar.gz -C /tmp && cp -r /tmp/Database-Extension-main/dbapp /opt/dd/dbapp && cp -r /tmp/Database-Extension-main/snapshotter /opt/dd/snapshotter && cp /tmp/Database-Extension-main/dbapp/app.sh /opt/dd/app.sh && chmod +x /opt/dd/app.sh && rm -rf /tmp/dd-src.tar.gz /tmp/Database-Extension-main
 
-ENV DD_ROLE=postgres DD_ENGINE=postgres
+RUN mkdir -p /mnt/db /mnt/db/sock /var/log/dd && chown -R ubuntu:ubuntu /mnt/db /var/log/dd /opt/dd
+
+ENV DD_ROLE=postgres DD_ENGINE=postgres DD_OPT_DIR=/opt/dd
 
 USER ubuntu

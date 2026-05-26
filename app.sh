@@ -55,8 +55,19 @@ pip install -q -r requirements.txt
 # ── Dispatch ─────────────────────────────────────────────────────────────
 case "$DD_ROLE" in
     postgres|mongo|database)
-        echo "DD_ROLE=$DD_ROLE — launching DB app router on :$PORT"
-        exec bash /mnt/code/dbapp/app.sh
+        # Prefer /opt/dd/ (baked into the dd-postgres-app env image) so
+        # this works in ANY Domino project, not just Database-Extension.
+        # Fall back to /mnt/code/dbapp/ for in-repo dev iteration.
+        if [ -x /opt/dd/app.sh ]; then
+            echo "DD_ROLE=$DD_ROLE — launching DB app from /opt/dd on :$PORT"
+            exec bash /opt/dd/app.sh
+        elif [ -x /mnt/code/dbapp/app.sh ]; then
+            echo "DD_ROLE=$DD_ROLE — launching DB app from /mnt/code/dbapp on :$PORT"
+            exec bash /mnt/code/dbapp/app.sh
+        else
+            echo "ERROR: no DB launcher at /opt/dd/app.sh or /mnt/code/dbapp/app.sh" >&2
+            exit 2
+        fi
         ;;
     wizard|"")
         echo "DD_ROLE=wizard — launching Domino Databases wizard on :$PORT"

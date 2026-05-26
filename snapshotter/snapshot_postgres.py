@@ -28,7 +28,13 @@ PG_PORT = os.environ.get("DD_PG_PORT", "5432")
 PG_USER = os.environ.get("DD_PG_USER", "domino")
 PG_PASSWORD = os.environ.get("DD_PG_PASSWORD", "")
 
-SNAPSHOT_ROOT = Path(f"/domino/datasets/db-{DB_ID}")
+# Snapshot path. lifecycle.schedule_snapshotter() pins this via the env-file
+# it writes; fall back to the project's default-dataset subdir if unset.
+_DEFAULT_ROOT = (
+    f"{os.environ.get('DOMINO_DATASETS_DIR', '/mnt/data')}/"
+    f"{os.environ.get('DOMINO_PROJECT_NAME', 'default')}/db-{DB_ID}"
+)
+SNAPSHOT_ROOT = Path(os.environ.get("DD_SNAPSHOT_DIR", _DEFAULT_ROOT))
 SNAPSHOTS = SNAPSHOT_ROOT / "snapshots"
 WAL = SNAPSHOT_ROOT / "wal"
 
@@ -60,26 +66,35 @@ def basebackup(dest: Path) -> None:
 
 
 def trigger_dataset_snapshot(tag: str) -> None:
-    """Ask Domino to take a dataset snapshot of /domino/datasets/db-<id>.
-    No-ops if we can't find the dataset id — the on-disk snapshot is still
-    durable, this just gives us versioning."""
-    if not API_HOST or not API_KEY:
-        log("no API credentials available — skipping dataset snapshot")
+    """Ask Domino to snapshot the project's default dataset.
+
+    Our snapshot bytes land in a subdir of the project's default dataset
+    (DOMINO_DATASETS_DIR/<project>/db-<id>/), so versioning that dataset
+    captures them. No-ops if we can't find the dataset — the on-disk bytes
+    are still durable, this just adds named version history.
+    """
+    if not API_HOST or not API_KEY or not PROJECT_ID:
+        log("no API credentials/project id — skipping dataset snapshot")
         return
     try:
         with httpx.Client(base_url=API_HOST, headers={"X-Domino-Api-Key": API_KEY}, timeout=15) as c:
-            # Find the dataset for this project + name.
             r = c.get("/api/datasetrw/v2/datasets", params={"projectId": PROJECT_ID})
             r.raise_for_status()
-            datasets = r.json().get("data", r.json())
-            target = next((d for d in datasets if d.get("name") == f"db-{DB_ID}"), None)
-            if not target:
-                log(f"dataset db-{DB_ID} not found — skip dataset snapshot")
+            # Response shape: {"datasets": [{"dataset": {...}}, ...], "metadata": ...}
+            # The ?projectId filter is ignored on some Domino builds — filter
+            # client-side so we don't snapshot somebody else's dataset.
+            wrapped = r.json().get("datasets", [])
+            mine = [w.get("dataset", {}) for w in wrapped
+                    if w.get("dataset", {}).get("projectId") == PROJECT_ID]
+            if not mine:
+                log(f"no dataset found for project {PROJECT_ID} — skip dataset snapshot")
                 return
-            ds_id = target.get("id") or target.get("datasetId")
+            ds_id = mine[0].get("id")
             r = c.post(f"/api/datasetrw/v1/datasets/{ds_id}/snapshots", json={"tag": tag})
             if r.status_code >= 400:
                 log(f"snapshot API returned {r.status_code}: {r.text}")
+            else:
+                log(f"dataset snapshot tagged {tag} on dataset {ds_id}")
     except Exception as e:
         log(f"dataset snapshot failed: {e}")
 

@@ -147,11 +147,30 @@ def create_app(
     })
 
 
-def start_app(app_id: str) -> dict:
-    """Launch the app instance. On this Domino, /api/apps/beta/...start is
-    gated by a feature flag; the v4 modelProducts endpoint is the working
-    path (apps and modelProducts share IDs)."""
-    return _post(f"/v4/modelProducts/{app_id}/start", json={})
+def start_app(
+    app_id: str,
+    environment_id: str | None = None,
+    hardware_tier_id: str | None = None,
+) -> dict:
+    """Launch the app instance.
+
+    Critical: /api/apps/beta/apps create() ignores the version.environmentId
+    we pass — the auto-created currentVersion uses the project's default
+    env (DSE). We MUST override at start time by passing environmentId +
+    hardwareTierId in the /v4/modelProducts/<id>/start body; the start
+    endpoint then provisions a new currentInstance bound to the right env.
+    Confirmed empirically against cloud-dogfood; the bare `{}` form silently
+    starts with the DSE.
+
+    The v4 path is used (not /api/apps/beta/.../start) because the latter
+    is feature-flag-gated on this Domino build.
+    """
+    body: dict = {}
+    if environment_id:
+        body["environmentId"] = environment_id
+    if hardware_tier_id:
+        body["hardwareTierId"] = hardware_tier_id
+    return _post(f"/v4/modelProducts/{app_id}/start", json=body)
 
 
 def get_app(app_id: str) -> dict:
@@ -165,8 +184,13 @@ def stop_app(app_id: str) -> dict:
 
 
 def delete_app(app_id: str) -> None:
-    """Stop instances and delete the app object."""
-    stop_app(app_id)
+    """Stop instances and delete the app object. Tolerates "no active run"
+    (404) from stop — that just means the App is already stopped."""
+    try:
+        stop_app(app_id)
+    except DominoApiError as e:
+        if e.status != 404:
+            raise
     _delete(f"/api/apps/beta/apps/{app_id}")
 
 

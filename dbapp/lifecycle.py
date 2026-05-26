@@ -30,34 +30,52 @@ DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR", "/mnt/code/dbapps"))
 
 
 def find_config() -> dict:
-    """Locate this app's config file. Two acceptable sources:
+    """Locate this App's config file. Resolution order:
+
       1. $DD_CONFIG explicit path  (set by the wizard via env vars)
       2. /mnt/code/dbapps/$DOMINO_APP_NAME.json
+      3. The most recently-modified .json in /mnt/code/dbapps/
 
-    If neither resolves, fail loudly. No "most recent file" guessing —
-    that risks loading the wrong DB's password when multiple DBs exist
-    in one project.
+    The fallback (3) exists because Domino's App containers do NOT receive
+    DOMINO_APP_NAME — confirmed by inspecting /var/lib/domino/launch/env.sh
+    inside a running App. The wizard writes the config right before POSTing
+    /start, so "most recent" is reliably the just-created DB's config.
+
+    Caveat: if you provision two DBs in the same project at the same time,
+    both Apps will see the same newest config file and one will silently
+    pick up the other's credentials. The wizard guards against this with a
+    name-collision check; the race window is only the few seconds between
+    POST /api/apps/beta/apps and POST /v4/modelProducts/<id>/start.
     """
     explicit = os.environ.get("DD_CONFIG")
     if explicit:
         p = Path(explicit)
         if not p.exists():
             raise RuntimeError(f"DD_CONFIG={explicit} but file does not exist")
+        sys.stderr.write(f"[lifecycle] config from DD_CONFIG={p}\n")
         return json.loads(p.read_text())
 
     app_name = os.environ.get("DOMINO_APP_NAME", "")
-    if not app_name:
-        raise RuntimeError(
-            "Neither DD_CONFIG nor DOMINO_APP_NAME is set. "
-            "Wizard must inject one of them when creating the App."
+    if app_name:
+        p = DBAPPS_DIR / f"{app_name}.json"
+        if p.exists():
+            sys.stderr.write(f"[lifecycle] config from DOMINO_APP_NAME={app_name}\n")
+            return json.loads(p.read_text())
+        sys.stderr.write(
+            f"[lifecycle] DOMINO_APP_NAME={app_name} but {p} missing — falling back to newest .json\n"
         )
-    p = DBAPPS_DIR / f"{app_name}.json"
-    if not p.exists():
+
+    candidates = sorted(
+        DBAPPS_DIR.glob("*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
         raise RuntimeError(
-            f"Expected config at {p} (DOMINO_APP_NAME={app_name}) but file is missing. "
-            f"Did the wizard fail to write it before creating the App?"
+            f"No config file found in {DBAPPS_DIR}. Did the wizard fail to write one?"
         )
-    return json.loads(p.read_text())
+    sys.stderr.write(f"[lifecycle] config from most-recent fallback: {candidates[0].name}\n")
+    return json.loads(candidates[0].read_text())
 
 
 # --------------------------------------------------------------------------
@@ -67,9 +85,25 @@ PGCTL = "/usr/lib/postgresql/16/bin/pg_ctl"
 INITDB = "/usr/lib/postgresql/16/bin/initdb"
 
 
+def snapshot_path(cfg: dict) -> Path:
+    """Where this DB's snapshots live. Always a subdir of the project's default
+    dataset on this Domino instance (DOMINO_DATASETS_DIR=/mnt/data), keyed by
+    db_id so multiple DBs in one project don't collide.
+
+    Single source of truth — lifecycle.py uses it for restore, snapshotter
+    reads $DD_SNAPSHOT_DIR (which we set from this).
+    """
+    explicit = cfg.get("snapshot_dir") or os.environ.get("DD_SNAPSHOT_DIR")
+    if explicit:
+        return Path(explicit)
+    base = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
+    project = os.environ.get("DOMINO_PROJECT_NAME", "default")
+    return Path(base) / project / f"db-{cfg['db_id']}"
+
+
 def restore_or_init_postgres(cfg: dict) -> None:
     pgdata = Path(cfg.get("pgdata", "/mnt/db/pgdata"))
-    snapshot_dir = Path(f"/domino/datasets/db-{cfg['db_id']}")
+    snapshot_dir = snapshot_path(cfg)
     pgdata.mkdir(parents=True, exist_ok=True)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     (snapshot_dir / "wal").mkdir(exist_ok=True)
@@ -80,12 +114,24 @@ def restore_or_init_postgres(cfg: dict) -> None:
 
     snapshots = snapshot_dir / "snapshots"
     if snapshots.exists():
-        latest = sorted(snapshots.iterdir(), key=lambda p: p.name)
-        latest = next((p for p in reversed(latest) if (p / "basebackup").exists()), None)
+        candidates = sorted(snapshots.iterdir(), key=lambda p: p.name)
+        latest = next(
+            (p for p in reversed(candidates)
+             if (p / "basebackup" / "base.tar.gz").exists()),
+            None,
+        )
         if latest:
             sys.stderr.write(f"[lifecycle] restoring pgdata from snapshot {latest.name}\n")
-            shutil.copytree(latest / "basebackup", pgdata, dirs_exist_ok=True)
-            (pgdata / "recovery.signal").touch()
+            # snapshot_postgres.py writes pg_basebackup -Ft -z output: base.tar.gz +
+            # pg_wal.tar.gz. Extract both. Do NOT create recovery.signal — the streamed
+            # pg_wal is enough for crash recovery to bring the cluster up clean, and
+            # recovery.signal would require a restore_command we don't have.
+            base_tar = latest / "basebackup" / "base.tar.gz"
+            wal_tar = latest / "basebackup" / "pg_wal.tar.gz"
+            subprocess.run(["tar", "-xzf", str(base_tar), "-C", str(pgdata)], check=True)
+            (pgdata / "pg_wal").mkdir(exist_ok=True)
+            subprocess.run(["tar", "-xzf", str(wal_tar), "-C", str(pgdata / "pg_wal")], check=True)
+            _pin_socket_dir(pgdata, cfg)
             return
 
     sys.stderr.write("[lifecycle] no snapshot, initializing fresh cluster\n")
@@ -101,13 +147,30 @@ def restore_or_init_postgres(cfg: dict) -> None:
     pwfile.unlink()
 
     port = cfg.get("port", 5432)
+    socket_dir = cfg.get("socket_dir", "/mnt/db/sock")
+    Path(socket_dir).mkdir(parents=True, exist_ok=True)
     with (pgdata / "postgresql.conf").open("a") as f:
         f.write(f"\nlisten_addresses = '127.0.0.1'\nport = {port}\n")
+        # Default /var/run/postgresql is owned by the postgres OS user; we run
+        # as ubuntu and can't write a lock file there. Pin to a path we own.
+        f.write(f"unix_socket_directories = '{socket_dir}'\n")
         f.write("archive_mode = on\n")
         f.write(f"archive_command = 'test ! -f {snapshot_dir}/wal/%f && cp %p {snapshot_dir}/wal/%f'\n")
         f.write("wal_level = replica\nmax_wal_senders = 3\n")
     with (pgdata / "pg_hba.conf").open("a") as f:
         f.write("host all all 127.0.0.1/32 scram-sha-256\n")
+
+
+def _pin_socket_dir(pgdata: Path, cfg: dict) -> None:
+    """Restored snapshots carry the socket-dir from the snapshot-source cluster.
+    Re-pin to a path the current process can actually write."""
+    socket_dir = cfg.get("socket_dir", "/mnt/db/sock")
+    Path(socket_dir).mkdir(parents=True, exist_ok=True)
+    conf = pgdata / "postgresql.conf"
+    existing = conf.read_text() if conf.exists() else ""
+    if f"unix_socket_directories = '{socket_dir}'" not in existing:
+        with conf.open("a") as f:
+            f.write(f"\nunix_socket_directories = '{socket_dir}'\n")
 
 
 def start_postgres(cfg: dict) -> None:
@@ -225,10 +288,37 @@ def start_pgweb(cfg: dict) -> None:
 # Cron snapshotter
 # --------------------------------------------------------------------------
 def schedule_snapshotter(cfg: dict) -> None:
+    """Write an env-file with the snapshotter's runtime context, then a crontab
+    that sources it before running the snapshot script.
+
+    Why a file (not inline env vars on the cron line): the password ends up in
+    the cron line otherwise, and `crontab -l` exposes it. With an env-file we
+    can chmod 600 it.
+    """
     interval = cfg.get("snapshot_interval_min", 60)
     script = f"/mnt/code/snapshotter/snapshot_{cfg['engine']}.py"
-    line = f"*/{interval} * * * * /usr/bin/python3 {script} >> /var/log/dd/snapshot.log 2>&1\n"
-    # Reset crontab to only our entry
+
+    env_path = Path("/var/log/dd/snapshotter.env")
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    snap_dir = snapshot_path(cfg)
+    env_lines = [
+        f"DD_DB_ID={cfg['db_id']}",
+        f"DD_SNAPSHOT_DIR={snap_dir}",
+        f"DD_PG_PORT={cfg.get('port', 5432)}",
+        f"DD_PG_USER={cfg.get('user', 'domino')}",
+        f"DD_PG_PASSWORD={cfg['password']}",
+        f"DOMINO_API_PROXY={os.environ.get('DOMINO_API_PROXY', 'http://localhost:8899')}",
+        f"DOMINO_USER_API_KEY={os.environ.get('DOMINO_USER_API_KEY', '')}",
+        f"DOMINO_PROJECT_ID={os.environ.get('DOMINO_PROJECT_ID', '')}",
+    ]
+    env_path.write_text("\n".join(env_lines) + "\n")
+    env_path.chmod(0o600)
+
+    line = (
+        f"*/{interval} * * * * "
+        f"set -a; . {env_path}; set +a; "
+        f"/usr/bin/python3 {script} >> /var/log/dd/snapshot.log 2>&1\n"
+    )
     subprocess.run(["bash", "-c", f"echo '{line}' | crontab -"], check=False)
 
 

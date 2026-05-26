@@ -175,8 +175,11 @@ def api_create_database():
     log.info("created app id=%s — starting", a.get("id"))
 
     # 3. Start it — create only makes the App object, doesn't launch the container.
+    #    Pass env+hw explicitly; the create call's version.environmentId is
+    #    silently dropped on this Domino build, so without the override the
+    #    container would launch against the project's default DSE.
     try:
-        dapi.start_app(a["id"])
+        dapi.start_app(a["id"], environment_id=env_id, hardware_tier_id=hw_id)
         a["status"] = "Starting"
     except dapi.DominoApiError as e:
         log.warning("start failed: %s", e)
@@ -208,8 +211,23 @@ def api_stop_database(app_id: str):
 
 @app.route("/api/databases/<app_id>/start", methods=["POST"])
 def api_start_database(app_id: str):
+    # Resume must re-pass env+hw because /start without them defaults to the
+    # project's DSE (same bug as create — see domino_api.start_app). Read
+    # from request body if the caller provided overrides; else recover them
+    # from the App's currentVersion (last-known good).
+    body = request.get_json(silent=True) or {}
+    env_id = body.get("environmentId")
+    hw_id = body.get("hardwareTierId")
+    if not (env_id and hw_id):
+        try:
+            app_doc = dapi.get_app(app_id)
+            cv = app_doc.get("currentVersion", {})
+            env_id = env_id or cv.get("environmentId")
+            hw_id = hw_id or cv.get("hardwareTierId")
+        except Exception:
+            pass
     try:
-        result = dapi.start_app(app_id)
+        result = dapi.start_app(app_id, environment_id=env_id, hardware_tier_id=hw_id)
     except dapi.DominoApiError as e:
         return jsonify({"error": "start failed", "status": e.status,
                         "dominoBody": e.body[:1500]}), 502

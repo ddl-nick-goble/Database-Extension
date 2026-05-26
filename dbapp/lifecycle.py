@@ -331,22 +331,34 @@ def schedule_snapshotter(cfg: dict) -> None:
 
     interval_sec = max(60, interval_min * 60)
     log_path = "/var/log/dd/snapshot.log"
+    # Diagnostic markers in the dataset so we can confirm execution from
+    # outside the container.
+    marker_dir = snap_dir / "_diag"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    (marker_dir / "schedule_called.txt").write_text(
+        f"schedule_snapshotter ran at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        f"interval_sec={interval_sec}\nscript={script}\n"
+    )
     loop_cmd = (
+        f"echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) loop-start\" > {marker_dir}/loop_start.txt; "
         f"sleep 5; "  # let postgres settle before the first snapshot
         f"while true; do "
+        f"  echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) tick\" >> {marker_dir}/ticks.txt; "
         f"  /usr/bin/python3 {script} >> {log_path} 2>&1; "
+        f"  echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) rc=$?\" >> {marker_dir}/ticks.txt; "
         f"  sleep {interval_sec}; "
         f"done"
     )
     with open(log_path, "a") as logf:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             ["bash", "-c", loop_cmd],
             env=env,
             stdout=logf, stderr=logf,
             start_new_session=True,   # survive parent exit
             close_fds=True,
         )
-    sys.stderr.write(f"[lifecycle] snapshotter loop started (every {interval_sec}s, script={script})\n")
+    (marker_dir / "spawned.txt").write_text(f"Popen returned pid={proc.pid}\n")
+    sys.stderr.write(f"[lifecycle] snapshotter loop started pid={proc.pid} (every {interval_sec}s, script={script})\n")
 
 
 # --------------------------------------------------------------------------

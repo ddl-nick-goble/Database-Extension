@@ -195,21 +195,43 @@ def delete_app(app_id: str) -> None:
 
 
 def app_url(app: dict) -> str:
-    """Best-effort URL where the user can open the app.
+    """URL where clients (including our /wire WS tunnel) can reach the App.
 
-    Preference order (works for both Apps API + modelProducts shapes):
-      1. runningAppUrl  — present when an instance is live (modelProducts)
-      2. openUrl        — always present on modelProducts; opens the
-                          launcher even if the app isn't running
-      3. url            — present on /api/apps/beta/apps responses
-    Relative paths are prefixed with PUBLIC_HOST.
+    On this Domino there are TWO surfaces:
+
+      `https://apps.<domain>/apps-internal/<appId>/`
+         → app's response directly; honors X-Domino-Api-Key; WS upgrades work.
+
+      `https://<domain>/u/<owner>/<project>/apps/<instId>/latest`
+         → browser-only; Domino wraps with a 70KB HTML auth/loading page.
+           HTTP-level WS upgrade still hits the wrapper, not the app.
+
+    We need the first one for programmatic clients (psql tunnel, healthchecks,
+    etc.) so the preference order is:
+      1. `url`         — already the apps.<domain> absolute URL on this build
+      2. `openUrl`     — relative `/apps-internal/<id>/`, prepended with
+                          PUBLIC_HOST's apps-subdomain form
+      3. `runningAppUrl` — absolute browser URL (last resort)
     """
-    for key in ("runningAppUrl", "openUrl", "url"):
-        u = app.get(key)
-        if not u:
-            continue
-        if u.startswith("http"):
-            return u
+    direct = app.get("url")
+    if direct and direct.startswith("http"):
+        return direct.rstrip("/")
+
+    open_path = app.get("openUrl")
+    if open_path and PUBLIC_HOST:
+        # PUBLIC_HOST = https://cloud-dogfood.domino.tech
+        # apps-host    = https://apps.cloud-dogfood.domino.tech
+        host = PUBLIC_HOST.rstrip("/")
+        if host.startswith("https://") and not host.startswith("https://apps."):
+            host = "https://apps." + host[len("https://"):]
+        elif host.startswith("http://") and not host.startswith("http://apps."):
+            host = "http://apps." + host[len("http://"):]
+        return f"{host}{open_path}".rstrip("/")
+
+    running = app.get("runningAppUrl")
+    if running:
+        if running.startswith("http"):
+            return running.rstrip("/")
         if PUBLIC_HOST:
-            return f"{PUBLIC_HOST.rstrip('/')}{u}"
+            return f"{PUBLIC_HOST.rstrip('/')}{running}".rstrip("/")
     return ""

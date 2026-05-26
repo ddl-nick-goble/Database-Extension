@@ -347,7 +347,7 @@ def schedule_snapshotter(cfg: dict) -> None:
         f"sleep 5; "
         f"while true; do "
         f"  echo \"--- $(date -u +%Y-%m-%dT%H:%M:%SZ) tick ---\" >> {out_log}; "
-        f"  /usr/bin/python3 {script} >> {out_log} 2>&1; "
+        f"  python3 {script} >> {out_log} 2>&1; "
         f"  echo \"--- rc=$? ---\" >> {out_log}; "
         f"  echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) tick rc=$?\" >> {marker_dir}/ticks.txt; "
         f"  sleep {interval_sec}; "

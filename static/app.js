@@ -105,7 +105,7 @@ function renderTable() {
     });
 
     if (!rows.length) {
-        tbody.innerHTML = `<tr><td colspan="6" class="muted">No databases yet. Click <b>+ New Database</b> to create one.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="7" class="muted">No databases yet. Click <b>+ New Database</b> to create one.</td></tr>`;
         return;
     }
 
@@ -113,20 +113,30 @@ function renderTable() {
         const eb = db.engine === "postgres" ? "badge-postgres" : db.engine === "mongo" ? "badge-mongo" : "";
         const sLower = String(db.status).toLowerCase();
         const sb =
-            ["running", "started", "active"].includes(sLower) ? "badge-running" :
-            ["starting", "pending"].includes(sLower)          ? "badge-starting" :
-            ["error", "failed"].includes(sLower)              ? "badge-error" :
-                                                                "badge-stopped";
-        const url = db.url ? `<a href="${db.url}" target="_blank">open IDE →</a>` : "—";
+            sLower === "running"                                ? "badge-running" :
+            ["starting", "pending"].includes(sLower)            ? "badge-starting" :
+            ["failed", "error"].includes(sLower)                ? "badge-error" :
+            sLower === "never started"                          ? "badge-pending" :
+                                                                  "badge-stopped";
+        const conn = db.url
+            ? `<a href="${escapeHtml(db.url)}" target="_blank" rel="noopener">Open app →</a>`
+            : `<span class="muted">—</span>`;
+        const created = db.createdAt ? formatDate(db.createdAt) : "<span class=\"muted\">—</span>";
+        const isRunning = db.isRunning;
+        const actionBtns = isRunning
+            ? `<button class="btn btn-secondary btn-small" data-stop="${db.id}">Stop</button>`
+            : `<button class="btn btn-secondary btn-small" data-start="${db.id}">Start</button>`;
         return `
             <tr>
                 <td><b>${escapeHtml(db.name)}</b></td>
                 <td><span class="badge ${eb}">${escapeHtml(db.engine)}</span></td>
                 <td><span class="badge ${sb}">${escapeHtml(db.status)}</span></td>
                 <td>${escapeHtml(db.owner || "")}</td>
-                <td>${url}</td>
+                <td>${created}</td>
+                <td>${conn}</td>
                 <td class="td-actions">
-                    <button class="btn btn-secondary btn-small" data-stop="${db.id}">Stop</button>
+                    ${actionBtns}
+                    <button class="btn btn-secondary btn-small btn-danger" data-delete="${db.id}" title="Delete app">×</button>
                 </td>
             </tr>
         `;
@@ -135,6 +145,44 @@ function renderTable() {
     tbody.querySelectorAll("[data-stop]").forEach(btn => {
         btn.onclick = () => stopDb(btn.getAttribute("data-stop"));
     });
+    tbody.querySelectorAll("[data-start]").forEach(btn => {
+        btn.onclick = () => startDb(btn.getAttribute("data-start"));
+    });
+    tbody.querySelectorAll("[data-delete]").forEach(btn => {
+        btn.onclick = () => deleteDb(btn.getAttribute("data-delete"));
+    });
+}
+
+function formatDate(s) {
+    try {
+        const d = new Date(s);
+        if (isNaN(d.getTime())) return "<span class=\"muted\">—</span>";
+        const y = d.getFullYear();
+        if (y < 2000) return "<span class=\"muted\">just now</span>";
+        const m = d.toLocaleString("en-US", { month: "short" });
+        return `${m} ${d.getDate()}, ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+    } catch (e) {
+        return "<span class=\"muted\">—</span>";
+    }
+}
+
+async function startDb(id) {
+    try {
+        await api(`/databases/${id}/start`, { method: "POST", body: "{}" });
+    } catch (e) {
+        alert("Start failed: " + e.message);
+    }
+    refreshDatabases();
+}
+
+async function deleteDb(id) {
+    if (!confirm("Delete this app entirely? This removes the App object from Domino. Dataset snapshots are preserved.")) return;
+    try {
+        await api(`/databases/${id}?keep=0`, { method: "DELETE" });
+    } catch (e) {
+        alert("Delete failed: " + e.message);
+    }
+    refreshDatabases();
 }
 
 async function stopDb(id) {
@@ -163,14 +211,14 @@ function closeWizard() {
 
 async function loadCatalogs() {
     if (state.envs.length && state.tiers.length) return;
-    try {
-        const [envs, tiers] = await Promise.all([api("/environments"), api("/hardware-tiers")]);
-        state.envs = envs;
-        state.tiers = tiers;
-        populateCatalogSelects();
-    } catch (e) {
-        console.error("catalogs load failed", e);
-    }
+    const [envs, tiers] = await Promise.all([api("/environments"), api("/hardware-tiers")]);
+    state.envs = envs;
+    state.tiers = tiers;
+    populateCatalogSelects();
+    // Re-apply the engine default in case the user already picked an engine
+    // before catalogs finished loading (race that previously left the env
+    // dropdown unset → app spawned with project default env).
+    applyEnvDefault();
 }
 
 function populateCatalogSelects() {
@@ -180,10 +228,17 @@ function populateCatalogSelects() {
         state.envs.map(e => `<option value="${e.id}">${escapeHtml(e.name)}</option>`).join("");
     tierSel.innerHTML = state.tiers.map(t =>
         `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join("");
+}
 
-    // Default env from config if it matches engine
-    const def = state.wizard.engine === "postgres" ? state.config.postgresEnvId : state.config.mongoEnvId;
-    if (def) envSel.value = def;
+function applyEnvDefault() {
+    const envSel = document.getElementById("db-env");
+    if (!envSel) return;
+    const def = state.wizard.engine === "postgres"
+        ? state.config.postgresEnvId
+        : state.config.mongoEnvId;
+    if (!def) return;
+    const match = envSel.querySelector(`option[value="${def}"]`);
+    if (match) envSel.value = def;
 }
 
 function renderWizard() {
@@ -197,7 +252,7 @@ function renderWizard() {
     }
     document.getElementById("btn-prev").disabled = s === 1;
     document.getElementById("btn-next").textContent =
-        s === 3 ? "🚀 Provision" : "Next →";
+        s === 3 ? "Provision" : "Next →";
 
     document.getElementById("name-prefix").textContent =
         state.wizard.engine === "mongo" ? "mongo-" : "pg-";
@@ -240,6 +295,12 @@ async function next() {
         const w = state.wizard;
         if (!w.name || !w.environmentId || !w.hardwareTierId || !w.password) {
             alert("All fields required.");
+            return;
+        }
+        // Guard against an env id that's not in the dropdown (shouldn't happen,
+        // but if it does we'd send junk to Domino and get a wrong-env spawn).
+        if (!state.envs.find(e => e.id === w.environmentId)) {
+            alert("Selected environment is not in the catalog. Refresh and try again.");
             return;
         }
         state.wizard.step = 3;
@@ -309,11 +370,9 @@ function bindUi() {
         c.onclick = () => {
             state.wizard.engine = c.getAttribute("data-engine");
             renderWizard();
-            const def = state.wizard.engine === "postgres"
-                ? state.config.postgresEnvId
-                : state.config.mongoEnvId;
-            const envSel = document.getElementById("db-env");
-            if (def && envSel.querySelector(`option[value="${def}"]`)) envSel.value = def;
+            // applyEnvDefault is a no-op until catalogs are loaded; loadCatalogs
+            // re-applies it once they arrive, so the dropdown ends up correct either way.
+            applyEnvDefault();
         };
     });
 

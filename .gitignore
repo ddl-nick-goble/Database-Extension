@@ -11,7 +11,11 @@ __pycache__/
 
 # OS noise
 .DS_Store
+.Trash-*/
 
 # Editor noise
 .vscode/
 .idea/
+
+# Domino crawl output contains plaintext env vars, PATs, credentials — never check in.
+MRM-Portal-main/crawl_output/

@@ -75,15 +75,20 @@ def _engine(a: dict) -> str:
 
 
 def _shape(a: dict) -> dict:
+    status = a.get("status") or "Unknown"
     return {
         "id": a.get("id"),
         "name": a.get("name"),
         "engine": _engine(a),
-        "status": a.get("status", "unknown"),
-        "createdAt": a.get("createdAt"),
-        "owner": a.get("ownerName") or a.get("creator") or dapi.PROJECT_OWNER,
+        "status": status,
+        "createdAt": a.get("createdAt") or a.get("created"),
+        "lastUpdated": a.get("lastUpdated"),
+        "owner": (a.get("publisher") or {}).get("name") or dapi.PROJECT_OWNER,
         "description": a.get("description", ""),
         "url": dapi.app_url(a),
+        "environmentId": a.get("environmentId"),
+        "hardwareTierId": a.get("hardwareTierId"),
+        "isRunning": status.lower() == "running",
     }
 
 
@@ -98,7 +103,7 @@ def api_list_databases():
         "total":    len(dbs),
         "postgres": sum(1 for d in dbs if d["engine"] == "postgres"),
         "mongo":    sum(1 for d in dbs if d["engine"] == "mongo"),
-        "running":  sum(1 for d in dbs if str(d["status"]).lower() == "running"),
+        "running":  sum(1 for d in dbs if d["isRunning"]),
     }
     return jsonify({"databases": dbs, "summary": summary})
 
@@ -116,6 +121,14 @@ def api_create_database():
 
     prefix = "pg-" if engine == "postgres" else "mongo-"
     full_name = name if name.startswith(prefix) else prefix + name
+
+    # Name collision check. If the list call itself fails, surface the
+    # error — don't pretend the name is free.
+    existing = dapi.list_apps()
+    if any(a.get("name") == full_name for a in existing):
+        return jsonify({
+            "error": f"name '{full_name}' is already in use in this project. Stop & delete the existing one first, or pick a different name.",
+        }), 409
 
     # 1. Write the per-DB config file BEFORE creating the app. The DB app's
     #    lifecycle.find_config() picks it up by app name (or most-recent fallback).
@@ -185,9 +198,24 @@ def api_stop_database(app_id: str):
             dapi.stop_app(app_id)
         else:
             dapi.delete_app(app_id)
+    except dapi.DominoApiError as e:
+        return jsonify({"error": "stop/delete failed", "status": e.status,
+                        "dominoBody": e.body[:1500]}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     return jsonify({"ok": True})
+
+
+@app.route("/api/databases/<app_id>/start", methods=["POST"])
+def api_start_database(app_id: str):
+    try:
+        result = dapi.start_app(app_id)
+    except dapi.DominoApiError as e:
+        return jsonify({"error": "start failed", "status": e.status,
+                        "dominoBody": e.body[:1500]}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"ok": True, "result": result})
 
 
 # --------------------------------------------------------------------------

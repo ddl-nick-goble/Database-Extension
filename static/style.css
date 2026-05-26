@@ -194,7 +194,29 @@ code {
 .data-table tbody tr:last-child td { border-bottom: none; }
 .data-table tbody tr:hover { background: var(--bg-alt); }
 .muted { color: var(--text-faint); }
-.th-actions, .td-actions { text-align: right; white-space: nowrap; }
+.th-actions, .td-actions {
+    text-align: right;
+    white-space: nowrap;
+}
+.td-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+    align-items: center;
+    /* Match the table row vertical rhythm — flex on td needs explicit height */
+    min-height: 28px;
+}
+.btn-danger {
+    color: var(--danger);
+    border-color: var(--border);
+    padding: 4px 8px;
+    line-height: 1;
+    font-size: 14px;
+}
+.btn-danger:hover {
+    background: var(--danger-soft);
+    border-color: var(--danger);
+}
 
 /* ============== BADGES ============== */
 .badge {
@@ -211,6 +233,7 @@ code {
 .badge-mongo    { background: var(--mongo-bg);    color: var(--mongo); }
 .badge-running  { background: #dcfce7; color: #15803d; }
 .badge-starting { background: #fef3c7; color: #b45309; }
+.badge-pending  { background: #e0e7ff; color: #4338ca; }
 .badge-stopped  { background: #f3f4f6; color: #4b5563; }
 .badge-error    { background: var(--danger-soft); color: var(--danger); }
 

@@ -19,7 +19,6 @@ import requests
 log = logging.getLogger("domino_api")
 
 PROXY_URL = os.getenv("DOMINO_API_PROXY", "http://localhost:8899")
-DIRECT_URL = os.getenv("DOMINO_API_HOST", "")
 API_KEY = os.getenv("DOMINO_USER_API_KEY", "")
 PROJECT_ID = os.getenv("DOMINO_PROJECT_ID", "")
 PROJECT_OWNER = os.getenv("DOMINO_PROJECT_OWNER", "")
@@ -48,41 +47,25 @@ class DominoApiError(RuntimeError):
 def _request(method: str, path: str, **kwargs) -> Any:
     """One shared helper for GET/POST/DELETE.
 
-    Strategy:
-      - Try PROXY_URL first; on network error or 5xx, fall back to DIRECT_URL.
-      - 4xx is the *server's* answer — don't retry, just surface it.
-      - Always log status + (truncated) body so the wizard's stdout has real info.
+    All calls go through the in-pod auth proxy at PROXY_URL
+    (localhost:8899). No alternate-base fallback — if the proxy is
+    unreachable, something is very wrong and we want the loud failure.
+    Any non-2xx raises DominoApiError carrying status + body.
     """
-    last_exc = None
-    bases = [b for b in (PROXY_URL, DIRECT_URL) if b]
-    for base in bases:
-        url = f"{base}{path}"
-        try:
-            r = _session().request(method, url, timeout=30, **kwargs)
-        except requests.RequestException as e:
-            last_exc = e
-            log.warning("[domino_api] %s %s → network error via %s: %s", method, path, base, e)
-            continue
+    url = f"{PROXY_URL}{path}"
+    r = _session().request(method, url, timeout=30, **kwargs)
 
-        body_preview = r.text[:1000] if r.text else ""
-        log.info("[domino_api] %s %s → %s via %s", method, path, r.status_code, base)
-        if r.status_code >= 500:
-            log.warning("[domino_api]   server error body: %s", body_preview)
-            last_exc = DominoApiError(method, path, r.status_code, r.text)
-            continue  # try next base
-        if r.status_code >= 400:
-            log.warning("[domino_api]   client error body: %s", body_preview)
-            raise DominoApiError(method, path, r.status_code, r.text)
-        if not r.content:
-            return {}
-        try:
-            return r.json()
-        except ValueError:
-            return r.text
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError(f"no bases configured for {method} {path}")
+    body_preview = r.text[:1000] if r.text else ""
+    log.info("[domino_api] %s %s → %s", method, path, r.status_code)
+    if r.status_code >= 400:
+        log.warning("[domino_api]   error body: %s", body_preview)
+        raise DominoApiError(method, path, r.status_code, r.text)
+    if not r.content:
+        return {}
+    try:
+        return r.json()
+    except ValueError:
+        return r.text
 
 
 def _get(path: str, params: dict | None = None) -> Any:
@@ -94,11 +77,9 @@ def _post(path: str, json: dict | None = None) -> Any:
 
 
 def _delete(path: str) -> None:
-    try:
-        _request("DELETE", path)
-    except DominoApiError as e:
-        if e.status not in (404,):  # ok if already gone
-            log.warning("[domino_api] DELETE %s → %s", path, e.status)
+    """Raises DominoApiError on any non-2xx (including 404). Callers decide
+    whether 404 is fatal — we don't swallow it here."""
+    _request("DELETE", path)
 
 
 def _unwrap_list(d) -> list:
@@ -123,22 +104,22 @@ def list_environments() -> list[dict]:
 
 
 def list_hardware_tiers() -> list[dict]:
-    # Confirmed: /v4/projects/{id}/hardwareTiers → 200 on this instance.
-    try:
-        return _unwrap_list(_get(f"/v4/projects/{PROJECT_ID}/hardwareTiers"))
-    except Exception:
-        return _unwrap_list(_get("/api/hardwaretiers/v1/hardwaretiers"))
+    # Confirmed working endpoint on this Domino. If it stops working,
+    # surface the failure rather than silently switching paths.
+    return _unwrap_list(_get(f"/v4/projects/{PROJECT_ID}/hardwareTiers"))
 
 
 # --------------------------------------------------------------------------
 # Apps
 # --------------------------------------------------------------------------
 def list_apps(status: str | None = None) -> list[dict]:
-    params = {"projectId": PROJECT_ID, "limit": 200}
+    """Use /v4/modelProducts which gives us status + runningAppUrl in one call.
+    (apps/beta/apps lists apps but doesn't include lifecycle status.)"""
+    data = _get("/v4/modelProducts", params={"projectId": PROJECT_ID})
+    apps = data if isinstance(data, list) else _unwrap_list(data)
     if status:
-        params["status"] = status
-    # Apps API uses {items: [...], metadata: {...}} on this instance.
-    return _unwrap_list(_get("/api/apps/beta/apps", params=params))
+        apps = [a for a in apps if str(a.get("status", "")).lower() == status.lower()]
+    return apps
 
 
 def create_app(
@@ -148,7 +129,12 @@ def create_app(
     hardware_tier_id: str,
     visibility: str = "GRANT_BASED",
 ) -> dict:
-    """Create the App object. NOT started yet — call start_app(id) next."""
+    """Create the App and bind it to the chosen environment.
+
+    The `version` sub-object on this Domino instance IS respected on initial
+    create — the auto-created currentVersion inherits the env+hw we set
+    here. Call start_app(id) afterward to launch the container.
+    """
     return _post("/api/apps/beta/apps", json={
         "projectId": PROJECT_ID,
         "name": name,
@@ -185,16 +171,21 @@ def delete_app(app_id: str) -> None:
 
 
 def app_url(app: dict) -> str:
-    """Best-effort URL where the user can open the app."""
-    url = app.get("url")
-    if url:
-        if url.startswith("http"):
-            return url
+    """Best-effort URL where the user can open the app.
+
+    Preference order (works for both Apps API + modelProducts shapes):
+      1. runningAppUrl  — present when an instance is live (modelProducts)
+      2. openUrl        — always present on modelProducts; opens the
+                          launcher even if the app isn't running
+      3. url            — present on /api/apps/beta/apps responses
+    Relative paths are prefixed with PUBLIC_HOST.
+    """
+    for key in ("runningAppUrl", "openUrl", "url"):
+        u = app.get(key)
+        if not u:
+            continue
+        if u.startswith("http"):
+            return u
         if PUBLIC_HOST:
-            return f"{PUBLIC_HOST.rstrip('/')}{url}"
-    name = app.get("name", "")
-    app_id = app.get("id", "")
-    if PUBLIC_HOST and PROJECT_OWNER and PROJECT_NAME and (name or app_id):
-        slug = name or app_id
-        return f"{PUBLIC_HOST.rstrip('/')}/{PROJECT_OWNER}/{PROJECT_NAME}/app/{slug}/"
+            return f"{PUBLIC_HOST.rstrip('/')}{u}"
     return ""

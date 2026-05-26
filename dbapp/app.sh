@@ -13,6 +13,9 @@ cd /mnt/code
 
 mkdir -p /var/log/dd
 
+# Sanity check: the env image must ship pgweb.
+command -v pgweb >/dev/null || { echo "[dbapp] ERROR: pgweb not on PATH — rebuild dd-postgres-app." >&2; exit 1; }
+
 echo "[dbapp] booting sidecars…"
 python3 -c "
 import json, sys

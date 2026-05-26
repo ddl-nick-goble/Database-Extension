@@ -30,33 +30,34 @@ DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR", "/mnt/code/dbapps"))
 
 
 def find_config() -> dict:
-    """Locate this app's config file. Three strategies, in order:
-      1. $DD_CONFIG explicit path
+    """Locate this app's config file. Two acceptable sources:
+      1. $DD_CONFIG explicit path  (set by the wizard via env vars)
       2. /mnt/code/dbapps/$DOMINO_APP_NAME.json
-      3. Most recently modified .json under /mnt/code/dbapps/
-         (this is the wizard's contract: it writes the config immediately
-         before creating the app, so freshest = ours)
+
+    If neither resolves, fail loudly. No "most recent file" guessing —
+    that risks loading the wrong DB's password when multiple DBs exist
+    in one project.
     """
     explicit = os.environ.get("DD_CONFIG")
-    if explicit and Path(explicit).exists():
-        return json.loads(Path(explicit).read_text())
+    if explicit:
+        p = Path(explicit)
+        if not p.exists():
+            raise RuntimeError(f"DD_CONFIG={explicit} but file does not exist")
+        return json.loads(p.read_text())
 
     app_name = os.environ.get("DOMINO_APP_NAME", "")
-    if app_name:
-        p = DBAPPS_DIR / f"{app_name}.json"
-        if p.exists():
-            return json.loads(p.read_text())
-
-    if DBAPPS_DIR.exists():
-        candidates = sorted(DBAPPS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
-        if candidates:
-            sys.stderr.write(f"[lifecycle] picking config {candidates[-1].name} (most recent)\n")
-            return json.loads(candidates[-1].read_text())
-
-    raise RuntimeError(
-        "No config found. Wizard should have written "
-        "/mnt/code/dbapps/<app-name>.json before creating this app."
-    )
+    if not app_name:
+        raise RuntimeError(
+            "Neither DD_CONFIG nor DOMINO_APP_NAME is set. "
+            "Wizard must inject one of them when creating the App."
+        )
+    p = DBAPPS_DIR / f"{app_name}.json"
+    if not p.exists():
+        raise RuntimeError(
+            f"Expected config at {p} (DOMINO_APP_NAME={app_name}) but file is missing. "
+            f"Did the wizard fail to write it before creating the App?"
+        )
+    return json.loads(p.read_text())
 
 
 # --------------------------------------------------------------------------
@@ -188,48 +189,35 @@ db.createUser({{
 
 
 # --------------------------------------------------------------------------
-# CloudBeaver — internal :8978, fronted at /admin/
+# pgweb — Go-binary OSS Postgres admin, internal :8978, fronted at /admin/
 # --------------------------------------------------------------------------
-def start_cloudbeaver(cfg: dict) -> None:
-    cb_workspace = Path("/mnt/db/.cloudbeaver")
-    cb_workspace.mkdir(parents=True, exist_ok=True)
-    port = cfg.get("cloudbeaver_port", 8978)
+def start_pgweb(cfg: dict) -> None:
+    """Start pgweb pre-connected to the local Postgres.
 
-    server_conf = {
-        "server": {
-            "serverPort": port,
-            "serverHost": "127.0.0.1",
-            "workspaceLocation": str(cb_workspace),
-            "rootURI": "/admin/",
-            "serviceURI": "/admin/api/",
-        }
-    }
-    (cb_workspace / "server.conf.json").write_text(json.dumps(server_conf, indent=2))
-
-    if cfg["engine"] == "postgres":
-        ds = [{
-            "name": "Local Postgres (this database)",
-            "driver": "postgres-jdbc",
-            "url": f"jdbc:postgresql://localhost:{cfg.get('port', 5432)}/postgres",
-            "user": cfg.get("user", "domino"),
-            "password": cfg["password"],
-            "save-password": True,
-        }]
-    else:
-        ds = [{
-            "name": "Local Mongo (this database)",
-            "driver": "mongodb",
-            "url": f"mongodb://localhost:{cfg.get('port', 27017)}/admin",
-            "user": cfg.get("user", "domino"),
-            "password": cfg["password"],
-            "save-password": True,
-        }]
-    (cb_workspace / "initial-data-sources.conf").write_text(json.dumps(ds, indent=2))
-
-    log = open("/var/log/dd/cloudbeaver.log", "a")
+    pgweb (/usr/local/bin/pgweb, pinned to v0.17.0 in the env image) is a
+    single Go binary that serves a schema/SQL/edit UI on its own port. The
+    --prefix flag makes it generate /admin-prefixed asset URLs so our
+    Flask reverse-proxy at /admin/ Just Works.
+    """
+    if cfg["engine"] != "postgres":
+        return  # pgweb is Postgres-only; Mongo admin lands in v1.
+    if not Path("/usr/local/bin/pgweb").exists():
+        raise RuntimeError("pgweb missing at /usr/local/bin/pgweb — rebuild dd-postgres-app")
+    port = cfg.get("admin_port", 8978)
+    pg_port = cfg.get("port", 5432)
+    user = cfg.get("user", "domino")
+    pw = cfg["password"]
+    url = f"postgres://{user}:{pw}@127.0.0.1:{pg_port}/postgres?sslmode=disable"
+    log_path = open("/var/log/dd/pgweb.log", "a")
     subprocess.Popen(
-        ["bash", "-c", "cd /opt/cloudbeaver && ./run-server.sh"],
-        stdout=log, stderr=log,
+        ["pgweb",
+         "--bind", "127.0.0.1",
+         "--listen", str(port),
+         "--prefix", "admin",          # serve at /admin/...
+         "--url", url,
+         "--skip-open",
+         "--lock-session"],            # one DB per pgweb instance — ours
+        stdout=log_path, stderr=log_path,
     )
 
 
@@ -258,7 +246,7 @@ def boot() -> dict:
         start_mongo(cfg)
     else:
         raise RuntimeError(f"unsupported engine: {cfg['engine']}")
-    start_cloudbeaver(cfg)
+    start_pgweb(cfg)
     schedule_snapshotter(cfg)
     sys.stderr.write("[lifecycle] all sidecars launched\n")
     return cfg

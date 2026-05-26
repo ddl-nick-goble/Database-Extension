@@ -1,14 +1,14 @@
 """Flask router for a Domino Databases App.
 
 This is the ONLY process bound to port 8888 (the Domino App's exposed port).
-Everything else — Postgres/Mongo, CloudBeaver, ws2tcp — runs internally and
-is fronted here. Routes:
+Everything else — Postgres/Mongo, Adminer, ws2tcp — runs internally and is
+fronted here. Routes:
 
   GET  /              → status page (HTML)
   GET  /api/status    → JSON status
   GET  /api/config    → JSON (sanitized — no password)
   WS   /wire          → byte-transparent relay to the local engine port
-  *    /admin/*       → reverse-proxy to CloudBeaver on 127.0.0.1:8978
+  *    /admin/*       → reverse-proxy to Adminer on 127.0.0.1:8978
 
 dbapp/app.sh calls lifecycle.boot() to start sidecars, then launches this.
 """
@@ -23,27 +23,25 @@ import requests
 from flask import Flask, Response, jsonify, render_template_string, request
 from flask_sock import Sock
 
-# Config — loaded once when the router starts (lifecycle.boot writes it
-# to /tmp/dd-config.json so we don't re-read the original file).
+# Config — loaded once when the router starts. dbapp/app.sh calls
+# lifecycle.boot() before launching the router; that step writes the
+# per-DB config to /tmp/dd-config.json. The router REQUIRES that file —
+# if it's missing, boot failed and we should fail too rather than guess.
 import json
 import sys
 from pathlib import Path
 
 CONFIG_CACHE = Path("/tmp/dd-config.json")
 
-
-def _config() -> dict:
-    if CONFIG_CACHE.exists():
-        return json.loads(CONFIG_CACHE.read_text())
-    # Fallback: re-discover via lifecycle.find_config
-    from lifecycle import find_config
-    return find_config()
-
-
-CFG = _config()
+if not CONFIG_CACHE.exists():
+    raise RuntimeError(
+        f"router: {CONFIG_CACHE} missing — lifecycle.boot() didn't write it. "
+        f"Check /var/log/dd/preRun.log."
+    )
+CFG = json.loads(CONFIG_CACHE.read_text())
 ENGINE = CFG["engine"]
 ENGINE_PORT = CFG.get("port", 5432 if ENGINE == "postgres" else 27017)
-CLOUDBEAVER_PORT = CFG.get("cloudbeaver_port", 8978)
+ADMIN_PORT = CFG.get("admin_port", 8978)
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -88,8 +86,9 @@ STATUS_HTML = """<!doctype html>
 
   <div class="card">
     <h2>Open</h2>
-    <a class="btn" href="admin/">DB Explorer (CloudBeaver) →</a>
+    <a class="btn" href="admin/">Open DB Admin →</a>
     <a class="btn" href="api/status">JSON status →</a>
+    <p style="font-size: 13px; color: #4b5563; margin-top: 12px;">pgweb is pre-connected to this DB — no login needed.</p>
   </div>
 
   <div class="card">
@@ -118,7 +117,7 @@ def api_status():
         "engine": ENGINE,
         "db_id": CFG["db_id"],
         "internal_port": ENGINE_PORT,
-        "cloudbeaver_at": "/admin/",
+        "adminer_at": "/admin/",
         "wire_at": "/wire",
     })
 
@@ -181,7 +180,11 @@ def wire(ws):
 
 
 # --------------------------------------------------------------------------
-# Reverse proxy to CloudBeaver at /admin/
+# /admin/ — reverse-proxy to pgweb (OSS Postgres admin, Go single binary)
+#
+# pgweb owns its UI, schema browser, row editor, SQL console, and exports.
+# We launch it with --prefix=admin so the URLs it emits already include
+# our /admin/ prefix; the proxy is then a straight passthrough.
 # --------------------------------------------------------------------------
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -189,8 +192,10 @@ HOP_BY_HOP = {
 }
 
 
-def _proxy_to_cloudbeaver(path: str):
-    upstream = f"http://127.0.0.1:{CLOUDBEAVER_PORT}/admin/{path}"
+def _proxy_to_admin(path: str):
+    # pgweb expects the original `/admin/...` path because we ran it with
+    # --prefix=admin.  Always forward the full prefixed path.
+    upstream = f"http://127.0.0.1:{ADMIN_PORT}/admin/{path}"
     headers = {k: v for k, v in request.headers if k.lower() not in HOP_BY_HOP and k.lower() != "host"}
     try:
         r = requests.request(
@@ -205,16 +210,23 @@ def _proxy_to_cloudbeaver(path: str):
             timeout=30,
         )
     except requests.RequestException as e:
-        return Response(f"upstream error: {e}", status=502)
-
+        return Response(f"admin upstream error: {e}", status=502)
     resp_headers = [(k, v) for k, v in r.headers.items() if k.lower() not in HOP_BY_HOP]
     return Response(r.iter_content(chunk_size=8192), status=r.status_code, headers=resp_headers)
 
 
-@app.route("/admin/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-@app.route("/admin/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+@app.route("/admin/", defaults={"path": ""},
+           methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+@app.route("/admin/<path:path>",
+           methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 def admin(path):
-    return _proxy_to_cloudbeaver(path)
+    if ENGINE != "postgres":
+        return Response(
+            "<!doctype html><body style='font-family: sans-serif; padding: 40px;'>"
+            "<h2>Mongo admin UI — coming soon</h2></body>",
+            mimetype="text/html",
+        )
+    return _proxy_to_admin(path)
 
 
 # --------------------------------------------------------------------------

@@ -55,6 +55,14 @@ pip install -q -r requirements.txt
 # ── Dispatch ─────────────────────────────────────────────────────────────
 case "$DD_ROLE" in
     postgres|mongo|database)
+        # Start cron so schedule_snapshotter's crontab entry actually fires.
+        # apt's cron package doesn't auto-start a daemon. Idempotent — won't
+        # double-start if already running. Goes here (in the dispatcher) so
+        # the fix takes effect from the next git push without an env rebuild.
+        if command -v cron >/dev/null && ! pgrep -x cron >/dev/null; then
+            sudo cron 2>/dev/null || cron 2>/dev/null || \
+                echo "WARN: cron daemon not started — snapshots will not fire" >&2
+        fi
         # Prefer /opt/dd/ (baked into the dd-postgres-app env image) so
         # this works in ANY Domino project, not just Database-Extension.
         # Fall back to /mnt/code/dbapp/ for in-repo dev iteration.

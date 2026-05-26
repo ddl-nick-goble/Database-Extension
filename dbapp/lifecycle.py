@@ -339,13 +339,17 @@ def schedule_snapshotter(cfg: dict) -> None:
         f"schedule_snapshotter ran at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
         f"interval_sec={interval_sec}\nscript={script}\n"
     )
+    # Mirror the snapshotter's stdout/stderr to the dataset so we can see
+    # what it's actually doing from outside the container.
+    out_log = marker_dir / "snapshot.out"
     loop_cmd = (
-        f"echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) loop-start\" > {marker_dir}/loop_start.txt; "
-        f"sleep 5; "  # let postgres settle before the first snapshot
+        f"echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) loop-start cwd=$(pwd) DD_SNAPSHOT_DIR=$DD_SNAPSHOT_DIR DD_DB_ID=$DD_DB_ID DD_PG_PASSWORD_LEN=${{#DD_PG_PASSWORD}}\" > {marker_dir}/loop_start.txt; "
+        f"sleep 5; "
         f"while true; do "
-        f"  echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) tick\" >> {marker_dir}/ticks.txt; "
-        f"  /usr/bin/python3 {script} >> {log_path} 2>&1; "
-        f"  echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) rc=$?\" >> {marker_dir}/ticks.txt; "
+        f"  echo \"--- $(date -u +%Y-%m-%dT%H:%M:%SZ) tick ---\" >> {out_log}; "
+        f"  /usr/bin/python3 {script} >> {out_log} 2>&1; "
+        f"  echo \"--- rc=$? ---\" >> {out_log}; "
+        f"  echo \"$(date -u +%Y-%m-%dT%H:%M:%SZ) tick rc=$?\" >> {marker_dir}/ticks.txt; "
         f"  sleep {interval_sec}; "
         f"done"
     )

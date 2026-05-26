@@ -1,0 +1,17 @@
+# Per-DB configs contain secrets — never check in.
+/dbapps/*.json
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local logs (in case anything ends up in the repo root)
+*.log
+
+# OS noise
+.DS_Store
+
+# Editor noise
+.vscode/
+.idea/

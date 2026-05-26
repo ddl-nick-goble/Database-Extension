@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Model Context — Unified Graph</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #05070d; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  canvas { display: block; }
+  #overlay {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center, rgba(40,60,120,0.08) 0%, rgba(5,7,13,0) 60%);
+  }
+  .ui {
+    position: absolute; color: #aabbd0; font-size: 11px;
+    letter-spacing: 3px; text-transform: uppercase;
+    text-shadow: 0 0 12px rgba(0,0,0,0.8);
+    font-weight: 500;
+  }
+  #eyebrow { top: 28px; left: 32px; color: #6a7a98; }
+  #title    { top: 24px; left: 50%; transform: translateX(-50%); color: #e6edf8; font-size: 14px; letter-spacing: 5px; }
+  #footnote { bottom: 24px; left: 32px; color: #5a6a88; font-size: 10px; letter-spacing: 2px; }
+  #legend   { bottom: 24px; right: 32px; color: #8898b8; font-size: 10px; letter-spacing: 1.5px; text-align: right; line-height: 1.8; }
+  .swatch { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 1px; vertical-align: middle; box-shadow: 0 0 6px currentColor; }
+</style>
+</head>
+<body>
+<div id="overlay"></div>
+<div class="ui" id="eyebrow">Model Context</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* ============================================================
+   Model Context Graph — three.js
+   Asymmetric, flat-ish layout. Multiple models, with cross-links
+   between models, and lineage edges that wire jobs back to the
+   specific experiments they belong to.
+   ============================================================ */
+
+// ---------- Scene ----------
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x05070d, 0.013);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 500);
+camera.position.set(0, 3, 26);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+// ---------- Lights ----------
+scene.add(new THREE.AmbientLight(0x556680, 0.55));
+const coreLight = new THREE.PointLight(0x88aaff, 2.2, 80);
+coreLight.position.set(0, 0, 0);
+scene.add(coreLight);
+const rimLight = new THREE.DirectionalLight(0xffffff, 0.4);
+rimLight.position.set(8, 6, 12);
+scene.add(rimLight);
+
+// ---------- Root ----------
+const root = new THREE.Group();
+scene.add(root);
+
+// ---------- Palette ----------
+// Colors sampled from the editorial reference layouts: bright cyan, mint, orange,
+// hot pink, violet, warm yellow, coral, and a deeper steel blue. Models stay white.
+const C = {
+  model:        0xffffff, // pure white — the centerpiece
+  modelPeer:    0xffffff, // peer models also white per direction
+  endpoints:    0x5dd4e6, // bright cyan — interactive input surfaces ("X · PROMPT" feel)
+  agents:       0xb46cf0, // violet — router/planner / LLM-adjacent
+  apps:         0xff4d80, // hot pink — UI surfaces
+  genai:        0xff8a4d, // orange — output/answer accent ("Y · ANSWER" feel)
+  datasets:     0x3ddcaa, // mint green — "data" tier
+  experiments:  0xffd451, // warm yellow — "config" / versioned definitions
+  jobs:         0xff7565, // coral — runs / processes
+  environments: 0x6b94b3, // deeper steel-blue — compute infra (cousin of cyan)
+};
+
+// ---------- Helpers ----------
+function makeLabel(text, colorHex, scale = 1) {
+  const canvas = document.createElement('canvas');
+  const W = 512, H = 128;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.font = '600 54px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(0,0,0,0.95)';
+  ctx.shadowBlur = 18;
+  ctx.fillStyle = '#000'; ctx.fillText(text, W / 2, H / 2);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#' + colorHex.toString(16).padStart(6, '0');
+  ctx.fillText(text, W / 2, H / 2);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: false });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(4 * scale, 1 * scale, 1);
+  sprite.renderOrder = 999;
+  return sprite;
+}
+
+// Build a {body, shell} geometry pair for a given abstract shape.
+function geometryFor(shape, size, isCore) {
+  const detail = isCore ? 1 : 0;
+  const s = size, ss = size * 1.18;
+  switch (shape) {
+    case 'octa':
+      return [new THREE.OctahedronGeometry(s, 0), new THREE.OctahedronGeometry(ss, 0)];
+    case 'tetra':
+      return [new THREE.TetrahedronGeometry(s, 0), new THREE.TetrahedronGeometry(ss, 0)];
+    case 'sphere':
+      return [new THREE.SphereGeometry(s, 18, 12), new THREE.SphereGeometry(ss, 14, 10)];
+    case 'dodeca':
+      return [new THREE.DodecahedronGeometry(s, 0), new THREE.DodecahedronGeometry(ss, 0)];
+    case 'box':
+      return [new THREE.BoxGeometry(s*1.3, s*1.3, s*1.3), new THREE.BoxGeometry(s*1.55, s*1.55, s*1.55)];
+    case 'cone':
+      return [new THREE.ConeGeometry(s*0.95, s*1.8, 6), new THREE.ConeGeometry(s*1.12, s*2.05, 6)];
+    case 'cylinder':
+      return [new THREE.CylinderGeometry(s*0.75, s*0.75, s*1.7, 8), new THREE.CylinderGeometry(s*0.9, s*0.9, s*1.95, 8)];
+    case 'icosa':
+    default:
+      return [new THREE.IcosahedronGeometry(s, detail), new THREE.IcosahedronGeometry(ss, detail)];
+  }
+}
+
+// Pick an abstract shape per category so each cluster has a distinct silhouette.
+function shapeFor(id) {
+  if (id === 'M0') return 'icosa';
+  if (id.startsWith('M'))    return 'icosa';
+  if (id.startsWith('EP'))   return 'octa';
+  if (id.startsWith('AG'))   return 'tetra';
+  if (id.startsWith('APP'))  return 'sphere';
+  if (id.startsWith('GA'))   return 'dodeca';
+  if (id.startsWith('DS'))   return 'box';
+  if (id.startsWith('EX'))   return 'cone';
+  if (id.startsWith('JB'))   return 'icosa';
+  if (id.startsWith('ENV'))  return 'cylinder';
+  return 'icosa';
+}
+
+// Soft additive glow disc — used as a sprite "lens halo" behind each node.
+const _glowTexCache = new Map();
+function glowTexture(colorHex) {
+  if (_glowTexCache.has(colorHex)) return _glowTexCache.get(colorHex);
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  const hex = '#' + colorHex.toString(16).padStart(6, '0');
+  const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  grad.addColorStop(0.0, hex + 'cc');
+  grad.addColorStop(0.25, hex + '66');
+  grad.addColorStop(0.55, hex + '1f');
+  grad.addColorStop(1.0,  hex + '00');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 128, 128);
+  const tex = new THREE.CanvasTexture(c);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  _glowTexCache.set(colorHex, tex);
+  return tex;
+}
+
+function makeGlowSprite(colorHex, size) {
+  const mat = new THREE.SpriteMaterial({
+    map: glowTexture(colorHex),
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const s = new THREE.Sprite(mat);
+  s.scale.setScalar(size);
+  s.renderOrder = -1; // draw before solid bodies
+  return s;
+}
+
+function makeNode(size, colorHex, shape, isCore = false) {
+  const [bodyGeo, shellGeo] = geometryFor(shape, size, isCore);
+  const mat = new THREE.MeshPhongMaterial({
+    color: colorHex,
+    emissive: colorHex,
+    emissiveIntensity: isCore ? 0.95 : 0.6,
+    shininess: 80,
+    flatShading: true,
+    transparent: true,
+    opacity: 0.92,
+  });
+  const mesh = new THREE.Mesh(bodyGeo, mat);
+
+  // Outer wireframe shell — lives as a sibling so we can counter-rotate it
+  // independently of the body for that "two layers, two lives" feel.
+  const shellMat = new THREE.MeshBasicMaterial({
+    color: colorHex, wireframe: true, transparent: true, opacity: isCore ? 0.55 : 0.34,
+  });
+  const shell = new THREE.Mesh(shellGeo, shellMat);
+  mesh.add(shell);
+
+  // Soft additive halo behind the body — gives every crystal a faint bloom.
+  const haloScale = isCore ? size * 6.5 : (size > 0.4 ? size * 5.0 : size * 4.2);
+  const halo = makeGlowSprite(colorHex, haloScale);
+  mesh.add(halo);
+
+  // Random initial orientation so cones / cylinders / tetras don't all point up.
+  mesh.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+  mesh.userData.spin = new THREE.Vector3(
+    (Math.random() - 0.5) * 0.45,
+    (Math.random() - 0.5) * 0.45,
+    (Math.random() - 0.5) * 0.45
+  );
+  // Shell counter-spins relative to body for that subtle "the outline is
+  // moving on its own" effect that reads as crystalline life.
+  mesh.userData.shell = shell;
+  mesh.userData.shellSpin = mesh.userData.spin.clone().multiplyScalar(-1.45);
+  return mesh;
+}
+
+// Thin orbital ring (Torus) — used to dress the central model.
+function makeOrbitRing(radius, colorHex, opacity = 0.32) {
+  const geo = new THREE.TorusGeometry(radius, 0.018, 6, 128);
+  const mat = new THREE.MeshBasicMaterial({
+    color: colorHex,
+    transparent: true,
+    opacity,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  return new THREE.Mesh(geo, mat);
+}
+
+// Solid edge as a thin cylinder. `weight`: 'strong' | 'normal' | 'cross'.
+function makeEdge(p1, p2, colorHex, weight = 'normal') {
+  const dir = new THREE.Vector3().subVectors(p2, p1);
+  const len = dir.length();
+  let radius, opacity, haloOpacity;
+  if (weight === 'strong')      { radius = 0.085; opacity = 0.95; haloOpacity = 0.32; }
+  else if (weight === 'normal') { radius = 0.05;  opacity = 0.78; haloOpacity = 0.20; }
+  else /* cross */              { radius = 0.028; opacity = 0.28; haloOpacity = 0.06; }
+
+  const geo = new THREE.CylinderGeometry(radius, radius, len, 12, 1, false);
+  geo.translate(0, len / 2, 0);
+  const mat = new THREE.MeshBasicMaterial({ color: colorHex, transparent: true, opacity });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.copy(p1);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+
+  const haloGeo = new THREE.CylinderGeometry(radius * 2.8, radius * 2.8, len, 12, 1, false);
+  haloGeo.translate(0, len / 2, 0);
+  const haloMat = new THREE.MeshBasicMaterial({
+    color: colorHex, transparent: true, opacity: haloOpacity,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  });
+  mesh.add(new THREE.Mesh(haloGeo, haloMat));
+  return mesh;
+}
+
+// ---------- Graph: nodes + edges ----------
+// Layout philosophy: blobby sphere — nodes spread in ALL directions
+// (x, y, z all used) so the silhouette reads as a roughly spherical cloud.
+// Edges are intentionally simple: everything connects to the model, and
+// the models connect to each other.
+
+const nodes = [
+  // ---- MODELS (4 peers, in their own pockets, no hub collisions) ----
+  { id:'M0',  name:'Model · v3.2',       color:C.model,     pos:[ 0.0,  0.0,  0.0 ], size:1.7, isCore:true },
+  { id:'M1',  name:'Model · embed',      color:C.modelPeer, pos:[ 8.2, -0.3,  0.6 ], size:0.85 }, // far right
+  { id:'M2',  name:'Model · classifier', color:C.modelPeer, pos:[-8.0,  0.4, -0.6 ], size:0.85 }, // far left
+  { id:'M3',  name:'Model · summarizer', color:C.modelPeer, pos:[ 0.4, -6.0, -1.4 ], size:0.78 }, // bottom
+
+  // ---- SERVING (front hemisphere, z > 0) ----
+  // Endpoints
+  { id:'EP',   name:'Endpoints', color:C.endpoints, pos:[ 4.0,  1.0,  5.0 ], size:0.6  },
+  { id:'EP1',  name:'REST',      color:C.endpoints, pos:[ 5.5,  2.2,  6.4 ], size:0.22 },
+  { id:'EP1a', name:'v1',        color:C.endpoints, pos:[ 6.4,  2.6,  6.9 ], size:0.14 },
+  { id:'EP1b', name:'v2',        color:C.endpoints, pos:[ 4.9,  3.0,  7.0 ], size:0.14 },
+  { id:'EP2',  name:'gRPC',      color:C.endpoints, pos:[ 4.6, -0.6,  6.9 ], size:0.22 },
+  { id:'EP2a', name:'proto v3',  color:C.endpoints, pos:[ 4.0, -1.4,  7.5 ], size:0.14 },
+  { id:'EP3',  name:'Streaming', color:C.endpoints, pos:[ 2.8,  2.6,  6.8 ], size:0.22 },
+  { id:'EP3a', name:'websocket', color:C.endpoints, pos:[ 2.0,  3.4,  7.2 ], size:0.14 },
+  { id:'EP4',  name:'Batch',     color:C.endpoints, pos:[ 5.0,  0.6,  7.4 ], size:0.22 },
+  { id:'EP4a', name:'queue',     color:C.endpoints, pos:[ 5.6,  0.0,  7.8 ], size:0.14 },
+
+  // Agents
+  { id:'AG',   name:'Agents',     color:C.agents, pos:[ 0.8,  4.0,  4.5 ], size:0.55 },
+  { id:'AG1',  name:'Tool calls', color:C.agents, pos:[ 1.8,  5.4,  5.5 ], size:0.22 },
+  { id:'AG1a', name:'search',     color:C.agents, pos:[ 2.6,  5.8,  6.2 ], size:0.14 },
+  { id:'AG1b', name:'code exec',  color:C.agents, pos:[ 1.0,  6.0,  6.0 ], size:0.14 },
+  { id:'AG2',  name:'Workflows',  color:C.agents, pos:[-0.6,  5.4,  4.8 ], size:0.22 },
+  { id:'AG2a', name:'cron',       color:C.agents, pos:[-1.2,  6.0,  5.4 ], size:0.14 },
+
+  // Apps
+  { id:'APP',   name:'Apps',         color:C.apps, pos:[-2.6,  2.0,  5.0 ], size:0.58 },
+  { id:'APP1',  name:'Dashboards',   color:C.apps, pos:[-3.6,  3.6,  5.5 ], size:0.22 },
+  { id:'APP1a', name:'perf',         color:C.apps, pos:[-4.2,  4.2,  6.2 ], size:0.14 },
+  { id:'APP1b', name:'usage',        color:C.apps, pos:[-3.0,  4.4,  6.2 ], size:0.14 },
+  { id:'APP2',  name:'Internal UI',  color:C.apps, pos:[-1.6,  3.8,  5.8 ], size:0.22 },
+  { id:'APP2a', name:'admin',        color:C.apps, pos:[-1.0,  4.4,  6.4 ], size:0.14 },
+  { id:'APP3',  name:'Customer app', color:C.apps, pos:[-4.4,  2.0,  6.2 ], size:0.22 },
+  { id:'APP3a', name:'mobile',       color:C.apps, pos:[-5.2,  1.4,  6.8 ], size:0.14 },
+
+  // GenAI
+  { id:'GA',    name:'GenAI',        color:C.genai, pos:[-1.4, -3.4,  5.0 ], size:0.55 },
+  { id:'GA1',   name:'Chat',         color:C.genai, pos:[-2.4, -4.6,  5.4 ], size:0.22 },
+  { id:'GA1a',  name:'chat-ui',      color:C.genai, pos:[-3.2, -5.0,  6.0 ], size:0.14 },
+  { id:'GA2',   name:'RAG',          color:C.genai, pos:[ 0.2, -4.4,  5.4 ], size:0.22 },
+  { id:'GA2a',  name:'vector store', color:C.genai, pos:[ 1.0, -5.0,  5.6 ], size:0.14 },
+  { id:'GA2b',  name:'retriever',    color:C.genai, pos:[ 0.6, -4.0,  6.4 ], size:0.14 },
+
+  // Datasets — new hub, front-bottom-right pocket
+  { id:'DS',    name:'Datasets',      color:C.datasets, pos:[ 3.0, -2.4,  1.6 ], size:0.55 },
+  { id:'DS1',   name:'training data', color:C.datasets, pos:[ 4.0, -3.0,  0.6 ], size:0.22 },
+  { id:'DS1a',  name:'v2',            color:C.datasets, pos:[ 4.6, -3.4, -0.2 ], size:0.14 },
+  { id:'DS2',   name:'eval set',      color:C.datasets, pos:[ 3.6, -2.0,  2.6 ], size:0.22 },
+  { id:'DS3',   name:'golden set',    color:C.datasets, pos:[ 2.0, -3.4,  2.0 ], size:0.22 },
+
+  // ---- LINEAGE (back hemisphere, z < 0) ----
+  // Experiments — back-left, denser
+  { id:'EX',    name:'Experiments', color:C.experiments, pos:[-4.0,  0.6, -4.6 ], size:0.6  },
+  { id:'EX1',   name:'Run #1842',   color:C.experiments, pos:[-5.6,  1.6, -5.6 ], size:0.22 },
+  { id:'EX1a',  name:'artifacts',   color:C.experiments, pos:[-6.4,  2.2, -6.2 ], size:0.14 },
+  { id:'EX2',   name:'Run #1843',   color:C.experiments, pos:[-5.0, -1.0, -6.2 ], size:0.22 },
+  { id:'EX2a',  name:'artifacts',   color:C.experiments, pos:[-5.6, -1.6, -6.8 ], size:0.14 },
+  { id:'EX3',   name:'Run #1844',   color:C.experiments, pos:[-3.4,  2.6, -5.6 ], size:0.22 },
+  { id:'EX3a',  name:'artifacts',   color:C.experiments, pos:[-2.6,  3.4, -6.0 ], size:0.14 },
+  { id:'EX4',   name:'Run #1845',   color:C.experiments, pos:[-3.0, -1.6, -6.6 ], size:0.22 },
+  { id:'EX5',   name:'Run #1846',   color:C.experiments, pos:[-4.4, -2.6, -5.4 ], size:0.22 },
+  { id:'EX6',   name:'Run #1847',   color:C.experiments, pos:[-2.0,  1.4, -6.6 ], size:0.22 },
+
+  // Jobs — back-center, the dense pile (now denser still)
+  { id:'JB',    name:'Jobs',  color:C.jobs, pos:[ 1.6, -1.8, -5.0 ], size:0.65 },
+  { id:'JB1',   name:'train · 03-21',   color:C.jobs, pos:[ 3.0, -3.0, -6.4 ], size:0.18 },
+  { id:'JB1a',  name:'ckpt',            color:C.jobs, pos:[ 3.7, -3.5, -6.9 ], size:0.12 },
+  { id:'JB2',   name:'train · 03-22',   color:C.jobs, pos:[ 1.5, -4.0, -6.0 ], size:0.18 },
+  { id:'JB3',   name:'eval · 03-22',    color:C.jobs, pos:[-0.6, -3.0, -6.4 ], size:0.18 },
+  { id:'JB4',   name:'tune · 03-23',    color:C.jobs, pos:[ 3.6, -1.0, -6.4 ], size:0.18 },
+  { id:'JB5',   name:'train · 03-24',   color:C.jobs, pos:[ 2.0,  0.0, -7.0 ], size:0.18 },
+  { id:'JB5a',  name:'ckpt',            color:C.jobs, pos:[ 2.6,  0.6, -7.5 ], size:0.12 },
+  { id:'JB6',   name:'eval · 03-24',    color:C.jobs, pos:[-0.4, -1.6, -7.0 ], size:0.18 },
+  { id:'JB7',   name:'tune · 03-25',    color:C.jobs, pos:[ 4.0, -2.4, -5.4 ], size:0.18 },
+  { id:'JB7a',  name:'ckpt',            color:C.jobs, pos:[ 4.6, -2.8, -4.8 ], size:0.12 },
+  { id:'JB8',   name:'distill · 03-26', color:C.jobs, pos:[ 2.6,  1.0, -6.2 ], size:0.18 },
+  { id:'JB9',   name:'train · 03-27',   color:C.jobs, pos:[ 0.6, -4.0, -7.0 ], size:0.18 },
+  { id:'JB10',  name:'train · 03-28',   color:C.jobs, pos:[-1.6, -2.4, -5.8 ], size:0.18 },
+  { id:'JB11',  name:'eval · 03-28',    color:C.jobs, pos:[ 1.0,  1.4, -6.4 ], size:0.18 },
+
+  // Environments — top-back
+  { id:'ENV',   name:'Environments', color:C.environments, pos:[ 3.6,  4.2, -2.4 ], size:0.5  },
+  { id:'ENV1',  name:'GPU pool',     color:C.environments, pos:[ 4.6,  5.2, -3.6 ], size:0.20 },
+  { id:'ENV1a', name:'A100',         color:C.environments, pos:[ 5.2,  5.4, -4.4 ], size:0.13 },
+  { id:'ENV1b', name:'H100',         color:C.environments, pos:[ 4.0,  5.6, -4.2 ], size:0.13 },
+  { id:'ENV2',  name:'CPU pool',     color:C.environments, pos:[ 5.4,  4.8, -1.0 ], size:0.20 },
+  { id:'ENV2a', name:'general',      color:C.environments, pos:[ 6.2,  5.2, -0.4 ], size:0.13 },
+];
+
+// Build a lookup so edges can reference IDs
+const N = Object.fromEntries(nodes.map(n => [n.id, n]));
+
+// Edges. Tree-of-trees, now with a third level (hub → leaf → sub-leaf)
+// plus more cross-model serves so the picture reads as an interconnected
+// graph rather than a clean tree.
+const edges = [
+  // ---- Between the models ----
+  ['M0','M1','strong'],
+  ['M0','M2','strong'],
+  ['M0','M3','strong'],
+  ['M1','M2','normal'],
+  ['M2','M3','normal'],
+  ['M1','M3','normal'],
+
+  // ---- Central model → top-level hubs (the trunks) ----
+  ['M0','EP','strong'], ['M0','AG','strong'], ['M0','APP','strong'], ['M0','GA','strong'],
+  ['M0','DS','strong'], ['M0','EX','strong'], ['M0','JB','strong'], ['M0','ENV','strong'],
+
+  // ---- Hub → leaves (1→N) ----
+  // Endpoints (1→4)
+  ['EP','EP1'], ['EP','EP2'], ['EP','EP3'], ['EP','EP4'],
+  // Agents (1→2)
+  ['AG','AG1'], ['AG','AG2'],
+  // Apps (1→3)
+  ['APP','APP1'], ['APP','APP2'], ['APP','APP3'],
+  // GenAI (1→2)
+  ['GA','GA1'], ['GA','GA2'],
+  // Datasets (1→3)
+  ['DS','DS1'], ['DS','DS2'], ['DS','DS3'],
+  // Experiments (1→6)
+  ['EX','EX1'], ['EX','EX2'], ['EX','EX3'], ['EX','EX4'], ['EX','EX5'], ['EX','EX6'],
+  // Jobs (1→11, the busy branch)
+  ['JB','JB1'], ['JB','JB2'], ['JB','JB3'], ['JB','JB4'], ['JB','JB5'],
+  ['JB','JB6'], ['JB','JB7'], ['JB','JB8'], ['JB','JB9'], ['JB','JB10'], ['JB','JB11'],
+  // Environments (1→2)
+  ['ENV','ENV1'], ['ENV','ENV2'],
+
+  // ---- Leaves → sub-leaves (third level) ----
+  ['EP1','EP1a'], ['EP1','EP1b'],
+  ['EP2','EP2a'],
+  ['EP3','EP3a'],
+  ['EP4','EP4a'],
+  ['AG1','AG1a'], ['AG1','AG1b'],
+  ['AG2','AG2a'],
+  ['APP1','APP1a'], ['APP1','APP1b'],
+  ['APP2','APP2a'],
+  ['APP3','APP3a'],
+  ['GA1','GA1a'],
+  ['GA2','GA2a'], ['GA2','GA2b'],
+  ['DS1','DS1a'],
+  ['EX1','EX1a'], ['EX2','EX2a'], ['EX3','EX3a'],
+  ['JB1','JB1a'], ['JB5','JB5a'], ['JB7','JB7a'],
+  ['ENV1','ENV1a'], ['ENV1','ENV1b'],
+  ['ENV2','ENV2a'],
+
+  // ---- Cross-model serves: surfaces that reach into peer models ----
+  // To embed model (M1)
+  ['APP3','M1','cross'],
+  ['AG1', 'M1','cross'],
+  ['EP2', 'M1','cross'],
+  // To classifier (M2)
+  ['GA',  'M2','cross'],
+  ['EP1', 'M2','cross'],
+  ['APP1','M2','cross'],
+  // To summarizer (M3) — the new peer model
+  ['GA2', 'M3','cross'],
+  ['EP4', 'M3','cross'],
+  ['AG2a','M3','cross'],
+  ['DS1a','M3','cross'],
+];
+
+// ---------- Build ----------
+const animatedNodes = [];
+
+for (const n of nodes) {
+  const mesh = makeNode(n.size, n.color, shapeFor(n.id), !!n.isCore);
+  mesh.position.fromArray(n.pos);
+  root.add(mesh);
+  animatedNodes.push({
+    mesh,
+    phase: (mesh.position.x + mesh.position.z) * 0.3,
+    pulseAmp: n.isCore ? 0.05 : (n.size > 0.5 ? 0.07 : 0.09),
+  });
+  // (Text labels intentionally omitted — keeping the plot purely abstract.)
+}
+
+// ---------- Orbital rings around the central model ----------
+// Two thin tori at slightly different tilts, each with its own slow drift.
+const orbitRings = [];
+{
+  const r1 = makeOrbitRing(2.6, 0xffffff, 0.28);
+  r1.rotation.x = Math.PI / 2.2;
+  r1.rotation.z = 0.18;
+  root.add(r1);
+  orbitRings.push({ mesh: r1, axis: new THREE.Vector3(0, 1, 0), speed: 0.18 });
+
+  const r2 = makeOrbitRing(3.1, 0xb8c4dc, 0.20);
+  r2.rotation.x = Math.PI / 1.6;
+  r2.rotation.y = 0.4;
+  root.add(r2);
+  orbitRings.push({ mesh: r2, axis: new THREE.Vector3(1, 0, 0.3).normalize(), speed: -0.13 });
+}
+
+for (const [a, b, weight] of edges) {
+  const na = N[a], nb = N[b];
+  const p1 = new THREE.Vector3().fromArray(na.pos);
+  const p2 = new THREE.Vector3().fromArray(nb.pos);
+  // Color: use the destination color for hub→leaf, midpoint-feel via "from" color for cross
+  const color = (weight === 'cross') ? na.color : nb.color;
+  root.add(makeEdge(p1, p2, color, weight || 'normal'));
+}
+
+// ---------- Ambient particle field ----------
+{
+  const count = 800;
+  const positions = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    // Bias particles into a flatter disc-ish cloud so they reinforce the layout shape
+    const r = 18 + Math.random() * 38;
+    const t = Math.random() * Math.PI * 2;
+    const yJitter = (Math.random() - 0.5) * 12;
+    positions[i * 3]     = Math.cos(t) * r;
+    positions[i * 3 + 1] = yJitter;
+    positions[i * 3 + 2] = Math.sin(t) * r;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const mat = new THREE.PointsMaterial({
+    color: 0x6688aa, size: 0.07, transparent: true, opacity: 0.42,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  });
+  var particleField = new THREE.Points(geo, mat);
+  scene.add(particleField);
+  window.__particleField = particleField; // exposed so animate() can twinkle it
+}
+
+// ---------- Animation loop ----------
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+  const t  = clock.elapsedTime;
+
+  // Gentle, multi-axis rotation
+  root.rotation.y += dt * 0.13;
+  root.rotation.x = Math.sin(t * 0.16) * 0.14;
+  root.rotation.z = Math.cos(t * 0.11) * 0.05;
+
+  // Per-node tumble + breathing pulse + counter-rotating wireframe shell
+  for (const n of animatedNodes) {
+    const ud = n.mesh.userData;
+    n.mesh.rotation.x += ud.spin.x * dt;
+    n.mesh.rotation.y += ud.spin.y * dt;
+    n.mesh.rotation.z += ud.spin.z * dt;
+    if (ud.shell) {
+      ud.shell.rotation.x += ud.shellSpin.x * dt;
+      ud.shell.rotation.y += ud.shellSpin.y * dt;
+      ud.shell.rotation.z += ud.shellSpin.z * dt;
+    }
+    const s = 1 + Math.sin(t * 1.6 + n.phase) * n.pulseAmp;
+    n.mesh.scale.setScalar(s);
+  }
+
+  // Orbit rings around M0 — each drifts on its own axis, independent of root
+  for (const r of orbitRings) {
+    r.mesh.rotateOnAxis(r.axis, r.speed * dt);
+  }
+
+  // Twinkling particle field — slow alpha modulation
+  if (window.__particleField) {
+    window.__particleField.material.opacity = 0.38 + Math.sin(t * 0.45) * 0.10;
+  }
+
+  // Slow camera drift
+  camera.position.x = Math.sin(t * 0.07) * 1.6;
+  camera.position.y = 3 + Math.sin(t * 0.10) * 0.6;
+  camera.lookAt(0, 0, 0);
+
+  renderer.render(scene, camera);
+}
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

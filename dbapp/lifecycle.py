@@ -300,16 +300,14 @@ def start_pgweb(cfg: dict) -> None:
 # Cron snapshotter
 # --------------------------------------------------------------------------
 def schedule_snapshotter(cfg: dict) -> None:
-    """Write an env-file with the snapshotter's runtime context, then a crontab
-    that sources it before running the snapshot script.
-
-    Why a file (not inline env vars on the cron line): the password ends up in
-    the cron line otherwise, and `crontab -l` exposes it. With an env-file we
-    can chmod 600 it.
+    """Spawn a detached background subprocess that runs the snapshotter on a
+    fixed interval. We used to install a crontab entry, but cron-as-ubuntu
+    doesn't fire without sudoers configuration, so the entry was effectively
+    a no-op. A self-contained shell loop in a new session is root-free and
+    survives the parent's exec to gunicorn.
     """
-    interval = cfg.get("snapshot_interval_min", 60)
-    # Snapshotter lives next to dbapp/ — /opt/dd/snapshotter/ when baked
-    # into the env, /mnt/code/snapshotter/ for in-repo dev.
+    interval_min = int(cfg.get("snapshot_interval_min", 60))
+    script = None
     for candidate in (
         f"/opt/dd/snapshotter/snapshot_{cfg['engine']}.py",
         f"/mnt/code/snapshotter/snapshot_{cfg['engine']}.py",
@@ -317,32 +315,38 @@ def schedule_snapshotter(cfg: dict) -> None:
         if Path(candidate).exists():
             script = candidate
             break
-    else:
+    if not script:
         sys.stderr.write(f"[lifecycle] WARN: snapshotter not found for engine={cfg['engine']}\n")
         return
 
-    env_path = Path("/var/log/dd/snapshotter.env")
-    env_path.parent.mkdir(parents=True, exist_ok=True)
     snap_dir = snapshot_path(cfg)
-    env_lines = [
-        f"DD_DB_ID={cfg['db_id']}",
-        f"DD_SNAPSHOT_DIR={snap_dir}",
-        f"DD_PG_PORT={cfg.get('port', 5432)}",
-        f"DD_PG_USER={cfg.get('user', 'domino')}",
-        f"DD_PG_PASSWORD={cfg['password']}",
-        f"DOMINO_API_PROXY={os.environ.get('DOMINO_API_PROXY', 'http://localhost:8899')}",
-        f"DOMINO_USER_API_KEY={os.environ.get('DOMINO_USER_API_KEY', '')}",
-        f"DOMINO_PROJECT_ID={os.environ.get('DOMINO_PROJECT_ID', '')}",
-    ]
-    env_path.write_text("\n".join(env_lines) + "\n")
-    env_path.chmod(0o600)
+    env = os.environ.copy()
+    env.update({
+        "DD_DB_ID": cfg["db_id"],
+        "DD_SNAPSHOT_DIR": str(snap_dir),
+        "DD_PG_PORT": str(cfg.get("port", 5432)),
+        "DD_PG_USER": cfg.get("user", "domino"),
+        "DD_PG_PASSWORD": cfg["password"],
+    })
 
-    line = (
-        f"*/{interval} * * * * "
-        f"set -a; . {env_path}; set +a; "
-        f"/usr/bin/python3 {script} >> /var/log/dd/snapshot.log 2>&1\n"
+    interval_sec = max(60, interval_min * 60)
+    log_path = "/var/log/dd/snapshot.log"
+    loop_cmd = (
+        f"sleep 5; "  # let postgres settle before the first snapshot
+        f"while true; do "
+        f"  /usr/bin/python3 {script} >> {log_path} 2>&1; "
+        f"  sleep {interval_sec}; "
+        f"done"
     )
-    subprocess.run(["bash", "-c", f"echo '{line}' | crontab -"], check=False)
+    with open(log_path, "a") as logf:
+        subprocess.Popen(
+            ["bash", "-c", loop_cmd],
+            env=env,
+            stdout=logf, stderr=logf,
+            start_new_session=True,   # survive parent exit
+            close_fds=True,
+        )
+    sys.stderr.write(f"[lifecycle] snapshotter loop started (every {interval_sec}s, script={script})\n")
 
 
 # --------------------------------------------------------------------------

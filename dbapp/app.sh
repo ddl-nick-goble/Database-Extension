@@ -31,14 +31,6 @@ mkdir -p /var/log/dd
 # Sanity check: the env image must ship pgweb.
 command -v pgweb >/dev/null || { echo "[dbapp] ERROR: pgweb not on PATH — rebuild dd-postgres-app." >&2; exit 1; }
 
-# Start cron so the snapshotter entry installed by lifecycle.schedule_snapshotter
-# actually fires. apt's `cron` package installs it but doesn't start a daemon;
-# we run it in the foreground-detached mode (cron -L 15 forks itself).
-if command -v cron >/dev/null && ! pgrep -x cron >/dev/null; then
-    sudo cron 2>/dev/null || cron 2>/dev/null || \
-        echo "[dbapp] WARN: cron daemon not started — snapshots won't fire" >&2
-fi
-
 echo "[dbapp] booting sidecars (module home: $DD_MODULE_HOME)…"
 python3 -c "
 import json, sys

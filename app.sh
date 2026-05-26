@@ -55,25 +55,18 @@ pip install -q -r requirements.txt
 # ── Dispatch ─────────────────────────────────────────────────────────────
 case "$DD_ROLE" in
     postgres|mongo|database)
-        # Start cron so schedule_snapshotter's crontab entry actually fires.
-        # apt's cron package doesn't auto-start a daemon. Idempotent — won't
-        # double-start if already running. Goes here (in the dispatcher) so
-        # the fix takes effect from the next git push without an env rebuild.
-        if command -v cron >/dev/null && ! pgrep -x cron >/dev/null; then
-            sudo cron 2>/dev/null || cron 2>/dev/null || \
-                echo "WARN: cron daemon not started — snapshots will not fire" >&2
-        fi
-        # Prefer /opt/dd/ (baked into the dd-postgres-app env image) so
-        # this works in ANY Domino project, not just Database-Extension.
-        # Fall back to /mnt/code/dbapp/ for in-repo dev iteration.
-        if [ -x /opt/dd/app.sh ]; then
-            echo "DD_ROLE=$DD_ROLE — launching DB app from /opt/dd on :$PORT"
-            exec bash /opt/dd/app.sh
-        elif [ -x /mnt/code/dbapp/app.sh ]; then
+        # Prefer /mnt/code/dbapp/ when it exists — that's THIS project's
+        # local copy of the boot logic. Iterating on it costs a git push
+        # (~10s) instead of an env rebuild (~5min). Projects that don't
+        # include the boot code fall back to /opt/dd/ baked into the env.
+        if [ -x /mnt/code/dbapp/app.sh ]; then
             echo "DD_ROLE=$DD_ROLE — launching DB app from /mnt/code/dbapp on :$PORT"
             exec bash /mnt/code/dbapp/app.sh
+        elif [ -x /opt/dd/app.sh ]; then
+            echo "DD_ROLE=$DD_ROLE — launching DB app from /opt/dd on :$PORT"
+            exec bash /opt/dd/app.sh
         else
-            echo "ERROR: no DB launcher at /opt/dd/app.sh or /mnt/code/dbapp/app.sh" >&2
+            echo "ERROR: no DB launcher at /mnt/code/dbapp/app.sh or /opt/dd/app.sh" >&2
             exit 2
         fi
         ;;

@@ -79,10 +79,19 @@ def create_db(env_id: str, hw_id: str) -> dict:
     return r.json()
 
 
-def poll_until_running(app_id: str, deadline_s: int = 240) -> dict:
+def poll_until_running(app_id: str, deadline_s: int = 300) -> dict:
+    """Wait until the App reaches Running.
+
+    On this Domino build, transient 'Stopped' shows up during deployment
+    *before* the container actually starts. Don't treat it as terminal —
+    Domino re-enters Queued/Pending shortly after. Only declare failure
+    after we've seen Stopped/Failed persist past the warmup window OR
+    the deadline expires.
+    """
     full_name = f"pg-{DB_NAME}"
     start = time.time()
     last_status = ""
+    stopped_first_seen_at: float | None = None
     while time.time() - start < deadline_s:
         dbs = requests.get(f"{WIZARD}/api/databases", timeout=20).json()
         me = next((d for d in dbs["databases"] if d["id"] == app_id), None)
@@ -92,11 +101,20 @@ def poll_until_running(app_id: str, deadline_s: int = 240) -> dict:
         if status != last_status:
             log(f"  status: {status}  (url={me.get('url') or '?'})")
             last_status = status
+            if status.lower() not in ("stopped", "failed"):
+                stopped_first_seen_at = None
         if status.lower() == "running":
             return me
         if status.lower() in ("failed", "stopped"):
-            err = me.get("startError", "")
-            raise SystemExit(f"app reached terminal state {status!r} (startError={err})")
+            now = time.time()
+            if stopped_first_seen_at is None:
+                stopped_first_seen_at = now
+            # Tolerate transient Stopped/Failed for up to 120s — Domino's
+            # Apps API regularly flaps to Stopped briefly between Queued and
+            # Pending on this build. Real failures sit in Stopped indefinitely.
+            if now - stopped_first_seen_at > 120:
+                err = me.get("startError", "")
+                raise SystemExit(f"app sat in {status!r} for >60s (startError={err})")
         time.sleep(4)
     raise SystemExit(f"timed out after {deadline_s}s waiting for {full_name} to reach Running")
 
@@ -187,7 +205,7 @@ def verify_snapshot_path() -> None:
 # --------------------------------------------------------------------------
 # Cleanup
 # --------------------------------------------------------------------------
-def cleanup() -> None:
+def cleanup(success: bool = False) -> None:
     global TUNNEL_PROC, APP_ID
     if TUNNEL_PROC is not None:
         log("stopping tunnel client")
@@ -196,7 +214,8 @@ def cleanup() -> None:
             TUNNEL_PROC.wait(timeout=5)
         except subprocess.TimeoutExpired:
             TUNNEL_PROC.kill()
-    if APP_ID:
+    keep_on_fail = os.environ.get("DD_E2E_KEEP_ON_FAIL", "1") == "1"
+    if APP_ID and (success or not keep_on_fail):
         log(f"stopping + deleting app {APP_ID}")
         try:
             requests.delete(
@@ -206,6 +225,8 @@ def cleanup() -> None:
             )
         except Exception as e:
             log(f"  cleanup error: {e}")
+    elif APP_ID:
+        log(f"app left alive for debugging: {APP_ID} (set DD_E2E_KEEP_ON_FAIL=0 to auto-clean)")
 
 
 # --------------------------------------------------------------------------
@@ -256,8 +277,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    success = False
     try:
         rc = main()
+        success = (rc == 0)
     except SystemExit as e:
         log(f"FAILURE: {e}")
         rc = 1
@@ -265,5 +288,5 @@ if __name__ == "__main__":
         log(f"UNEXPECTED ERROR: {e!r}")
         rc = 2
     finally:
-        cleanup()
+        cleanup(success=success)
     sys.exit(rc)

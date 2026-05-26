@@ -185,17 +185,33 @@ def api_create_database():
     #    Pass env+hw explicitly; the create call's version.environmentId is
     #    silently dropped on this Domino build, so without the override the
     #    container would launch against the project's default DSE.
-    try:
-        dapi.start_app(a["id"], environment_id=env_id, hardware_tier_id=hw_id)
-        a["status"] = "Starting"
-    except dapi.DominoApiError as e:
-        log.warning("start failed: %s", e)
+    #
+    #    Domino's Apps API on this build is racy: ~50% of the time the first
+    #    /start call leaves the App stuck in Stopped indefinitely (no error,
+    #    no logs, container never spawns). A second /start with the same body
+    #    consistently recovers. Retry once after a short delay.
+    import time as _t
+    start_ok = False
+    for attempt in (1, 2, 3):
+        try:
+            dapi.start_app(a["id"], environment_id=env_id, hardware_tier_id=hw_id)
+            a["status"] = "Starting"
+            # Probe the App's state — if it sticks in Stopped, retry start.
+            _t.sleep(8)
+            current = dapi.get_app(a["id"]) or {}
+            ci_status = (current.get("currentVersion", {}) or {}).get("currentInstance", {}).get("status", "")
+            if ci_status.lower() in ("queued", "pending", "preparing", "running"):
+                log.info("attempt %d: instance reached %s", attempt, ci_status)
+                start_ok = True
+                break
+            log.warning("attempt %d: instance status=%s — retrying /start", attempt, ci_status)
+        except dapi.DominoApiError as e:
+            log.warning("start attempt %d failed: %s", attempt, e)
+        except Exception as e:
+            log.exception("unexpected start failure on attempt %d", attempt)
+    if not start_ok:
         a["status"] = "Failed"
-        a["startError"] = f"{e.status}: {e.body[:500]}"
-    except Exception as e:
-        log.exception("unexpected start failure")
-        a["status"] = "Failed"
-        a["startError"] = str(e)
+        a["startError"] = "all start attempts left the instance stuck in Stopped"
 
     return jsonify(_shape(a)), 201
 

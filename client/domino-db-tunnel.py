@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Single-file Postgres-over-WebSocket tunnel for Domino Databases.
+
+ZERO dependencies — only Python stdlib. Works with any python3 that ships
+with macOS/Linux. No pip, no venv, no git clone.
+
+USAGE
+
+    # Either pipe straight from GitHub:
+    curl -fsSL https://raw.githubusercontent.com/ddl-nick-goble/Database-Extension/main/client/domino-db-tunnel.py \
+        | python3 - --url <app-url> --api-key <key> --port 5432
+
+    # Or save it locally and run repeatedly:
+    curl -fsSL https://raw.githubusercontent.com/ddl-nick-goble/Database-Extension/main/client/domino-db-tunnel.py \
+        -o ~/domino-db-tunnel.py
+    python3 ~/domino-db-tunnel.py --url <app-url> --api-key <key> --port 5432
+
+Then in another terminal:
+    psql -h 127.0.0.1 -p 5432 -U domino -d postgres
+    # or open DBeaver pointed at localhost:5432
+
+Args:
+    --url       https://apps.<host>/apps-internal/<appId>/  (no /wire suffix)
+    --api-key   Domino API key (or set $DOMINO_API_KEY)
+    --port      Local TCP port to expose (default 5432)
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import os
+import secrets
+import socket
+import ssl
+import struct
+import sys
+import threading
+from urllib.parse import urlparse
+
+
+# --------------------------------------------------------------------------
+# WebSocket framing (RFC 6455, the subset we need)
+# --------------------------------------------------------------------------
+OP_CONT = 0x0
+OP_TEXT = 0x1
+OP_BIN = 0x2
+OP_CLOSE = 0x8
+OP_PING = 0x9
+OP_PONG = 0xA
+
+
+def _ws_handshake(sock: socket.socket, host: str, path: str, api_key: str) -> bytes:
+    """Send HTTP/1.1 Upgrade, return any leftover bytes that came after the headers."""
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"X-Domino-Api-Key: {api_key}\r\n"
+        f"User-Agent: domino-db-tunnel/1.0\r\n"
+        f"\r\n"
+    )
+    sock.sendall(req.encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise IOError("server closed connection during WebSocket handshake")
+        resp += chunk
+    header_end = resp.index(b"\r\n\r\n")
+    headers, leftover = resp[:header_end], resp[header_end + 4:]
+    status_line = headers.split(b"\r\n", 1)[0].decode("latin-1", errors="replace")
+    if " 101 " not in status_line:
+        raise IOError(
+            f"WebSocket upgrade rejected: {status_line}\n"
+            f"--- response headers ---\n{headers.decode('latin-1', errors='replace')}"
+        )
+    return leftover
+
+
+def _send_frame(sock: socket.socket, opcode: int, payload: bytes) -> None:
+    """Send a single masked WS frame (clients MUST mask per RFC 6455)."""
+    fin_op = 0x80 | (opcode & 0x0F)
+    n = len(payload)
+    mask = secrets.token_bytes(4)
+    if n < 126:
+        header = struct.pack("!BB", fin_op, 0x80 | n)
+    elif n < 65536:
+        header = struct.pack("!BBH", fin_op, 0x80 | 126, n)
+    else:
+        header = struct.pack("!BBQ", fin_op, 0x80 | 127, n)
+    masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+    sock.sendall(header + mask + masked)
+
+
+class _FrameReader:
+    """Read WS frames from a stream socket, buffering between calls."""
+    def __init__(self, sock: socket.socket, leftover: bytes):
+        self.sock = sock
+        self.buf = bytearray(leftover)
+
+    def _read(self, n: int) -> bytes:
+        out = bytearray()
+        if self.buf:
+            take = self.buf[:n]
+            del self.buf[:n]
+            out.extend(take)
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise IOError("WebSocket closed mid-frame")
+            out.extend(chunk)
+        return bytes(out)
+
+    def next_frame(self) -> tuple[int, bytes, bool]:
+        """Return (opcode, payload, fin)."""
+        head = self._read(2)
+        fin = bool(head[0] & 0x80)
+        opcode = head[0] & 0x0F
+        masked = bool(head[1] & 0x80)
+        length = head[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._read(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._read(8))[0]
+        mask = self._read(4) if masked else None
+        payload = self._read(length) if length else b""
+        if masked:
+            payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+        return opcode, payload, fin
+
+
+# --------------------------------------------------------------------------
+# Per-connection relay
+# --------------------------------------------------------------------------
+def _relay(local_sock: socket.socket, app_url: str, api_key: str) -> None:
+    u = urlparse(app_url)
+    if not u.hostname:
+        raise ValueError(f"bad app URL: {app_url}")
+    host = u.hostname
+    is_tls = u.scheme in ("https", "wss", "")
+    if u.scheme == "":
+        # Default to https if no scheme given
+        is_tls = True
+    port = u.port or (443 if is_tls else 80)
+    path = (u.path.rstrip("/") or "") + "/wire"
+
+    raw = socket.create_connection((host, port), timeout=30)
+    if is_tls:
+        ctx = ssl.create_default_context()
+        ws = ctx.wrap_socket(raw, server_hostname=host)
+    else:
+        ws = raw
+    try:
+        leftover = _ws_handshake(ws, host, path, api_key)
+        ws.settimeout(None)
+        reader = _FrameReader(ws, leftover)
+
+        stop = threading.Event()
+        ws_lock = threading.Lock()  # serialize writes (we masking + pongs)
+
+        def local_to_ws() -> None:
+            try:
+                while not stop.is_set():
+                    chunk = local_sock.recv(65536)
+                    if not chunk:
+                        return
+                    with ws_lock:
+                        _send_frame(ws, OP_BIN, chunk)
+            except Exception:
+                pass
+            finally:
+                stop.set()
+
+        def ws_to_local() -> None:
+            current = bytearray()
+            try:
+                while not stop.is_set():
+                    opcode, payload, fin = reader.next_frame()
+                    if opcode == OP_CLOSE:
+                        return
+                    if opcode == OP_PING:
+                        with ws_lock:
+                            _send_frame(ws, OP_PONG, payload)
+                        continue
+                    if opcode == OP_PONG:
+                        continue
+                    if opcode in (OP_BIN, OP_TEXT, OP_CONT):
+                        current.extend(payload)
+                        if fin:
+                            local_sock.sendall(bytes(current))
+                            current.clear()
+            except Exception:
+                pass
+            finally:
+                stop.set()
+
+        t1 = threading.Thread(target=local_to_ws, daemon=True)
+        t2 = threading.Thread(target=ws_to_local, daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+    finally:
+        try: ws.close()
+        except Exception: pass
+        try: local_sock.close()
+        except Exception: pass
+
+
+# --------------------------------------------------------------------------
+# Local TCP listener
+# --------------------------------------------------------------------------
+def _serve(port: int, app_url: str, api_key: str) -> None:
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", port))
+    server.listen(8)
+    print(f"listening on 127.0.0.1:{port} → {app_url}/wire", file=sys.stderr, flush=True)
+    print(f"  connect with: psql -h 127.0.0.1 -p {port} -U domino -d postgres", file=sys.stderr, flush=True)
+    while True:
+        client, addr = server.accept()
+        print(f"[+] accepted {addr[0]}:{addr[1]}", file=sys.stderr, flush=True)
+        threading.Thread(
+            target=_relay, args=(client, app_url, api_key), daemon=True,
+        ).start()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="Postgres-over-WebSocket tunnel for Domino Databases (zero deps)",
+    )
+    p.add_argument("--url", required=True,
+                   help="App URL, e.g. https://apps.<host>/apps-internal/<id>/")
+    p.add_argument("--api-key", default=os.environ.get("DOMINO_API_KEY"),
+                   help="Domino API key (or set $DOMINO_API_KEY)")
+    p.add_argument("--port", type=int, default=5432,
+                   help="Local TCP port to bind (default 5432)")
+    args = p.parse_args()
+
+    if not args.api_key:
+        print("error: --api-key required (or set DOMINO_API_KEY)", file=sys.stderr)
+        return 2
+    try:
+        _serve(args.port, args.url.rstrip("/"), args.api_key)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

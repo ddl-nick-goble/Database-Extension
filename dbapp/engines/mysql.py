@@ -23,6 +23,7 @@ from . import _common
 
 _MYSQL_LOG = "/var/log/dd/mysqld.log"
 _MYSQL_ERROR_LOG = "/var/log/dd/mysqld.err"
+_MYSQL_INIT_LOG = "/var/log/dd/mysqld-init.err"
 _MYSQL_PIDFILE = "/mnt/db/mysql.pid"
 _MYSQL_SOCKET = "/mnt/db/sock/mysqld.sock"
 
@@ -167,10 +168,13 @@ class MySQLAdapter(EngineAdapter):
         # the cfg password ourselves in _bootstrap_user. The "insecure"
         # name is misleading — bind_address is 127.0.0.1 by default and
         # we add a real password before opening the port to /wire.
+        # --log-error: the apt-packaged defaults file points at
+        # /var/log/mysql/error.log which is root-only; we run as ubuntu.
+        Path(_MYSQL_INIT_LOG).parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ["mysqld", "--initialize-insecure",
              f"--datadir={data}",
-             "--user=ubuntu"],
+             f"--log-error={_MYSQL_INIT_LOG}"],
             check=True,
         )
 
@@ -185,7 +189,7 @@ class MySQLAdapter(EngineAdapter):
              "--bind-address=127.0.0.1",
              f"--socket={_MYSQL_SOCKET}",
              f"--pid-file={_MYSQL_PIDFILE}",
-             "--user=ubuntu",
+             f"--log-error={_MYSQL_ERROR_LOG}",
              # Modest memory cap — banks-playground tier, not OLTP.
              "--innodb-buffer-pool-size=512M",
              # Skip name resolution (faster connects, no DNS dep).

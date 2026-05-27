@@ -123,7 +123,6 @@ function renderEngineCards() {
         c.onclick = () => {
             state.wizard.engine = c.getAttribute("data-engine");
             renderWizard();
-            applyEnvDefault();
         };
     });
 }
@@ -273,7 +272,16 @@ async function stopDb(id) {
 // Wizard
 // =====================================================================
 function openWizard() {
-    state.wizard = { step: 1, engine: null, name: "", environmentId: "", hardwareTierId: "", password: "" };
+    state.wizard = { engine: null, name: "", environmentId: "", hardwareTierId: "", password: "" };
+    // Reset form fields so a re-opened wizard starts clean.
+    document.getElementById("db-name").value = "";
+    document.getElementById("db-pw").value = "";
+    document.getElementById("provision-log").classList.add("hidden");
+    document.getElementById("provision-log").innerHTML = "";
+    // provision() disables btn-next to prevent double-submits during a
+    // create stream; the success path doesn't re-enable it because it
+    // auto-closes the wizard. Re-enable on every open so a 2nd DB works.
+    document.getElementById("btn-next").disabled = false;
     renderWizard();
     document.getElementById("wizard-overlay").classList.remove("hidden");
     loadCatalogs();
@@ -303,38 +311,29 @@ function resolveEnvId() {
     return eng?.envId || "";
 }
 
+// All three wizard panes are visible at once now. renderWizard() just
+// reflects current state.wizard into the engine cards (selected ring),
+// the name-prefix code chip in Configure, and the Review table.
 function renderWizard() {
-    const s = state.wizard.step;
-    for (let i = 1; i <= 3; i++) {
-        const stepEl = document.querySelector(`.step[data-step="${i}"]`);
-        const bodyEl = document.getElementById(`step-${i}`);
-        stepEl.classList.toggle("active", i === s);
-        stepEl.classList.toggle("done", i < s);
-        bodyEl.classList.toggle("hidden", i !== s);
-    }
-    document.getElementById("btn-prev").disabled = s === 1;
-    document.getElementById("btn-next").textContent =
-        s === 3 ? "Provision" : "Next →";
+    const ws = state.wizard;
+    const adapter = enginesCatalog().find(e => e.name === ws.engine);
 
-    const adapter = enginesCatalog().find(e => e.name === state.wizard.engine);
     document.getElementById("name-prefix").textContent =
         adapter?.appPrefix ?? "pg-";
 
-    // populate engine cards
     document.querySelectorAll(".engine-card").forEach(c => {
-        c.classList.toggle("selected", c.getAttribute("data-engine") === state.wizard.engine);
+        c.classList.toggle("selected", c.getAttribute("data-engine") === ws.engine);
     });
 
-    if (s === 3) {
-        const ws = state.wizard;
-        document.getElementById("r-engine").textContent =
-            adapter ? adapter.label : ws.engine;
-        document.getElementById("r-name").textContent =
-            (adapter?.appPrefix ?? "pg-") + ws.name;
-        document.getElementById("r-tier").textContent =
-            (state.tiers.find(t => t.id === ws.hardwareTierId) || {}).name || ws.hardwareTierId;
-        document.getElementById("r-pw").textContent = "•".repeat(ws.password.length);
-    }
+    document.getElementById("r-engine").textContent =
+        adapter ? adapter.label : (ws.engine || "—");
+    document.getElementById("r-name").textContent =
+        ws.name ? (adapter?.appPrefix ?? "pg-") + ws.name : "—";
+    const tier = state.tiers.find(t => t.id === ws.hardwareTierId);
+    document.getElementById("r-tier").textContent =
+        tier?.name || ws.hardwareTierId || "—";
+    document.getElementById("r-pw").textContent =
+        ws.password ? "•".repeat(ws.password.length) : "—";
 }
 
 function readFormToWizard() {
@@ -344,47 +343,28 @@ function readFormToWizard() {
     state.wizard.password       = document.getElementById("db-pw").value;
 }
 
-async function next() {
-    const s = state.wizard.step;
-    if (s === 1) {
-        if (!state.wizard.engine) { alert("Pick an engine."); return; }
-        state.wizard.step = 2;
-        renderWizard();
+// Provision-button click: validate everything, then stream the create.
+async function submitWizard() {
+    readFormToWizard();
+    const w = state.wizard;
+    if (!w.engine) { alert("Pick an engine."); return; }
+    if (!w.name || !w.hardwareTierId || !w.password) {
+        alert("Name, hardware tier, and password are required.");
         return;
     }
-    if (s === 2) {
-        readFormToWizard();
-        const w = state.wizard;
-        if (!w.name || !w.hardwareTierId || !w.password) {
-            alert("Name, hardware tier, and password are required.");
-            return;
-        }
-        if (!w.environmentId) {
-            // resolveEnvId() returned "" — the admin hasn't built / wired
-            // up the env image for this engine yet. Tell the user how to
-            // fix it instead of letting Domino spawn against a wrong env.
-            const eng = enginesCatalog().find(e => e.name === w.engine);
-            alert(
-                `No compute environment is configured for ${eng?.label || w.engine}.\n\n` +
-                `Ask an admin to build envs/dd-${w.engine}-app and set ` +
-                `${eng?.envIdVar || 'the env id'} on the wizard project.`
-            );
-            return;
-        }
-        state.wizard.step = 3;
-        renderWizard();
+    if (!w.environmentId) {
+        // resolveEnvId() returned "" — the admin hasn't built / wired the
+        // env image for this engine yet. Tell the user how to fix it
+        // instead of letting Domino spawn against a wrong env.
+        const eng = enginesCatalog().find(e => e.name === w.engine);
+        alert(
+            `No compute environment is configured for ${eng?.label || w.engine}.\n\n` +
+            `Ask an admin to build envs/dd-${w.engine}-app and set ` +
+            `${eng?.envIdVar || 'the env id'} on the wizard project.`
+        );
         return;
     }
-    if (s === 3) {
-        await provision();
-    }
-}
-
-function prev() {
-    if (state.wizard.step > 1) {
-        state.wizard.step -= 1;
-        renderWizard();
-    }
+    await provision();
 }
 
 async function provision() {
@@ -392,7 +372,6 @@ async function provision() {
     log.classList.remove("hidden");
     log.innerHTML = "";
     document.getElementById("btn-next").disabled = true;
-    document.getElementById("btn-prev").disabled = true;
 
     const append = (cls, marker, msg, extra) => {
         const tail = extra ? ` <span class="muted">(${escapeHtml(extra)})</span>` : "";
@@ -480,7 +459,6 @@ async function provision() {
     } else {
         // error, or stream ended without a terminal event — let the user retry.
         document.getElementById("btn-next").disabled = false;
-        document.getElementById("btn-prev").disabled = false;
     }
 }
 
@@ -490,28 +468,31 @@ async function provision() {
 function bindUi() {
     document.getElementById("btn-new-db").onclick    = openWizard;
     document.getElementById("btn-close-wizard").onclick = closeWizard;
-    document.getElementById("btn-prev").onclick      = prev;
-    document.getElementById("btn-next").onclick      = next;
+    document.getElementById("btn-cancel").onclick    = closeWizard;
+    document.getElementById("btn-next").onclick      = submitWizard;
     document.getElementById("btn-refresh").onclick   = refreshDatabases;
     document.getElementById("filter-engine").onchange = renderTable;
     document.getElementById("filter-status").onchange = renderTable;
     document.getElementById("filter-search").oninput  = renderTable;
 
-    document.querySelectorAll(".engine-card").forEach(c => {
-        c.onclick = () => {
-            state.wizard.engine = c.getAttribute("data-engine");
-            renderWizard();
-            // applyEnvDefault is a no-op until catalogs are loaded; loadCatalogs
-            // re-applies it once they arrive, so the dropdown ends up correct either way.
-            applyEnvDefault();
-        };
-    });
+    // Live wiring — every form-field edit immediately flows into
+    // state.wizard and is reflected in the Review pane.
+    const liveUpdate = () => { readFormToWizard(); renderWizard(); };
+    document.getElementById("db-name").oninput  = liveUpdate;
+    document.getElementById("db-tier").onchange = liveUpdate;
+    document.getElementById("db-pw").oninput    = liveUpdate;
+
+    // (Engine-card click handlers are wired up in renderEngineCards()
+    // once the catalog has been fetched — at boot time the grid is empty.)
 
     document.getElementById("btn-gen-pw").onclick = () => {
         const r = new Uint8Array(16);
         crypto.getRandomValues(r);
         document.getElementById("db-pw").value =
             btoa(String.fromCharCode(...r)).replace(/[+/=]/g, "").slice(0, 20);
+        // Reflect generated password into state + Review pane immediately.
+        readFormToWizard();
+        renderWizard();
     };
 }
 

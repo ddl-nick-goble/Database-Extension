@@ -29,13 +29,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import os
 import secrets
+import shutil as _shutil
+import signal
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import threading
+import time as _time
 from urllib.parse import urlparse
 
 
@@ -215,10 +220,57 @@ def _relay(local_sock: socket.socket, app_url: str, api_key: str) -> None:
 # --------------------------------------------------------------------------
 # Local TCP listener
 # --------------------------------------------------------------------------
+def _free_port(port: int) -> None:
+    """Kill any process holding 127.0.0.1:<port>. Uses lsof if available
+    (macOS + most Linux); falls back to ss/fuser otherwise. Idempotent."""
+    pids: set[int] = set()
+    if _shutil.which("lsof"):
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-tiTCP:" + str(port), "-sTCP:LISTEN"],
+                stderr=subprocess.DEVNULL,
+            ).decode()
+            pids.update(int(x) for x in out.split() if x.strip().isdigit())
+        except subprocess.CalledProcessError:
+            pass
+    if not pids and _shutil.which("fuser"):
+        try:
+            out = subprocess.check_output(
+                ["fuser", f"{port}/tcp"], stderr=subprocess.DEVNULL,
+            ).decode()
+            pids.update(int(x) for x in out.split() if x.strip().isdigit())
+        except subprocess.CalledProcessError:
+            pass
+    if not pids:
+        return
+    print(f"[!] port {port} held by pid(s) {sorted(pids)} — sending SIGTERM",
+          file=sys.stderr, flush=True)
+    for pid in pids:
+        try: os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError: pass
+    _time.sleep(0.8)
+    for pid in pids:
+        try:
+            os.kill(pid, 0)  # still alive?
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    _time.sleep(0.3)
+
+
 def _serve(port: int, app_url: str, api_key: str) -> None:
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", port))
+    try:
+        server.bind(("127.0.0.1", port))
+    except OSError as e:
+        if e.errno not in (errno.EADDRINUSE, 48):  # 48 = macOS EADDRINUSE
+            raise
+        _free_port(port)
+        server.close()
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", port))
     server.listen(8)
     print(f"listening on 127.0.0.1:{port} → {app_url}/wire", file=sys.stderr, flush=True)
     print(f"  connect with: psql -h 127.0.0.1 -p {port} -U domino -d postgres", file=sys.stderr, flush=True)

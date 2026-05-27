@@ -181,6 +181,19 @@ def api_create_database():
 
     log.info("created app id=%s — starting", a.get("id"))
 
+    # 2b. Pin the App's apps-subdomain URL into the config now that we know
+    #     the App ID. The DB-app's status page reads this so it can render
+    #     a real working tunnel command to copy-paste.
+    app_id_str = a.get("id", "")
+    if app_id_str:
+        apps_host = dapi.PUBLIC_HOST.rstrip("/")
+        if apps_host.startswith("https://") and not apps_host.startswith("https://apps."):
+            apps_host = "https://apps." + apps_host[len("https://"):]
+        cfg["tunnel_url"] = f"{apps_host}/apps-internal/{app_id_str}/"
+        cfg["app_id"] = app_id_str
+        config_path.write_text(json.dumps(cfg, indent=2))
+        os.chmod(config_path, 0o600)
+
     # 3. Start it — create only makes the App object, doesn't launch the container.
     #    Pass env+hw explicitly; the create call's version.environmentId is
     #    silently dropped on this Domino build, so without the override the

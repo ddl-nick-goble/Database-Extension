@@ -93,14 +93,29 @@ STATUS_HTML = """<!doctype html>
 
   <div class="card">
     <h2>Connect from your laptop</h2>
-    <p style="font-size: 13px; color: #4b5563; margin-top: 0;">Open a tunnel; <code>psql</code> / <code>mongosh</code> / JDBC / ODBC against <code>localhost</code>:</p>
+    <p style="font-size: 13px; color: #4b5563; margin-top: 0;">
+      Step 1 — open a tunnel. Single-file Python script, zero install. Replace <code>$DOMINO_API_KEY</code> with your key from Account Settings.
+    </p>
+    <pre style="background: #0f172a; color: #d1d5db; padding: 14px; border-radius: 4px; font-size: 12px; overflow-x: auto; line-height: 1.6;">curl -fsSL https://raw.githubusercontent.com/ddl-nick-goble/Database-Extension/main/client/domino-db-tunnel.py | python3 - \
+  --url "{{ cfg.tunnel_url|default('https://apps.<your-domino-host>/apps-internal/<appId>/') }}" \
+  --api-key $DOMINO_API_KEY \
+  --port {{ engine_port }}</pre>
+    <p style="font-size: 13px; color: #4b5563; margin-top: 16px;">
+      Step 2 — leave that running. In another terminal (or DBeaver / DataGrip / any tool):
+    </p>
     <pre style="background: #0f172a; color: #d1d5db; padding: 14px; border-radius: 4px; font-size: 12px; overflow-x: auto; line-height: 1.6;">
-domino-db tunnel --app-url {{ request.url_root }} --local-port {{ engine_port }}
-{% if engine == 'postgres' -%}
+{%- if engine == 'postgres' %}
 psql "host=127.0.0.1 port={{ engine_port }} user={{ cfg.user|default('domino') }} dbname=postgres"
-{%- else -%}
+# or DBeaver: New PostgreSQL connection → host=localhost port={{ engine_port }} user={{ cfg.user|default('domino') }} SSL=off
+{%- else %}
 mongosh "mongodb://{{ cfg.user|default('domino') }}@127.0.0.1:{{ engine_port }}/admin"
 {%- endif %}</pre>
+    {% if not cfg.tunnel_url %}
+    <p style="font-size: 12px; color: #ca8a04; margin-top: 12px;">
+      ⚠️ This DB was provisioned before we started baking the App URL into the config.
+      Replace <code>&lt;your-domino-host&gt;</code> and <code>&lt;appId&gt;</code> by hand, or re-create the DB to get the snippet auto-filled.
+    </p>
+    {% endif %}
   </div>
 </body></html>
 """

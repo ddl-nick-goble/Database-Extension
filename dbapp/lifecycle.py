@@ -200,16 +200,41 @@ def _pin_socket_dir(pgdata: Path, cfg: dict) -> None:
 def start_postgres(cfg: dict) -> None:
     pgdata = cfg.get("pgdata", "/mnt/db/pgdata")
     port = cfg.get("port", 5432)
-    subprocess.run([
-        PGCTL, "-D", pgdata, "-l", "/var/log/dd/postgres.log",
+    log_path = "/var/log/dd/postgres.log"
+    result = subprocess.run([
+        PGCTL, "-D", pgdata, "-l", log_path,
         "-o", f"-p {port}", "start",
-    ], check=True)
+    ])
+    if result.returncode != 0:
+        # Dump the postgres log so we don't have to ssh in to debug.
+        sys.stderr.write(
+            f"[lifecycle] pg_ctl start failed (rc={result.returncode}). "
+            f"postgres.log tail:\n"
+        )
+        try:
+            with open(log_path) as f:
+                sys.stderr.write(f.read()[-3000:])
+        except OSError as e:
+            sys.stderr.write(f"  (could not read {log_path}: {e})\n")
+        sys.stderr.write(f"\n[lifecycle] pgdata listing:\n")
+        try:
+            for p in sorted(Path(pgdata).iterdir()):
+                sys.stderr.write(f"  {p.name}\n")
+        except OSError as e:
+            sys.stderr.write(f"  (could not list {pgdata}: {e})\n")
+        raise RuntimeError(f"Postgres failed to start (pg_ctl rc={result.returncode})")
     # Wait for readiness
     for _ in range(30):
         r = subprocess.run(["pg_isready", "-h", "127.0.0.1", "-p", str(port), "-q"])
         if r.returncode == 0:
             return
         time.sleep(1)
+    # Same log-dump on timeout.
+    try:
+        with open(log_path) as f:
+            sys.stderr.write(f"[lifecycle] pg_isready timeout. postgres.log tail:\n{f.read()[-3000:]}\n")
+    except OSError:
+        pass
     raise RuntimeError("Postgres failed to become ready in 30s")
 
 

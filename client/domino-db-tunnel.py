@@ -55,6 +55,24 @@ OP_PING = 0x9
 OP_PONG = 0xA
 
 
+# One SSL context for the lifetime of the process. Building it costs ~30 ms
+# (CA bundle load) — doing it per-connection adds noticeable latency at the
+# start of every `psql` invocation.
+_SSL_CTX = ssl.create_default_context()
+
+
+def _tune_socket(sock: socket.socket) -> None:
+    """Disable Nagle and enable keepalive on a TCP socket. Called on every
+    socket that carries Postgres bytes: the laptop-side accepted socket
+    AND the outbound socket that ends up wrapped in TLS for the WS hop."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        # SO_KEEPALIVE may be denied in some sandboxes; not fatal.
+        pass
+
+
 def _ws_handshake(sock: socket.socket, host: str, path: str, api_key: str) -> bytes:
     """Send HTTP/1.1 Upgrade, return any leftover bytes that came after the headers."""
     key = base64.b64encode(secrets.token_bytes(16)).decode()
@@ -155,9 +173,9 @@ def _relay(local_sock: socket.socket, app_url: str, api_key: str) -> None:
     path = (u.path.rstrip("/") or "") + "/wire"
 
     raw = socket.create_connection((host, port), timeout=30)
+    _tune_socket(raw)
     if is_tls:
-        ctx = ssl.create_default_context()
-        ws = ctx.wrap_socket(raw, server_hostname=host)
+        ws = _SSL_CTX.wrap_socket(raw, server_hostname=host)
     else:
         ws = raw
     try:
@@ -182,10 +200,14 @@ def _relay(local_sock: socket.socket, app_url: str, api_key: str) -> None:
                 stop.set()
 
         def ws_to_local() -> None:
-            current = bytearray()
+            # We're carrying a raw TCP byte stream — there is no message
+            # boundary that matters. Flush every fragment as it arrives
+            # instead of buffering until FIN. Buffering added pointless
+            # latency on small server-pushes (e.g., Postgres's per-row
+            # data messages during a result-set stream).
             try:
                 while not stop.is_set():
-                    opcode, payload, fin = reader.next_frame()
+                    opcode, payload, _fin = reader.next_frame()
                     if opcode == OP_CLOSE:
                         return
                     if opcode == OP_PING:
@@ -194,11 +216,8 @@ def _relay(local_sock: socket.socket, app_url: str, api_key: str) -> None:
                         continue
                     if opcode == OP_PONG:
                         continue
-                    if opcode in (OP_BIN, OP_TEXT, OP_CONT):
-                        current.extend(payload)
-                        if fin:
-                            local_sock.sendall(bytes(current))
-                            current.clear()
+                    if opcode in (OP_BIN, OP_TEXT, OP_CONT) and payload:
+                        local_sock.sendall(payload)
             except Exception:
                 pass
             finally:
@@ -276,6 +295,7 @@ def _serve(port: int, app_url: str, api_key: str) -> None:
     print(f"  connect with: psql -h 127.0.0.1 -p {port} -U domino -d postgres", file=sys.stderr, flush=True)
     while True:
         client, addr = server.accept()
+        _tune_socket(client)
         print(f"[+] accepted {addr[0]}:{addr[1]}", file=sys.stderr, flush=True)
         threading.Thread(
             target=_relay, args=(client, app_url, api_key), daemon=True,

@@ -27,7 +27,7 @@
 
 USER root
 
-RUN apt-get update && apt-get install -y --no-install-recommends gnupg lsb-release ca-certificates curl wget cron sudo unzip && install -d /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list && apt-get update && apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16 postgresql-contrib-16 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg lsb-release ca-certificates curl wget cron sudo unzip pgbouncer && install -d /usr/share/postgresql-common/pgdg && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list && apt-get update && apt-get install -y --no-install-recommends postgresql-16 postgresql-client-16 postgresql-contrib-16 && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL -o /tmp/pgweb.zip https://github.com/sosedoff/pgweb/releases/download/v0.17.0/pgweb_linux_amd64.zip && unzip /tmp/pgweb.zip -d /tmp && mv /tmp/pgweb_linux_amd64 /usr/local/bin/pgweb && chmod +x /usr/local/bin/pgweb && rm /tmp/pgweb.zip
 

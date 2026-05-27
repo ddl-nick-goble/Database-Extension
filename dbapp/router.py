@@ -40,7 +40,12 @@ if not CONFIG_CACHE.exists():
     )
 CFG = json.loads(CONFIG_CACHE.read_text())
 ENGINE = CFG["engine"]
-ENGINE_PORT = CFG.get("port", 5432 if ENGINE == "postgres" else 27017)
+# Where the /wire relay sends bytes. `client_port` (if present) takes
+# precedence — that's how lifecycle.boot points us at pgbouncer (:6432)
+# when connection pooling is enabled. Falls back to the raw engine port.
+ENGINE_PORT = CFG.get("client_port") or CFG.get(
+    "port", 5432 if ENGINE == "postgres" else 27017,
+)
 ADMIN_PORT = CFG.get("admin_port", 8978)
 
 app = Flask(__name__)
@@ -154,6 +159,14 @@ def wire(ws):
     """
     try:
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # TCP_NODELAY: disable Nagle so 1-byte/small writes don't get held
+        # waiting for a piggyback ACK. Postgres's wire protocol is full of
+        # small handshake messages; without this, every round-trip can pay
+        # ~40 ms of Nagle+delayed-ACK on top of the real network cost.
+        # SO_KEEPALIVE: detect dead peers so idle WS connections get
+        # cleaned up instead of lingering as zombie threads.
+        tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        tcp.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         tcp.connect(("127.0.0.1", ENGINE_PORT))
         tcp.settimeout(None)
     except OSError as e:

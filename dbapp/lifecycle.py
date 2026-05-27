@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -210,6 +211,103 @@ def start_postgres(cfg: dict) -> None:
             return
         time.sleep(1)
     raise RuntimeError("Postgres failed to become ready in 30s")
+
+
+PGBOUNCER_PORT = 6432
+
+
+def start_pgbouncer(cfg: dict) -> int | None:
+    """Run pgbouncer in front of Postgres for connection pooling.
+
+    Why: every new client connection through the /wire WebSocket relay
+    pays Postgres's per-connection startup cost (auth, role lookup,
+    process fork). Tools that open a new connection per query (ORMs,
+    notebooks with `with engine.connect():` patterns) become slow.
+    pgbouncer keeps ~25 backend connections warm and multiplexes hundreds
+    of client connections onto them.
+
+    Returns the port pgbouncer is listening on (6432), or None if
+    pgbouncer isn't installed in the env image — the router then falls
+    back to talking to Postgres directly.
+    """
+    import shutil as _sh
+    if not _sh.which("pgbouncer"):
+        sys.stderr.write("[lifecycle] pgbouncer not installed — clients hit Postgres directly\n")
+        return None
+
+    pg_port = cfg.get("port", 5432)
+    user = cfg.get("user", "domino")
+
+    # Fetch the SCRAM-SHA-256 password hash that Postgres stored for our
+    # user. pgbouncer can't validate scram passwords without the hash,
+    # and we don't want to hash it ourselves (Postgres's scram salting
+    # is non-trivial to replicate from Python).
+    psql_bin = "/usr/lib/postgresql/16/bin/psql"
+    socket_dir = cfg.get("socket_dir", "/mnt/db/sock")
+    hash_proc = subprocess.run(
+        [psql_bin, "-h", socket_dir, "-p", str(pg_port), "-U", user,
+         "-d", "postgres", "-Atqc",
+         f"SELECT passwd FROM pg_shadow WHERE usename = '{user}'"],
+        capture_output=True, text=True,
+    )
+    if hash_proc.returncode != 0 or "SCRAM-SHA-256" not in hash_proc.stdout:
+        sys.stderr.write(f"[lifecycle] couldn't fetch SCRAM hash for {user}: {hash_proc.stderr}\n")
+        return None
+    scram_hash = hash_proc.stdout.strip()
+
+    pb_dir = Path("/var/lib/dd/pgbouncer")
+    pb_dir.mkdir(parents=True, exist_ok=True)
+    userlist = pb_dir / "userlist.txt"
+    userlist.write_text(f'"{user}" "{scram_hash}"\n')
+    userlist.chmod(0o600)
+
+    config = pb_dir / "pgbouncer.ini"
+    config.write_text(f"""[databases]
+* = host=127.0.0.1 port={pg_port}
+
+[pgbouncer]
+listen_addr = 127.0.0.1
+listen_port = {PGBOUNCER_PORT}
+unix_socket_dir =
+auth_type = scram-sha-256
+auth_file = {userlist}
+pool_mode = transaction
+max_client_conn = 500
+default_pool_size = 25
+reserve_pool_size = 5
+server_lifetime = 3600
+server_idle_timeout = 600
+log_connections = 0
+log_disconnections = 0
+logfile = /var/log/dd/pgbouncer.log
+pidfile = {pb_dir / "pgbouncer.pid"}
+""")
+
+    # Start pgbouncer detached (it daemonizes itself with -d, but writes its
+    # PID file; if a previous instance left one behind, remove it).
+    pid_file = pb_dir / "pgbouncer.pid"
+    if pid_file.exists():
+        try: pid_file.unlink()
+        except OSError: pass
+    subprocess.Popen(
+        ["pgbouncer", "-d", str(config)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    # Wait for it to bind
+    for _ in range(20):
+        try:
+            s = socket.create_connection(("127.0.0.1", PGBOUNCER_PORT), timeout=0.5)
+            s.close()
+            sys.stderr.write(
+                f"[lifecycle] pgbouncer up on :{PGBOUNCER_PORT} → postgres :{pg_port} "
+                f"(pool_mode=transaction, default_pool_size=25)\n"
+            )
+            return PGBOUNCER_PORT
+        except OSError:
+            time.sleep(0.3)
+    sys.stderr.write("[lifecycle] pgbouncer failed to bind — falling back to direct postgres\n")
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -402,6 +500,12 @@ def boot() -> dict:
     if cfg["engine"] == "postgres":
         restore_or_init_postgres(cfg)
         start_postgres(cfg)
+        # Front Postgres with pgbouncer when available. The router learns
+        # about it through cfg["client_port"] — clients hit pgbouncer,
+        # pgbouncer multiplexes onto a small pool of Postgres connections.
+        pb_port = start_pgbouncer(cfg)
+        if pb_port:
+            cfg["client_port"] = pb_port
     elif cfg["engine"] == "mongo":
         start_mongo(cfg)
     else:

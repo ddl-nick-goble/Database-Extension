@@ -1,15 +1,14 @@
-"""Hourly Postgres snapshotter — runs as a cron inside the DB workspace.
+"""Postgres snapshotter — versioning via Domino dataset snapshots.
 
-Approach:
-  1. Take an online `pg_basebackup` into /domino/datasets/db-<id>/snapshots/<ts>/basebackup/
-  2. The WAL archive (continuous, written by Postgres's archive_command in
-     postgresql.conf) is already in /domino/datasets/db-<id>/wal/ — we
-     prune anything older than the oldest retained snapshot.
-  3. Trigger a Domino Dataset snapshot so the version is captured.
-  4. Apply tiered retention (rolling hourly/daily/weekly) so we stay under
-     the default 20-snapshot dataset cap.
+One tick:
+  1. pg_basebackup → /mnt/data/<project>/db-<id>/basebackup/  (live, overwritten)
+  2. POST /v4/datasetrw/snapshot to capture a versioned point-in-time copy
+     of the db-<id>/ subtree in the project's default dataset
 
-Logs go to /var/log/dd/snapshot.log via cron's stdout/stderr capture.
+Version history lives in Domino (visible in the dataset UI under "Snapshots"),
+not in timestamped directories on disk. Restore reads from the live path on
+normal boot. To roll back to an older version, a user manually picks a
+Domino snapshot from the UI.
 """
 
 from __future__ import annotations
@@ -23,144 +22,151 @@ from pathlib import Path
 
 import httpx
 
+# --------------------------------------------------------------------------
+# Config from env (set by lifecycle.schedule_snapshotter)
+# --------------------------------------------------------------------------
 DB_ID = os.environ.get("DD_DB_ID") or os.environ.get("DOMINO_RUN_ID", "default")
 PG_PORT = os.environ.get("DD_PG_PORT", "5432")
 PG_USER = os.environ.get("DD_PG_USER", "domino")
 PG_PASSWORD = os.environ.get("DD_PG_PASSWORD", "")
 
-# Snapshot path. lifecycle.schedule_snapshotter() pins this via the env-file
-# it writes; fall back to the project's default-dataset subdir if unset.
-_DEFAULT_ROOT = (
-    f"{os.environ.get('DOMINO_DATASETS_DIR', '/mnt/data')}/"
-    f"{os.environ.get('DOMINO_PROJECT_NAME', 'default')}/db-{DB_ID}"
+_DOMINO_DATASETS_DIR = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
+_DOMINO_PROJECT_NAME = os.environ.get("DOMINO_PROJECT_NAME", "default")
+SNAPSHOT_ROOT = Path(
+    os.environ.get(
+        "DD_SNAPSHOT_DIR",
+        f"{_DOMINO_DATASETS_DIR}/{_DOMINO_PROJECT_NAME}/db-{DB_ID}",
+    )
 )
-SNAPSHOT_ROOT = Path(os.environ.get("DD_SNAPSHOT_DIR", _DEFAULT_ROOT))
-SNAPSHOTS = SNAPSHOT_ROOT / "snapshots"
-WAL = SNAPSHOT_ROOT / "wal"
+BASEBACKUP_DIR = SNAPSHOT_ROOT / "basebackup"
+WAL_DIR = SNAPSHOT_ROOT / "wal"
 
-API_HOST = os.environ.get("DOMINO_API_HOST", "")
+# Path within the dataset (relative, no leading slash) — what we ask Domino
+# to snapshot. The dataset is mounted at $DOMINO_DATASETS_DIR/<project>/.
+DATASET_RELPATH = f"db-{DB_ID}"
+
+# Domino API
+API_HOST = os.environ.get("DOMINO_API_PROXY") or os.environ.get(
+    "DOMINO_API_HOST", "http://localhost:8899",
+)
 API_KEY = os.environ.get("DOMINO_USER_API_KEY", "")
 PROJECT_ID = os.environ.get("DOMINO_PROJECT_ID", "")
 
 
 def log(msg: str) -> None:
-    print(f"[snapshot] {dt.datetime.now().isoformat()} {msg}", flush=True)
+    print(f"[snapshot] {dt.datetime.utcnow().isoformat()}Z {msg}", flush=True)
 
 
-def basebackup(dest: Path) -> None:
-    dest.mkdir(parents=True, exist_ok=True)
+# --------------------------------------------------------------------------
+# pg_basebackup: write to a staging dir, then atomically swap into place so
+# the canonical path is never half-written.
+# --------------------------------------------------------------------------
+def basebackup() -> None:
+    staging = SNAPSHOT_ROOT / "basebackup.new"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
     env = os.environ.copy()
     env["PGPASSWORD"] = PG_PASSWORD
-    cmd = [
-        "/usr/lib/postgresql/16/bin/pg_basebackup",
-        "-h", "127.0.0.1",
-        "-p", PG_PORT,
-        "-U", PG_USER,
-        "-D", str(dest),
-        "-Ft", "-z",   # tar + gzip → smaller dataset footprint
-        "-Xs",          # stream WAL during backup
-        "-P",
-    ]
-    log(f"running pg_basebackup → {dest}")
-    subprocess.run(cmd, env=env, check=True)
+    subprocess.run(
+        [
+            "/usr/lib/postgresql/16/bin/pg_basebackup",
+            "-h", "127.0.0.1", "-p", PG_PORT, "-U", PG_USER,
+            "-D", str(staging),
+            "-Ft", "-z", "-Xs", "-P",
+        ],
+        env=env, check=True,
+    )
+    # Atomic-ish swap. NFS-mounted datasets honor rename2(), so the window
+    # where the canonical path has stale data is sub-millisecond.
+    old = SNAPSHOT_ROOT / "basebackup.old"
+    if old.exists():
+        shutil.rmtree(old)
+    if BASEBACKUP_DIR.exists():
+        BASEBACKUP_DIR.rename(old)
+    staging.rename(BASEBACKUP_DIR)
+    if old.exists():
+        shutil.rmtree(old, ignore_errors=True)
 
 
-def trigger_dataset_snapshot(tag: str) -> None:
-    """Ask Domino to snapshot the project's default dataset.
+# --------------------------------------------------------------------------
+# Domino dataset snapshot — the actual versioning mechanism
+# --------------------------------------------------------------------------
+def _find_dataset_id(client: httpx.Client) -> str | None:
+    """Return the dataset ID of the project's default dataset.
 
-    Our snapshot bytes land in a subdir of the project's default dataset
-    (DOMINO_DATASETS_DIR/<project>/db-<id>/), so versioning that dataset
-    captures them. No-ops if we can't find the dataset — the on-disk bytes
-    are still durable, this just adds named version history.
+    /api/datasetrw/v2/datasets?projectId=... is IGNORED on this build —
+    use ?projectIdsToInclude=... (verified empirically). Some builds also
+    return cross-project results regardless, so we still filter by
+    projectId client-side.
     """
-    if not API_HOST or not API_KEY or not PROJECT_ID:
-        log("no API credentials/project id — skipping dataset snapshot")
+    r = client.get(
+        "/api/datasetrw/v2/datasets",
+        params={"projectIdsToInclude": PROJECT_ID},
+    )
+    r.raise_for_status()
+    for wrapped in r.json().get("datasets", []):
+        ds = wrapped.get("dataset", {})
+        if ds.get("projectId") == PROJECT_ID:
+            return ds.get("id")
+    return None
+
+
+def trigger_domino_snapshot() -> None:
+    """POST /v4/datasetrw/snapshot for the db-<id>/ subtree. Idempotent —
+    skips silently if another snapshot is in flight on the same dataset.
+    """
+    if not (API_HOST and API_KEY and PROJECT_ID):
+        log("no API credentials / project id — skipping Domino snapshot")
         return
     try:
-        with httpx.Client(base_url=API_HOST, headers={"X-Domino-Api-Key": API_KEY}, timeout=15) as c:
-            r = c.get("/api/datasetrw/v2/datasets", params={"projectId": PROJECT_ID})
-            r.raise_for_status()
-            # Response shape: {"datasets": [{"dataset": {...}}, ...], "metadata": ...}
-            # The ?projectId filter is ignored on some Domino builds — filter
-            # client-side so we don't snapshot somebody else's dataset.
-            wrapped = r.json().get("datasets", [])
-            mine = [w.get("dataset", {}) for w in wrapped
-                    if w.get("dataset", {}).get("projectId") == PROJECT_ID]
-            if not mine:
-                log(f"no dataset found for project {PROJECT_ID} — skip dataset snapshot")
+        with httpx.Client(
+            base_url=API_HOST,
+            headers={"X-Domino-Api-Key": API_KEY},
+            timeout=30,
+        ) as c:
+            ds_id = _find_dataset_id(c)
+            if not ds_id:
+                log(f"no dataset found for project {PROJECT_ID}")
                 return
-            ds_id = mine[0].get("id")
-            r = c.post(f"/api/datasetrw/v1/datasets/{ds_id}/snapshots", json={"tag": tag})
-            if r.status_code >= 400:
-                log(f"snapshot API returned {r.status_code}: {r.text}")
+            body = {
+                "datasetId": ds_id,
+                "relativeFilePaths": [DATASET_RELPATH],
+            }
+            r = c.post("/v4/datasetrw/snapshot", json=body)
+            if r.status_code == 200:
+                snap = r.json()
+                log(
+                    f"Domino snapshot created "
+                    f"id={snap.get('id')} version={snap.get('version')} "
+                    f"status={snap.get('lifecycleStatus')}"
+                )
+            elif r.status_code == 400 and "already in progress" in r.text:
+                log("Domino snapshot already in progress — will catch the next tick")
             else:
-                log(f"dataset snapshot tagged {tag} on dataset {ds_id}")
+                log(f"Domino snapshot API {r.status_code}: {r.text[:300]}")
     except Exception as e:
-        log(f"dataset snapshot failed: {e}")
+        log(f"Domino snapshot trigger failed: {e}")
 
 
-def prune_local() -> None:
-    """Tiered retention: keep 6 hourly + 7 daily + 4 weekly = 17."""
-    if not SNAPSHOTS.exists():
-        return
-    now = dt.datetime.now()
-    entries = sorted(SNAPSHOTS.iterdir(), key=lambda p: p.name)
-    keep: set[Path] = set()
-
-    # Bucket by age category, keep newest in each bucket up to the limit.
-    hourly: list[Path] = []
-    daily: list[Path] = []
-    weekly: list[Path] = []
-    for p in entries:
-        try:
-            ts = dt.datetime.strptime(p.name, "%Y%m%dT%H%M%S")
-        except ValueError:
-            continue
-        age = now - ts
-        if age <= dt.timedelta(hours=6):
-            hourly.append(p)
-        elif age <= dt.timedelta(days=7):
-            daily.append(p)
-        else:
-            weekly.append(p)
-
-    keep.update(hourly[-6:])
-    # one per day for daily
-    by_day: dict[str, Path] = {}
-    for p in daily:
-        by_day[p.name[:8]] = p
-    keep.update(sorted(by_day.values())[-7:])
-    # one per week for weekly
-    by_week: dict[str, Path] = {}
-    for p in weekly:
-        ts = dt.datetime.strptime(p.name, "%Y%m%dT%H%M%S")
-        by_week[ts.strftime("%G-W%V")] = p
-    keep.update(sorted(by_week.values())[-4:])
-
-    for p in entries:
-        if p not in keep and p.is_dir():
-            log(f"pruning {p.name}")
-            shutil.rmtree(p, ignore_errors=True)
-
-
+# --------------------------------------------------------------------------
+# Entry
+# --------------------------------------------------------------------------
 def main() -> int:
     if not PG_PASSWORD:
         log("DD_PG_PASSWORD not set — refusing to run")
         return 2
-    SNAPSHOTS.mkdir(parents=True, exist_ok=True)
-    WAL.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT_ROOT.mkdir(parents=True, exist_ok=True)
+    WAL_DIR.mkdir(parents=True, exist_ok=True)
 
-    ts = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
-    target = SNAPSHOTS / ts / "basebackup"
+    log(f"pg_basebackup → {BASEBACKUP_DIR} (staging then swap)")
     try:
-        basebackup(target)
+        basebackup()
     except subprocess.CalledProcessError as e:
-        log(f"pg_basebackup failed: {e}")
-        shutil.rmtree(SNAPSHOTS / ts, ignore_errors=True)
+        log(f"pg_basebackup failed (rc={e.returncode}): {e}")
         return 1
 
-    trigger_dataset_snapshot(tag=ts)
-    prune_local()
+    trigger_domino_snapshot()
     log("done")
     return 0
 

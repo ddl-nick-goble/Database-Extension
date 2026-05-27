@@ -124,25 +124,36 @@ def restore_or_init_postgres(cfg: dict) -> None:
         sys.stderr.write(f"[lifecycle] pgdata already populated, skipping restore/init\n")
         return
 
-    snapshots = snapshot_dir / "snapshots"
-    if snapshots.exists():
-        candidates = sorted(snapshots.iterdir(), key=lambda p: p.name)
+    # Restore from the single canonical basebackup path. Domino dataset
+    # snapshots are the version history; the live path is always the most
+    # recent successful basebackup.
+    basebackup = snapshot_dir / "basebackup"
+    base_tar = basebackup / "base.tar.gz"
+    wal_tar = basebackup / "pg_wal.tar.gz"
+    if base_tar.exists() and wal_tar.exists():
+        sys.stderr.write(f"[lifecycle] restoring pgdata from {basebackup}\n")
+        subprocess.run(["tar", "-xzf", str(base_tar), "-C", str(pgdata)], check=True)
+        (pgdata / "pg_wal").mkdir(exist_ok=True)
+        subprocess.run(["tar", "-xzf", str(wal_tar), "-C", str(pgdata / "pg_wal")], check=True)
+        _pin_socket_dir(pgdata, cfg)
+        return
+
+    # Legacy timestamped layout (db-<id>/snapshots/<ts>/basebackup/) — kept
+    # only so DBs from before this refactor can still cold-boot. Will be
+    # gone once no live DB references it.
+    legacy = snapshot_dir / "snapshots"
+    if legacy.exists():
+        candidates = sorted(legacy.iterdir(), key=lambda p: p.name)
         latest = next(
             (p for p in reversed(candidates)
              if (p / "basebackup" / "base.tar.gz").exists()),
             None,
         )
         if latest:
-            sys.stderr.write(f"[lifecycle] restoring pgdata from snapshot {latest.name}\n")
-            # snapshot_postgres.py writes pg_basebackup -Ft -z output: base.tar.gz +
-            # pg_wal.tar.gz. Extract both. Do NOT create recovery.signal — the streamed
-            # pg_wal is enough for crash recovery to bring the cluster up clean, and
-            # recovery.signal would require a restore_command we don't have.
-            base_tar = latest / "basebackup" / "base.tar.gz"
-            wal_tar = latest / "basebackup" / "pg_wal.tar.gz"
-            subprocess.run(["tar", "-xzf", str(base_tar), "-C", str(pgdata)], check=True)
+            sys.stderr.write(f"[lifecycle] restoring pgdata from LEGACY snapshot {latest.name}\n")
+            subprocess.run(["tar", "-xzf", str(latest / "basebackup" / "base.tar.gz"), "-C", str(pgdata)], check=True)
             (pgdata / "pg_wal").mkdir(exist_ok=True)
-            subprocess.run(["tar", "-xzf", str(wal_tar), "-C", str(pgdata / "pg_wal")], check=True)
+            subprocess.run(["tar", "-xzf", str(latest / "basebackup" / "pg_wal.tar.gz"), "-C", str(pgdata / "pg_wal")], check=True)
             _pin_socket_dir(pgdata, cfg)
             return
 

@@ -136,6 +136,11 @@ def restore_or_init_postgres(cfg: dict) -> None:
         subprocess.run(["tar", "-xzf", str(base_tar), "-C", str(pgdata)], check=True)
         (pgdata / "pg_wal").mkdir(exist_ok=True)
         subprocess.run(["tar", "-xzf", str(wal_tar), "-C", str(pgdata / "pg_wal")], check=True)
+        # Postgres refuses to start unless the data dir is 0700 or 0750.
+        # mkdir(parents=True) above left it 0755; initdb-fresh-path chmods
+        # to 0700 implicitly, but tar-restore doesn't touch the containing
+        # dir's mode.
+        pgdata.chmod(0o700)
         _pin_socket_dir(pgdata, cfg)
         return
 
@@ -155,6 +160,7 @@ def restore_or_init_postgres(cfg: dict) -> None:
             subprocess.run(["tar", "-xzf", str(latest / "basebackup" / "base.tar.gz"), "-C", str(pgdata)], check=True)
             (pgdata / "pg_wal").mkdir(exist_ok=True)
             subprocess.run(["tar", "-xzf", str(latest / "basebackup" / "pg_wal.tar.gz"), "-C", str(pgdata / "pg_wal")], check=True)
+            pgdata.chmod(0o700)  # Postgres rejects 0755
             _pin_socket_dir(pgdata, cfg)
             return
 

@@ -105,6 +105,27 @@ def _ws_handshake(sock: socket.socket, host: str, path: str, api_key: str) -> by
     return leftover
 
 
+def _mask_xor(mask: bytes, payload: bytes) -> bytes:
+    """RFC 6455 client-to-server masking via bulk big-int XOR.
+
+    The naive `bytes(b ^ mask[i & 3] for i, b in enumerate(payload))` runs
+    one CPython opcode per byte — at 64 KB per frame it's the dominant
+    cost on bulk writes (COPY, large INSERTs). Converting to int via
+    `int.from_bytes`, XOR'ing both integers in one operation, and
+    converting back is ~10-20× faster on typical payloads because the
+    arithmetic happens in libgmp / CPython's bignum C code instead of in
+    interpreted bytecode. Still stdlib-only.
+    """
+    n = len(payload)
+    if n == 0:
+        return b""
+    # Repeat the 4-byte mask to match the payload length
+    repeated = (mask * ((n + 3) // 4))[:n]
+    return (
+        int.from_bytes(payload, "big") ^ int.from_bytes(repeated, "big")
+    ).to_bytes(n, "big")
+
+
 def _send_frame(sock: socket.socket, opcode: int, payload: bytes) -> None:
     """Send a single masked WS frame (clients MUST mask per RFC 6455)."""
     fin_op = 0x80 | (opcode & 0x0F)
@@ -116,8 +137,7 @@ def _send_frame(sock: socket.socket, opcode: int, payload: bytes) -> None:
         header = struct.pack("!BBH", fin_op, 0x80 | 126, n)
     else:
         header = struct.pack("!BBQ", fin_op, 0x80 | 127, n)
-    masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
-    sock.sendall(header + mask + masked)
+    sock.sendall(header + mask + _mask_xor(mask, payload))
 
 
 class _FrameReader:
@@ -153,7 +173,7 @@ class _FrameReader:
         mask = self._read(4) if masked else None
         payload = self._read(length) if length else b""
         if masked:
-            payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+            payload = _mask_xor(mask, payload)
         return opcode, payload, fin
 
 

@@ -255,7 +255,7 @@ def start_pgbouncer(cfg: dict) -> int | None:
         return None
     scram_hash = hash_proc.stdout.strip()
 
-    pb_dir = Path("/var/lib/dd/pgbouncer")
+    pb_dir = Path("/mnt/db/pgbouncer")
     pb_dir.mkdir(parents=True, exist_ok=True)
     userlist = pb_dir / "userlist.txt"
     userlist.write_text(f'"{user}" "{scram_hash}"\n')

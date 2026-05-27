@@ -49,12 +49,12 @@ Every database is a **Domino App**. The wizard, also a Domino App, provisions DB
 
 | | Workspace | App (current) |
 |---|---|---|
-| Lifecycle | Interactive — idles out (admin flag is a workaround) | Always-on service ✅ |
-| Multi-port externally | Only via JupyterLab+server-proxy | Single port multiplexed by Flask ✅ (cleaner; ~80 LoC) |
-| "Open and see your DB" | Workspace IDE = JupyterLab + extra tab for DB explorer | App URL **is** the DB explorer (CloudBeaver at `/admin/`) ✅ |
-| Discoverability | In the project's workspaces list | In the Apps catalog ("your databases") ✅ |
-| Restart on failure | Workspace pause semantics — bad for a DB | App supervisor — built in ✅ |
-| Mental model | "Workspace running a database" (wrong) | "Database (which happens to be an app)" ✅ |
+| Lifecycle | Interactive — idles out (admin flag is a workaround) | Always-on service |
+| Multi-port externally | Only via JupyterLab+server-proxy | Single port multiplexed by Flask (cleaner; ~80 LoC) |
+| "Open and see your DB" | Workspace IDE = JupyterLab + extra tab for DB explorer | App URL **is** the DB explorer (CloudBeaver at `/admin/`) |
+| Discoverability | In the project's workspaces list | In the Apps catalog ("your databases") |
+| Restart on failure | Workspace pause semantics — bad for a DB | App supervisor — built in |
+| Mental model | "Workspace running a database" (wrong) | "Database (which happens to be an app)" |
 
 ## Dispatcher pattern
 

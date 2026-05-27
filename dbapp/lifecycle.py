@@ -318,10 +318,13 @@ def schedule_snapshotter(cfg: dict) -> None:
     survives the parent's exec to gunicorn.
     """
     interval_min = int(cfg.get("snapshot_interval_min", 60))
+    # Prefer /mnt/code/snapshotter/ (live from this commit) over the baked
+    # /opt/dd/snapshotter/ — same dev-iteration preference as the dispatcher
+    # picks /mnt/code/dbapp/ over /opt/dd/.
     script = None
     for candidate in (
-        f"/opt/dd/snapshotter/snapshot_{cfg['engine']}.py",
         f"/mnt/code/snapshotter/snapshot_{cfg['engine']}.py",
+        f"/opt/dd/snapshotter/snapshot_{cfg['engine']}.py",
     ):
         if Path(candidate).exists():
             script = candidate

@@ -27,6 +27,10 @@
     --postgres-bg:  #eaf1f8;
     --mongo:        #4db33d;
     --mongo-bg:     #ebf7e9;
+    --mysql:        #00758f;
+    --mysql-bg:     #e0f2f6;
+    --redis:        #dc382d;
+    --redis-bg:     #fcecea;
 }
 
 html, body {
@@ -133,6 +137,8 @@ code {
 }
 .stat-postgres { color: var(--postgres); }
 .stat-mongo    { color: var(--mongo); }
+.stat-mysql    { color: var(--mysql); }
+.stat-redis    { color: var(--redis); }
 .stat-running  { color: var(--success); }
 .stat-stopped  { color: var(--text-faint); }
 
@@ -195,13 +201,13 @@ code {
 .data-table tbody tr:hover { background: var(--bg-alt); }
 .muted { color: var(--text-faint); }
 .th-actions, .td-actions {
-    text-align: right;
+    text-align: center;
     white-space: nowrap;
 }
 .td-actions {
     display: flex;
     gap: 6px;
-    justify-content: flex-end;
+    justify-content: center;
     align-items: center;
     /* Match the table row vertical rhythm — flex on td needs explicit height */
     min-height: 28px;
@@ -231,6 +237,8 @@ code {
 }
 .badge-postgres { background: var(--postgres-bg); color: var(--postgres); }
 .badge-mongo    { background: var(--mongo-bg);    color: var(--mongo); }
+.badge-mysql    { background: var(--mysql-bg);    color: var(--mysql); }
+.badge-redis    { background: var(--redis-bg);    color: var(--redis); }
 .badge-running  { background: #dcfce7; color: #15803d; }
 .badge-starting { background: #fef3c7; color: #b45309; }
 .badge-pending  { background: #e0e7ff; color: #4338ca; }
@@ -388,6 +396,13 @@ code {
     background: #eef2ff;
 }
 .engine-icon { font-size: 40px; margin-bottom: 8px; }
+.engine-icon-img {
+    width: 48px; height: 48px;
+    object-fit: contain;
+    margin-bottom: 8px;
+    display: block;
+    margin-left: auto; margin-right: auto;
+}
 .engine-card h3 { margin: 0 0 4px 0; font-size: 15px; font-weight: 600; }
 .engine-card p { margin: 0; color: var(--text-soft); font-size: 12px; }
 
@@ -461,5 +476,8 @@ code {
 }
 .provision-log.hidden { display: none; }
 .provision-log a { color: #60a5fa; }
-.provision-log .ok  { color: #34d399; }
-.provision-log .err { color: #f87171; }
+.provision-log .ok    { color: #34d399; }
+.provision-log .err   { color: #f87171; }
+.provision-log .warn  { color: #fbbf24; }
+.provision-log .step  { color: #93c5fd; }
+.provision-log .muted { color: #6b7280; }

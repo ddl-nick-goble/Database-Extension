@@ -28,20 +28,14 @@
         <button class="tab" data-tab="usage">Usage</button>
     </nav>
 
-    <!-- Stats row -->
+    <!-- Stats row — engine-specific stats are rendered from the registry
+         by app.js (see populateStatsRow). -->
     <section class="stats-row" id="stats-row">
         <div class="stat">
             <div class="stat-label">TOTAL DATABASES</div>
             <div class="stat-value" id="stat-total">—</div>
         </div>
-        <div class="stat">
-            <div class="stat-label">POSTGRES</div>
-            <div class="stat-value stat-postgres" id="stat-postgres">—</div>
-        </div>
-        <div class="stat">
-            <div class="stat-label">MONGO</div>
-            <div class="stat-value stat-mongo" id="stat-mongo">—</div>
-        </div>
+        <!-- Per-engine cards injected here -->
         <div class="stat">
             <div class="stat-label">RUNNING</div>
             <div class="stat-value stat-running" id="stat-running">—</div>
@@ -56,8 +50,7 @@
     <section class="filters">
         <select id="filter-engine">
             <option value="">All Engines</option>
-            <option value="postgres">Postgres</option>
-            <option value="mongo">Mongo</option>
+            <!-- engine options injected by app.js from /api/config -->
         </select>
         <select id="filter-status">
             <option value="">All Statuses</option>
@@ -105,24 +98,19 @@
             <div class="step" data-step="3"><span>3</span> Review</div>
         </div>
 
-        <!-- Step 1: engine picker -->
+        <!-- Step 1: engine picker — cards rendered by app.js from
+             /api/config.engines so adding an engine is a one-side change. -->
         <section class="step-body" id="step-1">
             <p class="muted">Choose the database engine to provision.</p>
-            <div class="engine-grid">
-                <div class="engine-card" data-engine="postgres">
-                    <div class="engine-icon">🐘</div>
-                    <h3>PostgreSQL</h3>
-                    <p>Relational • SQL • `psql`/JDBC/ODBC via WS tunnel</p>
-                </div>
-                <div class="engine-card" data-engine="mongo">
-                    <div class="engine-icon">🍃</div>
-                    <h3>MongoDB</h3>
-                    <p>Document store • `mongosh` & drivers</p>
-                </div>
+            <div class="engine-grid" id="engine-grid">
+                <!-- engine cards injected here -->
             </div>
         </section>
 
-        <!-- Step 2: configure -->
+        <!-- Step 2: configure
+             Compute environment is auto-resolved from the engine choice
+             (each engine has exactly one image — dd-postgres-app etc.).
+             We don't ask the user to pick it. -->
         <section class="step-body hidden" id="step-2">
             <div class="form-row">
                 <label>Name</label>
@@ -130,13 +118,9 @@
                 <div class="form-help">Will be prefixed with <code id="name-prefix">pg-</code></div>
             </div>
             <div class="form-row">
-                <label>Compute environment</label>
-                <select id="db-env"><option>Loading…</option></select>
-                <div class="form-help">Built from <code>envs/dd-&lt;engine&gt;-env/</code>. Pick the right one for the selected engine.</div>
-            </div>
-            <div class="form-row">
                 <label>Hardware tier</label>
                 <select id="db-tier"><option>Loading…</option></select>
+                <div class="form-help">Sizes the database container. Bigger = more RAM for caches and more concurrent connections.</div>
             </div>
             <div class="form-row">
                 <label>Admin password</label>
@@ -154,7 +138,6 @@
             <table class="review-table">
                 <tr><th>Engine</th><td id="r-engine">—</td></tr>
                 <tr><th>Name</th><td id="r-name">—</td></tr>
-                <tr><th>Environment</th><td id="r-env">—</td></tr>
                 <tr><th>Hardware tier</th><td id="r-tier">—</td></tr>
                 <tr><th>Password</th><td id="r-pw">—</td></tr>
             </table>

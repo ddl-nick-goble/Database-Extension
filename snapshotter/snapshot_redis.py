@@ -1,14 +1,16 @@
-"""MongoDB snapshotter — runs on a fixed interval inside the DB App.
+"""Redis snapshotter — BGSAVE + gzip dump.rdb + Domino dataset snapshot.
 
 One tick:
-  1. mongodump --oplog --gzip into <snapshot_dir>/snapshots.new/dump
-  2. Atomic-ish rename to <snapshot_dir>/snapshots/<ts>
-  3. Update <snapshot_dir>/snapshots/latest symlink (used by restore)
-  4. POST /v4/datasetrw/snapshot to capture a versioned dataset snapshot
+  1. Record current LASTSAVE timestamp on the server
+  2. Send BGSAVE; poll LASTSAVE until it advances (snapshot complete)
+  3. Read the live dump.rdb path from CONFIG GET dir + dbfilename
+  4. gzip the .rdb into staging, atomic-rename into snapshots/<ts>/
+  5. Update snapshots/latest symlink
+  6. POST /v4/datasetrw/snapshot for the versioned Domino snapshot
 
-Layout mirrors snapshot_postgres.py — both engines write to
-$DOMINO_DATASETS_DIR/<project>/db-<id>/, so the wizard + lifecycle code
-can use one set of helpers.
+The live AOF (appendfsync everysec) is what protects against in-memory
+loss between snapshots — the dataset snapshot exists for point-in-time
+restore on cold boot in a new DB App.
 """
 
 from __future__ import annotations
@@ -18,17 +20,14 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import httpx
 
-# --------------------------------------------------------------------------
-# Config from env (set by lifecycle.schedule_snapshotter)
-# --------------------------------------------------------------------------
 DB_ID = os.environ.get("DD_DB_ID") or os.environ.get("DOMINO_RUN_ID", "default")
-MONGO_PORT = os.environ.get("DD_MONGO_PORT", "27017")
-MONGO_USER = os.environ.get("DD_MONGO_USER", "domino")
-MONGO_PASSWORD = os.environ.get("DD_MONGO_PASSWORD", "")
+REDIS_PORT = os.environ.get("DD_REDIS_PORT", "6379")
+REDIS_PASSWORD = os.environ.get("DD_REDIS_PASSWORD", "")
 
 _DOMINO_DATASETS_DIR = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
 _DOMINO_PROJECT_NAME = os.environ.get("DOMINO_PROJECT_NAME", "default")
@@ -53,42 +52,80 @@ def log(msg: str) -> None:
     print(f"[snapshot] {dt.datetime.utcnow().isoformat()}Z {msg}", flush=True)
 
 
-def mongodump(staging: Path) -> None:
-    staging.mkdir(parents=True, exist_ok=True)
-    # --oplog requires the source to be a replSet primary; the Mongo
-    # adapter starts mongod as a single-node rs0 specifically for this.
+def redis_cli(*args: str, timeout: int = 10) -> str:
     cmd = [
-        "mongodump",
-        f"--host=127.0.0.1:{MONGO_PORT}",
-        f"--username={MONGO_USER}",
-        f"--password={MONGO_PASSWORD}",
-        "--authenticationDatabase=admin",
-        "--oplog",
-        "--gzip",
-        f"--out={staging}",
-    ]
-    log(f"running mongodump → {staging}")
-    subprocess.run(cmd, check=True)
+        "redis-cli", "-h", "127.0.0.1", "-p", REDIS_PORT,
+        "-a", REDIS_PASSWORD, "--no-auth-warning",
+    ] + list(args)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"redis-cli {args[0]} failed (rc={r.returncode}): {r.stderr[:300]}"
+        )
+    return r.stdout.strip()
+
+
+def _rdb_path() -> Path:
+    """Read dir + dbfilename from the running server. Avoids hardcoding
+    /mnt/db/redis — the adapter could move it."""
+    out = redis_cli("CONFIG", "GET", "dir").splitlines()
+    # CONFIG GET returns key\nvalue\n
+    rdb_dir = out[-1] if out else "/mnt/db/redis"
+    out = redis_cli("CONFIG", "GET", "dbfilename").splitlines()
+    rdb_name = out[-1] if out else "dump.rdb"
+    return Path(rdb_dir) / rdb_name
+
+
+def bgsave_and_wait(staging: Path) -> Path:
+    """Trigger BGSAVE, wait for LASTSAVE to advance, copy + gzip the .rdb."""
+    before = int(redis_cli("LASTSAVE"))
+    redis_cli("BGSAVE")
+    log("BGSAVE triggered; waiting for LASTSAVE to advance")
+    # Default: poll for up to 5 minutes. Larger RDBs may need this.
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        time.sleep(2)
+        try:
+            now = int(redis_cli("LASTSAVE"))
+        except RuntimeError:
+            continue
+        if now > before:
+            break
+    else:
+        raise RuntimeError("BGSAVE never completed within 5 minutes")
+
+    rdb = _rdb_path()
+    if not rdb.exists():
+        raise RuntimeError(f"rdb file not found at {rdb}")
+
+    staging.mkdir(parents=True, exist_ok=True)
+    target = staging / "dump.rdb.gz"
+    log(f"compressing {rdb} → {target}")
+    with rdb.open("rb") as src, subprocess.Popen(
+        ["gzip", "-1"], stdin=subprocess.PIPE, stdout=target.open("wb"),
+    ) as gz:
+        shutil.copyfileobj(src, gz.stdin)
+        if gz.stdin is not None:
+            gz.stdin.close()
+        gz_rc = gz.wait()
+    if gz_rc != 0:
+        raise RuntimeError(f"gzip failed rc={gz_rc}")
+    return target
 
 
 def swap_into_place(staging: Path, ts: str) -> Path:
-    """Move staging → snapshots/<ts>, point snapshots/latest at it.
-
-    `latest` is a symlink (not a hardlink) so the lifecycle adapter's
-    restore code can resolve a stable path.
-    """
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
     final = SNAPSHOTS_DIR / ts
     if final.exists():
         shutil.rmtree(final, ignore_errors=True)
     staging.rename(final)
 
-    latest_link = SNAPSHOTS_DIR / "latest"
+    latest = SNAPSHOTS_DIR / "latest"
     tmp_link = SNAPSHOTS_DIR / "latest.new"
     if tmp_link.exists() or tmp_link.is_symlink():
         tmp_link.unlink()
-    tmp_link.symlink_to(ts)  # relative target — works under bind-mounts
-    tmp_link.rename(latest_link)
+    tmp_link.symlink_to(ts)
+    tmp_link.rename(latest)
     return final
 
 
@@ -102,7 +139,6 @@ def trigger_domino_snapshot() -> None:
             headers={"X-Domino-Api-Key": API_KEY},
             timeout=30,
         ) as c:
-            # Same projectIdsToInclude quirk as snapshot_postgres.py.
             r = c.get(
                 "/api/datasetrw/v2/datasets",
                 params={"projectIdsToInclude": PROJECT_ID},
@@ -134,18 +170,18 @@ def trigger_domino_snapshot() -> None:
 
 
 def main() -> int:
-    if not MONGO_PASSWORD:
-        log("DD_MONGO_PASSWORD not set — refusing to run")
+    if not REDIS_PASSWORD:
+        log("DD_REDIS_PASSWORD not set — refusing to run")
         return 2
     SNAPSHOT_ROOT.mkdir(parents=True, exist_ok=True)
     SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    staging = SNAPSHOT_ROOT / f"mongodump.new.{ts}"
+    staging = SNAPSHOT_ROOT / f"bgsave.new.{ts}"
 
     try:
-        mongodump(staging)
-    except subprocess.CalledProcessError as e:
-        log(f"mongodump failed (rc={e.returncode})")
+        bgsave_and_wait(staging)
+    except RuntimeError as e:
+        log(f"BGSAVE pipeline failed: {e}")
         shutil.rmtree(staging, ignore_errors=True)
         return 1
 

@@ -7,6 +7,8 @@
 #   dd-wizard env (or unset)  → wizard  → python app.py
 #   dd-postgres-app env       → DB app  → bash dbapp/app.sh
 #   dd-mongo-app env          → DB app  → bash dbapp/app.sh
+#   dd-mysql-app env          → DB app  → bash dbapp/app.sh
+#   dd-redis-app env          → DB app  → bash dbapp/app.sh
 #
 # Pattern lifted from MRM-Portal: $PORT, port cleanup, cliSiteConfig URL
 # resolution, click-to-open URL print.
@@ -54,7 +56,7 @@ pip install -q -r requirements.txt
 
 # ── Dispatch ─────────────────────────────────────────────────────────────
 case "$DD_ROLE" in
-    postgres|mongo|database)
+    postgres|mongo|mysql|redis|database)
         # Prefer /mnt/code/dbapp/ when it exists — that's THIS project's
         # local copy of the boot logic. Iterating on it costs a git push
         # (~10s) instead of an env rebuild (~5min). Projects that don't

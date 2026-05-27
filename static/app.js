@@ -10,7 +10,6 @@ const state = {
     config: {},
     databases: [],
     summary: {},
-    envs: [],
     tiers: [],
     wizard: {
         step: 1,
@@ -53,13 +52,81 @@ async function boot() {
     bindUi();
     try {
         state.config = await api("/config");
+        // Engine catalog drives the entire UI — paint it before anything
+        // else so the filter dropdown / engine cards / stat tiles all
+        // exist before refreshDatabases() tries to populate them.
+        renderEngineDropdown();
+        renderStatTiles();
+        renderEngineCards();
     } catch (e) {
         console.error("config load failed", e);
     }
     await refreshDatabases();
-    // Catalogs load lazily when the wizard opens.
+    // Catalogs (envs / hw tiers) load lazily when the wizard opens.
 }
 document.addEventListener("DOMContentLoaded", boot);
+
+// engines() returns the catalog the backend resolved from the registry.
+// Empty array if the backend response was malformed — UI degrades to a
+// generic database list without engine-specific affordances.
+function enginesCatalog() {
+    return Array.isArray(state.config.engines) ? state.config.engines : [];
+}
+
+function renderEngineDropdown() {
+    const sel = document.getElementById("filter-engine");
+    if (!sel) return;
+    const head = `<option value="">All Engines</option>`;
+    sel.innerHTML = head + enginesCatalog().map(e =>
+        `<option value="${escapeHtml(e.name)}">${escapeHtml(e.label)}</option>`
+    ).join("");
+}
+
+function renderStatTiles() {
+    // Insert per-engine stat tiles after the TOTAL tile, before RUNNING.
+    const row = document.getElementById("stats-row");
+    if (!row) return;
+    // Strip any previously-injected tiles (idempotent reload).
+    row.querySelectorAll("[data-engine-stat]").forEach(el => el.remove());
+    const runningTile = row.querySelector(".stat-value.stat-running")?.closest(".stat");
+    enginesCatalog().forEach(e => {
+        const tile = document.createElement("div");
+        tile.className = "stat";
+        tile.setAttribute("data-engine-stat", e.name);
+        tile.innerHTML = `
+            <div class="stat-label">${escapeHtml(e.label.toUpperCase())}</div>
+            <div class="stat-value" id="stat-engine-${e.name}">—</div>
+        `;
+        row.insertBefore(tile, runningTile);
+    });
+}
+
+function renderEngineCards() {
+    const grid = document.getElementById("engine-grid");
+    if (!grid) return;
+    grid.innerHTML = enginesCatalog().map(e => {
+        const icon = e.iconUrl
+            ? `<img class="engine-icon-img" src="${escapeHtml(e.iconUrl)}" alt="${escapeHtml(e.label)}">`
+            : e.icon
+                ? `<div class="engine-icon">${escapeHtml(e.icon)}</div>`
+                : "";
+        return `
+            <div class="engine-card" data-engine="${escapeHtml(e.name)}">
+                ${icon}
+                <h3>${escapeHtml(e.label)}</h3>
+                <p>${escapeHtml(e.description)}</p>
+            </div>
+        `;
+    }).join("");
+    // Re-bind click handlers on the freshly rendered cards.
+    grid.querySelectorAll(".engine-card").forEach(c => {
+        c.onclick = () => {
+            state.wizard.engine = c.getAttribute("data-engine");
+            renderWizard();
+            applyEnvDefault();
+        };
+    });
+}
 
 // =====================================================================
 // Dashboard
@@ -83,8 +150,10 @@ function renderStats() {
     const s = state.summary;
     const total = (s.total ?? state.databases.length) || 0;
     document.getElementById("stat-total").textContent    = total;
-    document.getElementById("stat-postgres").textContent = s.postgres ?? "0";
-    document.getElementById("stat-mongo").textContent    = s.mongo    ?? "0";
+    enginesCatalog().forEach(e => {
+        const el = document.getElementById(`stat-engine-${e.name}`);
+        if (el) el.textContent = s[e.name] ?? "0";
+    });
     document.getElementById("stat-running").textContent  = s.running  ?? "0";
     document.getElementById("stat-stopped").textContent  = Math.max(0, total - (s.running || 0));
 }
@@ -110,7 +179,9 @@ function renderTable() {
     }
 
     tbody.innerHTML = rows.map(db => {
-        const eb = db.engine === "postgres" ? "badge-postgres" : db.engine === "mongo" ? "badge-mongo" : "";
+        // Use a uniform `badge-<engine>` class — style.css has rules for
+        // each registered engine name (postgres / mongo / mysql / redis).
+        const eb = `badge-${db.engine}`;
         const sLower = String(db.status).toLowerCase();
         const sb =
             sLower === "running"                                ? "badge-running" :
@@ -123,9 +194,12 @@ function renderTable() {
             : `<span class="muted">—</span>`;
         const created = db.createdAt ? formatDate(db.createdAt) : "<span class=\"muted\">—</span>";
         const isRunning = db.isRunning;
+        const isTransitioning = ["pending", "starting", "preparing", "queued"].includes(sLower);
         const actionBtns = isRunning
             ? `<button class="btn btn-secondary btn-small" data-stop="${db.id}">Stop</button>`
-            : `<button class="btn btn-secondary btn-small" data-start="${db.id}">Start</button>`;
+            : isTransitioning
+                ? `<button class="btn btn-secondary btn-small" disabled title="DB is ${escapeHtml(db.status)} — wait for it to settle">Start</button>`
+                : `<button class="btn btn-secondary btn-small" data-start="${db.id}">Start</button>`;
         return `
             <tr>
                 <td><b>${escapeHtml(db.name)}</b></td>
@@ -210,35 +284,23 @@ function closeWizard() {
 }
 
 async function loadCatalogs() {
-    if (state.envs.length && state.tiers.length) return;
-    const [envs, tiers] = await Promise.all([api("/environments"), api("/hardware-tiers")]);
-    state.envs = envs;
+    // We only need hw tiers now — the compute env is resolved from the
+    // engine catalog (each engine has exactly one image, baked in by an
+    // admin via DD_<ENGINE>_ENV_ID on the wizard project).
+    if (state.tiers.length) return;
+    const tiers = await api("/hardware-tiers");
     state.tiers = tiers;
-    populateCatalogSelects();
-    // Re-apply the engine default in case the user already picked an engine
-    // before catalogs finished loading (race that previously left the env
-    // dropdown unset → app spawned with project default env).
-    applyEnvDefault();
-}
-
-function populateCatalogSelects() {
-    const envSel = document.getElementById("db-env");
     const tierSel = document.getElementById("db-tier");
-    envSel.innerHTML = `<option value="">— pick environment —</option>` +
-        state.envs.map(e => `<option value="${e.id}">${escapeHtml(e.name)}</option>`).join("");
     tierSel.innerHTML = state.tiers.map(t =>
         `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join("");
 }
 
-function applyEnvDefault() {
-    const envSel = document.getElementById("db-env");
-    if (!envSel) return;
-    const def = state.wizard.engine === "postgres"
-        ? state.config.postgresEnvId
-        : state.config.mongoEnvId;
-    if (!def) return;
-    const match = envSel.querySelector(`option[value="${def}"]`);
-    if (match) envSel.value = def;
+// Returns the env id the wizard will submit for the currently-picked
+// engine, or "" if the admin hasn't configured one — caller surfaces
+// that as a user-visible error.
+function resolveEnvId() {
+    const eng = enginesCatalog().find(e => e.name === state.wizard.engine);
+    return eng?.envId || "";
 }
 
 function renderWizard() {
@@ -254,8 +316,9 @@ function renderWizard() {
     document.getElementById("btn-next").textContent =
         s === 3 ? "Provision" : "Next →";
 
+    const adapter = enginesCatalog().find(e => e.name === state.wizard.engine);
     document.getElementById("name-prefix").textContent =
-        state.wizard.engine === "mongo" ? "mongo-" : "pg-";
+        adapter?.appPrefix ?? "pg-";
 
     // populate engine cards
     document.querySelectorAll(".engine-card").forEach(c => {
@@ -264,11 +327,10 @@ function renderWizard() {
 
     if (s === 3) {
         const ws = state.wizard;
-        document.getElementById("r-engine").textContent = ws.engine;
+        document.getElementById("r-engine").textContent =
+            adapter ? adapter.label : ws.engine;
         document.getElementById("r-name").textContent =
-            (ws.engine === "mongo" ? "mongo-" : "pg-") + ws.name;
-        document.getElementById("r-env").textContent =
-            (state.envs.find(e => e.id === ws.environmentId) || {}).name || ws.environmentId;
+            (adapter?.appPrefix ?? "pg-") + ws.name;
         document.getElementById("r-tier").textContent =
             (state.tiers.find(t => t.id === ws.hardwareTierId) || {}).name || ws.hardwareTierId;
         document.getElementById("r-pw").textContent = "•".repeat(ws.password.length);
@@ -277,7 +339,7 @@ function renderWizard() {
 
 function readFormToWizard() {
     state.wizard.name           = document.getElementById("db-name").value.trim();
-    state.wizard.environmentId  = document.getElementById("db-env").value;
+    state.wizard.environmentId  = resolveEnvId();
     state.wizard.hardwareTierId = document.getElementById("db-tier").value;
     state.wizard.password       = document.getElementById("db-pw").value;
 }
@@ -293,14 +355,20 @@ async function next() {
     if (s === 2) {
         readFormToWizard();
         const w = state.wizard;
-        if (!w.name || !w.environmentId || !w.hardwareTierId || !w.password) {
-            alert("All fields required.");
+        if (!w.name || !w.hardwareTierId || !w.password) {
+            alert("Name, hardware tier, and password are required.");
             return;
         }
-        // Guard against an env id that's not in the dropdown (shouldn't happen,
-        // but if it does we'd send junk to Domino and get a wrong-env spawn).
-        if (!state.envs.find(e => e.id === w.environmentId)) {
-            alert("Selected environment is not in the catalog. Refresh and try again.");
+        if (!w.environmentId) {
+            // resolveEnvId() returned "" — the admin hasn't built / wired
+            // up the env image for this engine yet. Tell the user how to
+            // fix it instead of letting Domino spawn against a wrong env.
+            const eng = enginesCatalog().find(e => e.name === w.engine);
+            alert(
+                `No compute environment is configured for ${eng?.label || w.engine}.\n\n` +
+                `Ask an admin to build envs/dd-${w.engine}-app and set ` +
+                `${eng?.envIdVar || 'the env id'} on the wizard project.`
+            );
             return;
         }
         state.wizard.step = 3;
@@ -322,32 +390,95 @@ function prev() {
 async function provision() {
     const log = document.getElementById("provision-log");
     log.classList.remove("hidden");
-    log.innerHTML = "Creating Domino App…\n";
+    log.innerHTML = "";
     document.getElementById("btn-next").disabled = true;
     document.getElementById("btn-prev").disabled = true;
+
+    const append = (cls, marker, msg, extra) => {
+        const tail = extra ? ` <span class="muted">(${escapeHtml(extra)})</span>` : "";
+        const cleanCls = cls ? ` class="${cls}"` : "";
+        log.innerHTML += `<span${cleanCls}>${escapeHtml(marker)} ${escapeHtml(msg)}</span>${tail}\n`;
+        log.scrollTop = log.scrollHeight;
+    };
+    const renderEvent = (kind, data) => {
+        const msg = data.msg || "";
+        const ms = (typeof data.ms === "number" && data.ms > 0) ? `${data.ms}ms` : "";
+        if (kind === "step")        append("step",  "→", msg, ms);
+        else if (kind === "ok")     append("ok",    "✓", msg, ms);
+        else if (kind === "tick")   append("muted", "·", `${msg} (${data.elapsed_s}s)`);
+        else if (kind === "warn")   append("warn",  "⚠", msg + (data.detail ? ` — ${data.detail}` : ""));
+        else if (kind === "error")  append("err",   "✗", msg + (data.detail ? ` — ${data.detail}` : ""));
+        else if (kind === "result") {
+            append("ok", "✓", `Created App ${data.id} — status ${data.status}`,
+                   (typeof data.totalMs === "number") ? `total ${data.totalMs}ms` : "");
+            if (data.url) {
+                log.innerHTML += `<span class="ok">→</span> Open: <a href="${escapeHtml(data.url)}" target="_blank">${escapeHtml(data.url)}</a>\n`;
+                log.scrollTop = log.scrollHeight;
+            }
+            if (data.startError) {
+                append("warn", "⚠", `Start: ${data.startError}`);
+            }
+        }
+    };
+
+    let terminal = null;  // { kind: 'result'|'error', data }
     try {
         const w = state.wizard;
-        const body = {
+        const body = JSON.stringify({
             engine: w.engine,
             name: w.name,
             environmentId: w.environmentId,
             hardwareTierId: w.hardwareTierId,
             password: w.password,
-        };
-        const result = await api("/databases", { method: "POST", body: JSON.stringify(body) });
-        log.innerHTML += `<span class="ok">✓ Created App ${result.id}</span>\n`;
-        log.innerHTML += `  Status: ${result.status}\n`;
-        if (result.url) {
-            log.innerHTML += `  Open: <a href="${result.url}" target="_blank">${result.url}</a>\n`;
+        });
+        const resp = await fetch(`${API}/databases`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+            body,
+        });
+        const ct = resp.headers.get("Content-Type") || "";
+        // Non-SSE error response (pre-stream failure, e.g. malformed JSON).
+        if (!ct.includes("event-stream")) {
+            const text = await resp.text();
+            let detail = text;
+            try { detail = (JSON.parse(text).error) || text; } catch {}
+            throw new Error(`${resp.status} ${resp.statusText}: ${detail}`.trim());
         }
-        if (result.startError) {
-            log.innerHTML += `<span class="err">⚠ Start failed: ${escapeHtml(result.startError)}</span>\n`;
-        } else {
-            log.innerHTML += "Container is booting (this can take ~1 min)…\n";
+
+        const reader = resp.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            // SSE records separated by blank line.
+            let idx;
+            while ((idx = buf.indexOf("\n\n")) !== -1) {
+                const record = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                // Skip SSE comments (lines starting with ':') — used for padding/flush.
+                const lines = record.split("\n").filter(l => l && !l.startsWith(":"));
+                if (lines.length === 0) continue;
+                let kind = "message", dataStr = "";
+                for (const line of lines) {
+                    if (line.startsWith("event:")) kind = line.slice(6).trim();
+                    else if (line.startsWith("data:")) dataStr += (dataStr ? "\n" : "") + line.slice(5).trimStart();
+                }
+                let data = {};
+                try { data = JSON.parse(dataStr); } catch {}
+                renderEvent(kind, data);
+                if (kind === "result" || kind === "error") terminal = { kind, data };
+            }
         }
-        setTimeout(() => { closeWizard(); refreshDatabases(); }, 2000);
     } catch (e) {
-        log.innerHTML += `<span class="err">✗ ${escapeHtml(e.message)}</span>\n`;
+        append("err", "✗", e.message || String(e));
+    }
+
+    if (terminal && terminal.kind === "result") {
+        setTimeout(() => { closeWizard(); refreshDatabases(); }, 1800);
+    } else {
+        // error, or stream ended without a terminal event — let the user retry.
         document.getElementById("btn-next").disabled = false;
         document.getElementById("btn-prev").disabled = false;
     }

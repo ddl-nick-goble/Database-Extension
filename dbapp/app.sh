@@ -40,19 +40,43 @@ open('/tmp/dd-config.json', 'w').write(json.dumps(cfg))
 print('[dbapp] config cached at /tmp/dd-config.json')
 "
 
+# Teardown snapshot: when Domino sends SIGTERM (App stop / container kill),
+# run a final pg_basebackup before letting gunicorn die. lifecycle.boot
+# stages /tmp/dd-final-snapshot.sh with all the env vars baked in.
+_dd_teardown() {
+    if [ -x /tmp/dd-final-snapshot.sh ]; then
+        echo "[dbapp] caught signal — running teardown snapshot…" >&2
+        bash /tmp/dd-final-snapshot.sh >> /var/log/dd/snapshot.log 2>&1 \
+            && echo "[dbapp] teardown snapshot OK" >&2 \
+            || echo "[dbapp] teardown snapshot FAILED — letting shutdown proceed" >&2
+    fi
+    if [ -n "${GUN_PID:-}" ] && kill -0 "$GUN_PID" 2>/dev/null; then
+        kill -TERM "$GUN_PID" 2>/dev/null || true
+        wait "$GUN_PID" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap _dd_teardown TERM INT
+
 echo "[dbapp] launching router on :${PORT}"
 if [ "${PORT}" = "8888" ]; then
     # Production: gunicorn with the gthread worker class so flask-sock can
     # serve the /wire WebSocket relay alongside the regular HTTP routes.
-    exec gunicorn \
+    # Run as a child process (NOT exec) so this bash stays around to catch
+    # SIGTERM and run the teardown snapshot before gunicorn exits.
+    gunicorn \
         --bind "0.0.0.0:${PORT}" \
         --workers 1 \
         --threads 16 \
         --timeout 0 \
         --worker-class gthread \
         --chdir "$DD_MODULE_HOME" \
-        dbapp.router:app
+        dbapp.router:app &
+    GUN_PID=$!
+    wait "$GUN_PID"
 else
     # Dev: Flask's built-in server, fine for one user.
-    exec python3 -m flask --app dbapp/router.py run --host 0.0.0.0 --port "${PORT}"
+    python3 -m flask --app dbapp/router.py run --host 0.0.0.0 --port "${PORT}" &
+    GUN_PID=$!
+    wait "$GUN_PID"
 fi

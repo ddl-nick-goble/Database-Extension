@@ -355,6 +355,28 @@ def schedule_snapshotter(cfg: dict) -> None:
         )
     sys.stderr.write(f"[lifecycle] snapshotter loop started pid={proc.pid} (every {interval_sec}s, script={script})\n")
 
+    # Also stage a ready-to-run script for the SIGTERM trap in dbapp/app.sh
+    # to call on graceful shutdown — captures the last write before the
+    # container disappears. Has the same env vars baked in so it can run
+    # without any state from the python parent.
+    final_helper = Path("/tmp/dd-final-snapshot.sh")
+    final_helper.write_text(
+        "#!/bin/bash\n"
+        "# Run by dbapp/app.sh on SIGTERM/SIGINT. Bake a fresh snapshot\n"
+        "# before the container is killed.\n"
+        f"export DD_DB_ID={cfg['db_id']!r}\n"
+        f"export DD_SNAPSHOT_DIR={str(snap_dir)!r}\n"
+        f"export DD_PG_PORT={cfg.get('port', 5432)}\n"
+        f"export DD_PG_USER={cfg.get('user', 'domino')!r}\n"
+        f"export DD_PG_PASSWORD={cfg['password']!r}\n"
+        f"export DOMINO_API_PROXY={os.environ.get('DOMINO_API_PROXY', 'http://localhost:8899')!r}\n"
+        f"export DOMINO_USER_API_KEY={os.environ.get('DOMINO_USER_API_KEY', '')!r}\n"
+        f"export DOMINO_PROJECT_ID={os.environ.get('DOMINO_PROJECT_ID', '')!r}\n"
+        f"timeout 60 python3 {script} 2>&1\n"
+    )
+    final_helper.chmod(0o700)
+    sys.stderr.write(f"[lifecycle] teardown snapshot helper written to {final_helper}\n")
+
 
 # --------------------------------------------------------------------------
 # Entry — invoked by dbapp/app.sh once before launching the Flask router

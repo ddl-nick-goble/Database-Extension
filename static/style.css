@@ -201,13 +201,13 @@ code {
 .data-table tbody tr:hover { background: var(--bg-alt); }
 .muted { color: var(--text-faint); }
 .th-actions, .td-actions {
-    text-align: center;
+    text-align: left;
     white-space: nowrap;
 }
 .td-actions {
     display: flex;
     gap: 6px;
-    justify-content: center;
+    justify-content: flex-start;
     align-items: center;
     /* Match the table row vertical rhythm — flex on td needs explicit height */
     min-height: 28px;
@@ -289,8 +289,8 @@ code {
     background: var(--bg-card);
     border-radius: 8px;
     box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
-    width: 640px;
-    max-width: 92vw;
+    width: 1120px;
+    max-width: 96vw;
     max-height: 92vh;
     display: flex;
     flex-direction: column;
@@ -326,53 +326,31 @@ code {
     justify-content: space-between;
 }
 
-/* Step indicator */
-.step-indicator {
-    display: flex;
-    padding: 16px 24px;
-    border-bottom: 1px solid var(--border-soft);
-    background: var(--bg-alt);
-    gap: 24px;
+/* Three-column wizard layout — Engine | Configure | Review, all visible. */
+.wizard-grid {
+    display: grid;
+    grid-template-columns: minmax(260px, 1fr) minmax(260px, 1fr) minmax(300px, 1.15fr);
+    flex: 1;
+    min-height: 0;
 }
-.step {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-faint);
+.step-body {
+    padding: 18px 20px;
+    border-right: 1px solid var(--border-soft);
+    overflow-y: auto;
+    min-width: 0;
+}
+.step-body:last-child { border-right: none; }
+.pane-title {
+    margin: 0 0 14px 0;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--text-soft);
     text-transform: uppercase;
-    letter-spacing: 0.05em;
-}
-.step span {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--text-faint);
-    font-weight: 600;
-}
-.step.active { color: var(--text); }
-.step.active span {
-    background: var(--primary);
-    color: white;
-    border-color: var(--primary);
-}
-.step.done span {
-    background: var(--success);
-    color: white;
-    border-color: var(--success);
 }
 
-/* Step bodies */
-.step-body { padding: 24px; flex: 1; overflow-y: auto; }
-.step-body.hidden { display: none; }
-
-/* Engine cards */
+/* Engine cards — base styles assume a roomy 2-col layout; the wizard
+   override below stacks them tightly so all four fit without scrolling. */
 .engine-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -405,6 +383,31 @@ code {
 }
 .engine-card h3 { margin: 0 0 4px 0; font-size: 15px; font-weight: 600; }
 .engine-card p { margin: 0; color: var(--text-soft); font-size: 12px; }
+
+/* Inside the wizard's narrow Engine pane: single-column list, icon on
+   the left, label + tagline stacked on the right. Keeps all engines
+   visible without scrolling. */
+.wizard-grid .engine-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin-top: 0;
+}
+.wizard-grid .engine-card {
+    padding: 10px 12px;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.wizard-grid .engine-card .engine-icon,
+.wizard-grid .engine-card .engine-icon-img {
+    margin: 0;
+    flex: 0 0 auto;
+}
+.wizard-grid .engine-card .engine-icon-img { width: 32px; height: 32px; }
+.wizard-grid .engine-card .engine-icon { font-size: 24px; }
+.wizard-grid .engine-card h3 { font-size: 13px; margin: 0; }
+.wizard-grid .engine-card p { font-size: 11px; margin-top: 2px; line-height: 1.35; }
 
 /* Form */
 .form-row { margin-bottom: 18px; }

@@ -190,6 +190,10 @@ class MySQLAdapter(EngineAdapter):
              f"--socket={_MYSQL_SOCKET}",
              f"--pid-file={_MYSQL_PIDFILE}",
              f"--log-error={_MYSQL_ERROR_LOG}",
+             # X protocol's default unix-socket path (/var/run/mysqld/)
+             # isn't writable as ubuntu; point it next to the classic
+             # socket. We don't use mysqlx, but the warning is noisy.
+             f"--mysqlx-socket={Path(_MYSQL_SOCKET).parent / 'mysqlx.sock'}",
              # Modest memory cap — banks-playground tier, not OLTP.
              "--innodb-buffer-pool-size=512M",
              # Skip name resolution (faster connects, no DNS dep).
@@ -199,9 +203,11 @@ class MySQLAdapter(EngineAdapter):
         )
 
     def _ping(self, port: int) -> bool:
+        # Ping over the unix socket as root — root@localhost from
+        # --initialize-insecure has no password but is socket-only;
+        # TCP ping pre-bootstrap fails auth (no ubuntu@% user yet).
         r = subprocess.run(
-            ["mysqladmin", "-h", "127.0.0.1", "-P", str(port),
-             "--protocol=TCP", "ping"],
+            ["mysqladmin", f"--socket={_MYSQL_SOCKET}", "-u", "root", "ping"],
             capture_output=True, text=True, timeout=5,
         )
         return r.returncode == 0 and "alive" in r.stdout

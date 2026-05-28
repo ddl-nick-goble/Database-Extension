@@ -146,9 +146,17 @@ catch(e) { print("rs.initiate noop: " + e.message); }
                     f"?authSource=admin&directConnection=true"
                 ),
                 "ME_CONFIG_SITE_BASEURL": "/admin/",
-                # Domino's app proxy is the only gate — disabling
-                # client-side basic auth avoids a redundant login.
-                "ME_CONFIG_BASICAUTH": "false",
+                # mongo-express 1.x dropped the 0.x `ME_CONFIG_BASICAUTH`
+                # toggle and instead derives `useBasicAuth` from
+                # `ME_CONFIG_BASICAUTH_USERNAME` being non-empty. It also
+                # requires cookie + session secrets at startup or it exits
+                # before binding to PORT. Reuse the DB creds — the Domino
+                # app proxy is the real gate; mongo-express's basic auth
+                # is just a belt-and-suspenders backstop.
+                "ME_CONFIG_BASICAUTH_USERNAME": user,
+                "ME_CONFIG_BASICAUTH_PASSWORD": pw,
+                "ME_CONFIG_SITE_COOKIESECRET": pw,
+                "ME_CONFIG_SITE_SESSIONSECRET": pw,
                 "PORT": str(port),
                 "VCAP_APP_HOST": "127.0.0.1",
                 "VCAP_APP_PORT": str(port),

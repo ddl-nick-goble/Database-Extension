@@ -24,7 +24,7 @@ from . import EngineAdapter, AdminUISpec, ConnectionSnippet, _register
 from . import _common
 
 _REDIS_LOG = "/var/log/dd/redis.log"
-_REDIS_CONF = "/etc/dd-redis.conf"
+_REDIS_CONF = "/mnt/db/redis.conf"
 _REDIS_PIDFILE = "/mnt/db/redis.pid"
 
 

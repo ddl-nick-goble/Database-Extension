@@ -12,10 +12,20 @@ import hashlib
 import io
 import os
 import random
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Install weasyprint if not present — runs once, silent on subsequent runs.
+try:
+    import weasyprint as _wp  # noqa: F401
+except ImportError:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-q", "weasyprint"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="HiddenLayer model security scan (demo)")

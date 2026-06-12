@@ -344,7 +344,6 @@ def create_app(
     visibility: str = "GRANT_BASED",
     entry_point: str = "/opt/dd/app.sh",
     project_id: str | None = None,
-    extended_identity: bool = True,
 ) -> dict:
     """Create the App and bind it to the chosen environment.
 
@@ -355,19 +354,16 @@ def create_app(
     project_id overrides the wizard's own project so DB apps can be created
     in any project the caller has access to.
     """
-    version: dict = {
-        "hardwareTierId": hardware_tier_id,
-        "environmentId": environment_id,
-    }
-    if extended_identity:
-        version["extendedIdentityPropagationToAppsEnabled"] = True
     return _post("/api/apps/beta/apps", json={
         "projectId": project_id or PROJECT_ID,
         "name": name,
         "description": description,
         "visibility": visibility,
         "entryPoint": entry_point,
-        "version": version,
+        "version": {
+            "hardwareTierId": hardware_tier_id,
+            "environmentId": environment_id,
+        },
     })
 
 

@@ -318,34 +318,13 @@ def api_create_database():
                 hardware_tier_id=hw_id,
                 entry_point="/opt/dd/app.sh",
                 project_id=target_project_id,
-                extended_identity=True,
             )
         except dapi.DominoApiError as e:
-            if e.status == 403 and "UseExtendedIdentityPropagation" in (e.body or ""):
-                log.warning("extended identity not permitted on this Domino — retrying without it")
-                yield sse("warn", msg="Extended identity not available — creating without it")
-                try:
-                    a = dapi.create_app(
-                        name=full_name,
-                        description=f"Domino Databases — {engine} ({full_name})",
-                        environment_id=env_id,
-                        hardware_tier_id=hw_id,
-                        entry_point="/opt/dd/app.sh",
-                        project_id=target_project_id,
-                        extended_identity=False,
-                    )
-                except dapi.DominoApiError as e2:
-                    log.warning("create failed: %s", e2)
-                    try: config_path.unlink()
-                    except FileNotFoundError: pass
-                    yield sse("error", msg="create failed", detail=e2.body[:1500], status=e2.status, path=e2.path)
-                    return
-            else:
-                log.warning("create failed: %s", e)
-                try: config_path.unlink()
-                except FileNotFoundError: pass
-                yield sse("error", msg="create failed", detail=e.body[:1500], status=e.status, path=e.path)
-                return
+            log.warning("create failed: %s", e)
+            try: config_path.unlink()
+            except FileNotFoundError: pass
+            yield sse("error", msg="create failed", detail=e.body[:1500], status=e.status, path=e.path)
+            return
         except Exception as e:
             log.exception("unexpected create failure")
             try: config_path.unlink()

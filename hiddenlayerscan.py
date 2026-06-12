@@ -44,13 +44,13 @@ def ts():
 
 def log(msg, colour=WHITE, indent=0):
     prefix = "  " * indent
-    print(f"{DIM}{ts()}{RESET}  {colour}{prefix}{msg}{RESET}", flush=True)
+    print(f"{DIM}{ts()}{RESET}  {colour}{prefix}{msg}{RESET}", file=sys.stderr, flush=True)
 
 def section(title):
-    print(flush=True)
-    print(f"{BOLD}{CYAN}{'─' * 60}{RESET}", flush=True)
-    print(f"{BOLD}{CYAN}  {title}{RESET}", flush=True)
-    print(f"{BOLD}{CYAN}{'─' * 60}{RESET}", flush=True)
+    print(flush=True, file=sys.stderr)
+    print(f"{BOLD}{CYAN}{'─' * 60}{RESET}", file=sys.stderr, flush=True)
+    print(f"{BOLD}{CYAN}  {title}{RESET}", file=sys.stderr, flush=True)
+    print(f"{BOLD}{CYAN}{'─' * 60}{RESET}", file=sys.stderr, flush=True)
 
 def tick(label, value, colour=WHITE, indent=1):
     log(f"{DIM}{label:<38}{RESET} {colour}{value}{RESET}", indent=indent)
@@ -172,10 +172,10 @@ RISK_LABEL = "CRITICAL" if RISK_SCORE >= 9 else \
              "MEDIUM"    if RISK_SCORE >= 4 else "LOW"
 
 # ── Scan simulation ───────────────────────────────────────────────────────────
-print(flush=True)
-print(f"{BOLD}{'═' * 60}{RESET}", flush=True)
-print(f"{BOLD}  HiddenLayer  ·  Model Security Scanner  ·  v2.9.1{RESET}", flush=True)
-print(f"{BOLD}{'═' * 60}{RESET}", flush=True)
+print(flush=True, file=sys.stderr)
+print(f"{BOLD}{'═' * 60}{RESET}", file=sys.stderr, flush=True)
+print(f"{BOLD}  HiddenLayer  ·  Model Security Scanner  ·  v2.9.1{RESET}", file=sys.stderr, flush=True)
+print(f"{BOLD}{'═' * 60}{RESET}", file=sys.stderr, flush=True)
 
 section("INITIALISING")
 for msg in [
@@ -478,8 +478,24 @@ html = f"""<!DOCTYPE html>
 </html>
 """
 
+# Write to stdout (allows piping / capture)
+sys.stdout.write(html)
+sys.stdout.flush()
+
+# Save to --out path
 OUT_PATH.write_text(html, encoding="utf-8")
 
-print(flush=True)
+# Save to /mnt/artifacts (Domino artifacts dir, or override via $DOMINO_ARTIFACTS_DIR)
+ARTIFACTS_DIR = Path(os.environ.get("DOMINO_ARTIFACTS_DIR", "/mnt/artifacts"))
+artifacts_path = ARTIFACTS_DIR / OUT_PATH.name
+try:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    artifacts_path.write_text(html, encoding="utf-8")
+    artifacts_saved = str(artifacts_path)
+except OSError as e:
+    artifacts_saved = f"(skipped: {e})"
+
+print(flush=True, file=sys.stderr)
 log(f"Report written → {OUT_PATH.resolve()}", GREEN)
-print(flush=True)
+log(f"Artifacts copy  → {artifacts_saved}", GREEN)
+print(flush=True, file=sys.stderr)

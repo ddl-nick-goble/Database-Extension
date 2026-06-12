@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 HiddenLayer Model Security Scanner — demo passthrough
-Prints realistic scan logs, writes a self-contained HTML report.
+Prints realistic scan logs, writes a PDF report.
 
 Usage:
-    python3 hiddenlayerscan.py [model_name] [--out report.html]
+    python3 hiddenlayerscan.py [model_name] [--out report.pdf]
 """
 
 import argparse
 import hashlib
+import io
 import os
 import random
 import sys
@@ -20,8 +21,8 @@ from pathlib import Path
 parser = argparse.ArgumentParser(description="HiddenLayer model security scan (demo)")
 parser.add_argument("model", nargs="?", default="fraud-detection-v3.pkl",
                     help="Model name / path to scan")
-parser.add_argument("--out", default="hiddenlayer-report.html",
-                    help="Output HTML report path (default: hiddenlayer-report.html)")
+parser.add_argument("--out", default="hiddenlayer-report.pdf",
+                    help="Output PDF path (default: hiddenlayer-report.pdf)")
 args = parser.parse_args()
 
 MODEL_NAME = args.model
@@ -29,7 +30,7 @@ OUT_PATH   = Path(args.out)
 SEED       = int(hashlib.md5(MODEL_NAME.encode()).hexdigest(), 16) % (2**31)
 random.seed(SEED)
 
-# ── Colour helpers (stdout only) ──────────────────────────────────────────────
+# ── Colour helpers — all output to stderr so stdout stays clean ───────────────
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
 DIM    = "\033[2m"
@@ -110,7 +111,7 @@ FINDINGS_RAW = [
     },
     {
         "id": "HL-2024-0318",
-        "title": "Dependency on deprecated pickle protocol 2",
+        "title": "Deprecated pickle protocol 2 (policy violation)",
         "severity": "MEDIUM",
         "category": "Compliance / Supply Chain",
         "layer": "Global header",
@@ -141,7 +142,7 @@ FINDINGS_RAW = [
         "confidence": 95,
         "cve": "N/A",
         "detail": "Model metadata blob contains a hardcoded URL matching internal MLOps infra "
-                  "pattern (*.internal.corp). Not executable but leaks topology in public artifacts.",
+                  "pattern (*.internal.corp). Not executable but leaks topology in published artifacts.",
         "remediation": "Scrub metadata before publishing; use relative or environment-resolved URIs.",
     },
     {
@@ -178,14 +179,14 @@ print(f"{BOLD}  HiddenLayer  ·  Model Security Scanner  ·  v2.9.1{RESET}", fil
 print(f"{BOLD}{'═' * 60}{RESET}", file=sys.stderr, flush=True)
 
 section("INITIALISING")
-for msg in [
+for msg, colour in [
     ("Loading signature database …", GREEN),
     (f"Signatures loaded: {SIGNATURES:,}", WHITE),
     ("Connecting to HiddenLayer cloud telemetry …", GREEN),
     ("Session token acquired (TTL 3600s)", WHITE),
     (f"Target: {MODEL_NAME}", CYAN),
 ]:
-    log(*msg, indent=1); pause()
+    log(msg, colour, indent=1); pause()
 
 section("FILE ANALYSIS")
 tick("Path",           MODEL_NAME)
@@ -225,6 +226,9 @@ log(f"{DIM}  !! Hardcoded endpoint — HL-2024-0512 (LOW){RESET}",             i
 log("Verifying model card presence (NIST AI RMF MAP-1.5) …",   indent=1); pause(0.1, 0.2)
 log(f"{DIM}  !! No model card found — HL-2024-0601 (INFO){RESET}",           indent=1); pause(0.05, 0.1)
 
+section("GENERATING REPORT")
+log("Rendering PDF …", indent=1); pause(0.1, 0.2)
+
 section("SCAN COMPLETE")
 SCAN_END      = datetime.now(timezone.utc)
 SCAN_DURATION = (SCAN_END - SCAN_START).total_seconds()
@@ -237,260 +241,329 @@ tick("Medium",      str(SEV_COUNTS["MEDIUM"]),   YELLOW)
 tick("Low",         str(SEV_COUNTS["LOW"]),       DIM + WHITE)
 tick("Info",        str(SEV_COUNTS["INFO"]),      DIM)
 tick("Risk score",  f"{RISK_SCORE}  [{RISK_LABEL}]",
-     RED if RISK_LABEL in ("CRITICAL","HIGH") else YELLOW)
+     RED if RISK_LABEL in ("CRITICAL", "HIGH") else YELLOW)
 
-# ── HTML report ───────────────────────────────────────────────────────────────
-SEV_COLOUR = {
-    "CRITICAL": ("#ff3b3b", "#3d0a0a"),
-    "HIGH":     ("#ff8c00", "#3d1f00"),
-    "MEDIUM":   ("#f5c518", "#2e2600"),
-    "LOW":      ("#4fc3f7", "#0a1f2e"),
-    "INFO":     ("#9e9e9e", "#1e1e1e"),
+# ── HTML → PDF ────────────────────────────────────────────────────────────────
+
+SEV_STYLE = {
+    # label_color, bg_color, border_color
+    "CRITICAL": ("#b91c1c", "#fef2f2", "#fca5a5"),
+    "HIGH":     ("#c2410c", "#fff7ed", "#fdba74"),
+    "MEDIUM":   ("#a16207", "#fefce8", "#fde047"),
+    "LOW":      ("#1d4ed8", "#eff6ff", "#93c5fd"),
+    "INFO":     ("#374151", "#f9fafb", "#d1d5db"),
 }
 
-def sev_badge(sev):
-    fg, bg = SEV_COLOUR[sev]
-    return (f'<span style="background:{bg};color:{fg};border:1px solid {fg}22;'
-            f'font-size:11px;font-weight:700;letter-spacing:.06em;'
-            f'padding:2px 8px;border-radius:3px">{sev}</span>')
+RISK_SCORE_COLOUR = {
+    "CRITICAL": "#b91c1c",
+    "HIGH":     "#c2410c",
+    "MEDIUM":   "#a16207",
+    "LOW":      "#1d4ed8",
+}[RISK_LABEL]
 
-risk_fg, risk_bg = SEV_COLOUR[RISK_LABEL]
+scan_dt    = SCAN_START.strftime("%B %d, %Y  %H:%M UTC")
+report_id  = f"HL-{SCAN_START.strftime('%Y%m%d')}-{MODEL_HASH[:8].upper()}"
+
+
+def sev_pill(sev):
+    fg, bg, border = SEV_STYLE[sev]
+    return (f'<span style="display:inline-block;background:{bg};color:{fg};'
+            f'border:1px solid {border};border-radius:4px;'
+            f'font-size:10px;font-weight:700;letter-spacing:.07em;'
+            f'padding:2px 8px;white-space:nowrap">{sev}</span>')
+
+
+def meta_row(label, value, mono=False):
+    val_style = 'font-family:monospace;font-size:11px;color:#374151;word-break:break-all' if mono \
+                else 'font-size:12px;color:#111827'
+    return (f'<tr>'
+            f'<td style="padding:7px 0;color:#6b7280;font-size:12px;'
+            f'white-space:nowrap;padding-right:20px;vertical-align:top">{label}</td>'
+            f'<td style="{val_style};padding:7px 0">{value}</td>'
+            f'</tr>')
+
 
 findings_rows = ""
-for f in FINDINGS:
-    fg, bg = SEV_COLOUR[f["severity"]]
-    conf_bar = (f'<div style="width:100%;background:#ffffff14;border-radius:2px;height:5px;margin-top:4px">'
-                f'<div style="width:{f["confidence"]}%;background:{fg};height:5px;border-radius:2px"></div>'
-                f'</div><div style="font-size:10px;color:#6b7280;margin-top:2px">{f["confidence"]}% confidence</div>')
+for i, f in enumerate(FINDINGS):
+    fg, bg, border = SEV_STYLE[f["severity"]]
+    row_bg = "#fafafa" if i % 2 == 0 else "#ffffff"
+    conf_pct = f["confidence"]
+    conf_bar = (
+        f'<div style="width:80px;background:#e5e7eb;border-radius:2px;height:4px;display:inline-block;vertical-align:middle">'
+        f'<div style="width:{conf_pct}%;background:{fg};height:4px;border-radius:2px"></div></div>'
+        f'<span style="font-size:10px;color:#6b7280;margin-left:5px">{conf_pct}%</span>'
+    )
     findings_rows += f"""
-        <tr>
-            <td style="padding:14px 16px;border-bottom:1px solid #1f2937;white-space:nowrap">
-                <code style="font-size:11px;color:#6b7280">{f["id"]}</code>
-            </td>
-            <td style="padding:14px 16px;border-bottom:1px solid #1f2937">{sev_badge(f["severity"])}</td>
-            <td style="padding:14px 16px;border-bottom:1px solid #1f2937">
-                <div style="font-weight:600;color:#f3f4f6;margin-bottom:2px">{f["title"]}</div>
-                <div style="font-size:12px;color:#9ca3af">{f["detail"]}</div>
-                <div style="font-size:11px;color:#4b5563;margin-top:6px">
-                    <span style="color:#374151">Remediation:</span> {f["remediation"]}
-                </div>
-            </td>
-            <td style="padding:14px 16px;border-bottom:1px solid #1f2937;white-space:nowrap">
-                <div style="font-size:12px;color:#9ca3af">{f["category"]}</div>
-            </td>
-            <td style="padding:14px 16px;border-bottom:1px solid #1f2937;white-space:nowrap">
-                <code style="font-size:11px;color:#6b7280">{f["layer"]}</code>
-            </td>
-            <td style="padding:14px 16px;border-bottom:1px solid #1f2937">
-                {conf_bar}
-            </td>
-        </tr>"""
+    <tr style="background:{row_bg}">
+      <td style="padding:12px 14px;border-bottom:1px solid #f3f4f6;
+                 vertical-align:top;white-space:nowrap">
+        <code style="font-size:10px;color:#6b7280">{f["id"]}</code>
+      </td>
+      <td style="padding:12px 14px;border-bottom:1px solid #f3f4f6;vertical-align:top">
+        {sev_pill(f["severity"])}
+      </td>
+      <td style="padding:12px 14px;border-bottom:1px solid #f3f4f6;vertical-align:top">
+        <div style="font-weight:600;color:#111827;font-size:12px;margin-bottom:4px">{f["title"]}</div>
+        <div style="font-size:11px;color:#4b5563;line-height:1.5">{f["detail"]}</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:5px">
+          <span style="font-weight:600;color:#374151">Remediation:</span> {f["remediation"]}
+        </div>
+      </td>
+      <td style="padding:12px 14px;border-bottom:1px solid #f3f4f6;
+                 vertical-align:top;white-space:nowrap">
+        <div style="font-size:11px;color:#374151">{f["category"]}</div>
+      </td>
+      <td style="padding:12px 14px;border-bottom:1px solid #f3f4f6;vertical-align:top">
+        <code style="font-size:10px;color:#6b7280">{f["layer"]}</code>
+      </td>
+      <td style="padding:12px 14px;border-bottom:1px solid #f3f4f6;vertical-align:top">
+        {conf_bar}
+      </td>
+    </tr>"""
 
-def sev_card(label, count, fg, bg):
-    border = f"2px solid {fg}55" if count else "1px solid #1f2937"
-    return (f'<div style="background:{bg if count else "#111827"};border:{border};'
-            f'border-radius:8px;padding:16px 22px;min-width:90px;text-align:center">'
-            f'<div style="font-size:28px;font-weight:700;color:{fg if count else "#374151"}">{count}</div>'
-            f'<div style="font-size:11px;font-weight:600;letter-spacing:.07em;color:{fg if count else "#4b5563"}'
-            f';margin-top:2px">{label}</div></div>')
 
-cards = "".join([
-    sev_card("CRITICAL", SEV_COUNTS["CRITICAL"], *SEV_COLOUR["CRITICAL"]),
-    sev_card("HIGH",     SEV_COUNTS["HIGH"],     *SEV_COLOUR["HIGH"]),
-    sev_card("MEDIUM",   SEV_COUNTS["MEDIUM"],   *SEV_COLOUR["MEDIUM"]),
-    sev_card("LOW",      SEV_COUNTS["LOW"],      *SEV_COLOUR["LOW"]),
-    sev_card("INFO",     SEV_COUNTS["INFO"],      *SEV_COLOUR["INFO"]),
-])
+def sev_summary_cell(sev):
+    count = SEV_COUNTS[sev]
+    fg, bg, border = SEV_STYLE[sev]
+    active = count > 0
+    return (
+        f'<td style="padding:12px 18px;text-align:center;border-right:1px solid #e5e7eb">'
+        f'<div style="font-size:26px;font-weight:700;color:{fg if active else "#9ca3af"}">{count}</div>'
+        f'<div style="font-size:10px;font-weight:700;letter-spacing:.07em;'
+        f'color:{fg if active else "#9ca3af"};margin-top:2px">{sev}</div>'
+        f'</td>'
+    )
 
-scan_dt = SCAN_START.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+dist_segments = "".join(
+    f'<div title="{s}: {SEV_COUNTS[s]}" style="flex:{SEV_COUNTS[s] or 0.15};'
+    f'background:{SEV_STYLE[s][0]};opacity:{1.0 if SEV_COUNTS[s] else 0.15};'
+    f'min-width:3px"></div>'
+    for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+)
+
+dist_legend = "".join(
+    f'<span style="display:inline-flex;align-items:center;gap:5px;'
+    f'font-size:11px;color:#374151;margin-right:14px">'
+    f'<span style="display:inline-block;width:10px;height:10px;border-radius:2px;'
+    f'background:{SEV_STYLE[s][0]};opacity:{1.0 if SEV_COUNTS[s] else 0.3}"></span>'
+    f'{s.title()} ({SEV_COUNTS[s]})</span>'
+    for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+)
 
 html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HiddenLayer Scan — {MODEL_NAME}</title>
 <style>
+  @page {{
+    size: A4;
+    margin: 14mm 14mm 16mm 14mm;
+    @bottom-center {{
+      content: "CONFIDENTIAL  ·  HiddenLayer Model Security Report  ·  {report_id}  ·  Page " counter(page) " of " counter(pages);
+      font-size: 8px;
+      color: #9ca3af;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: .05em;
+    }}
+  }}
+
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-          background: #030712; color: #d1d5db; min-height: 100vh; }}
-  a {{ color: #6366f1; text-decoration: none; }}
-  code {{ font-family: ui-monospace, "SF Mono", Menlo, monospace; }}
+
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px;
+    color: #111827;
+    background: #ffffff;
+    line-height: 1.5;
+  }}
+
+  h1  {{ font-size: 20px; font-weight: 700; color: #111827; }}
+  h2  {{ font-size: 13px; font-weight: 700; color: #111827; margin-bottom: 12px; }}
+
   table {{ border-collapse: collapse; width: 100%; }}
-  th {{ text-align: left; font-size: 11px; font-weight: 700; letter-spacing: .08em;
-        color: #4b5563; padding: 10px 16px; border-bottom: 1px solid #1f2937;
-        background: #0a0f1a; }}
-  tr:last-child td {{ border-bottom: none !important; }}
+  th {{
+    text-align: left;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    color: #6b7280;
+    padding: 9px 14px;
+    background: #f9fafb;
+    border-bottom: 1px solid #e5e7eb;
+    border-top: 1px solid #e5e7eb;
+  }}
+
+  .card {{
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 18px;
+    page-break-inside: avoid;
+  }}
+
+  .card-header {{
+    padding: 11px 18px;
+    background: #f9fafb;
+    border-bottom: 1px solid #e5e7eb;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    color: #6b7280;
+    text-transform: uppercase;
+  }}
+
+  .card-body {{ padding: 16px 18px; }}
+
+  code {{
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+    font-size: 11px;
+  }}
 </style>
 </head>
 <body>
 
-<!-- TOP BAR -->
-<div style="background:#0a0f1a;border-bottom:1px solid #1f2937;padding:0 40px">
-  <div style="max-width:1200px;margin:0 auto;height:56px;display:flex;align-items:center;gap:16px">
-    <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-      <rect width="24" height="24" rx="5" fill="#6366f1"/>
-      <path d="M7 12l3.5 3.5L17 8" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
-    <span style="font-weight:700;font-size:16px;color:#f9fafb;letter-spacing:-.01em">HiddenLayer</span>
-    <span style="color:#374151;font-size:14px">Model Security Scanner</span>
-    <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
-      <span style="font-size:12px;color:#4b5563">v2.9.1</span>
-      <span style="font-size:12px;color:#374151">·</span>
-      <span style="font-size:12px;color:#4b5563">{scan_dt}</span>
+<!-- ── HEADER ── -->
+<div style="display:flex;align-items:flex-start;justify-content:space-between;
+            padding-bottom:16px;border-bottom:2px solid #111827;margin-bottom:22px">
+  <div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+        <rect width="28" height="28" rx="6" fill="#1d4ed8"/>
+        <path d="M8 14l4.5 4.5L20 9" stroke="white" stroke-width="2.5"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span style="font-size:15px;font-weight:700;color:#111827;letter-spacing:-.01em">HiddenLayer</span>
+      <span style="font-size:11px;color:#6b7280;border-left:1px solid #d1d5db;
+                   padding-left:10px;margin-left:2px">Model Security Scanner</span>
     </div>
+    <h1>Model Security Assessment Report</h1>
+    <div style="font-size:11px;color:#6b7280;margin-top:4px">
+      Report ID: <code>{report_id}</code> &nbsp;·&nbsp; Generated: {scan_dt} &nbsp;·&nbsp; Scanner v2.9.1
+    </div>
+  </div>
+  <div style="text-align:right;flex-shrink:0">
+    <div style="font-size:10px;font-weight:700;letter-spacing:.08em;
+                color:#6b7280;margin-bottom:4px">OVERALL RISK SCORE</div>
+    <div style="font-size:40px;font-weight:800;color:{RISK_SCORE_COLOUR};
+                line-height:1">{RISK_SCORE}</div>
+    <div style="margin-top:4px">{sev_pill(RISK_LABEL)}</div>
   </div>
 </div>
 
-<div style="max-width:1200px;margin:0 auto;padding:32px 40px">
-
-  <!-- HERO -->
-  <div style="background:#0d1117;border:1px solid #1f2937;border-radius:10px;
-              padding:28px 32px;margin-bottom:28px;display:flex;align-items:center;gap:32px">
-    <div style="background:{risk_bg};border:2px solid {risk_fg}44;border-radius:10px;
-                padding:20px 28px;text-align:center;flex-shrink:0">
-      <div style="font-size:44px;font-weight:800;color:{risk_fg};line-height:1">{RISK_SCORE}</div>
-      <div style="font-size:11px;font-weight:700;letter-spacing:.1em;color:{risk_fg};
-                  margin-top:4px">RISK SCORE</div>
-      <div style="margin-top:8px">{sev_badge(RISK_LABEL)}</div>
+<!-- ── EXECUTIVE SUMMARY BAR ── -->
+<div class="card">
+  <div class="card-header">Executive Summary</div>
+  <table>
+    <tr>
+      {sev_summary_cell("CRITICAL")}
+      {sev_summary_cell("HIGH")}
+      {sev_summary_cell("MEDIUM")}
+      {sev_summary_cell("LOW")}
+      {sev_summary_cell("INFO")}
+      <td style="padding:12px 18px;text-align:center">
+        <div style="font-size:26px;font-weight:700;color:#111827">{len(FINDINGS)}</div>
+        <div style="font-size:10px;font-weight:700;letter-spacing:.07em;color:#374151;margin-top:2px">TOTAL</div>
+      </td>
+    </tr>
+  </table>
+  <!-- distribution bar -->
+  <div style="padding:0 18px 14px">
+    <div style="display:flex;height:6px;border-radius:3px;overflow:hidden;gap:2px;margin-bottom:8px">
+      {dist_segments}
     </div>
-    <div style="flex:1;min-width:0">
-      <div style="font-size:22px;font-weight:700;color:#f9fafb;margin-bottom:4px;
-                  overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-           title="{MODEL_NAME}">{MODEL_NAME}</div>
-      <div style="font-size:14px;color:#6b7280;margin-bottom:16px">{FRAMEWORK} · {MODEL_FMT}</div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">
-        {cards}
-      </div>
-    </div>
-    <div style="flex-shrink:0;text-align:right;font-size:13px;color:#4b5563;line-height:2">
-      <div><span style="color:#6b7280">Scan duration</span> &nbsp;{SCAN_DURATION:.2f}s</div>
-      <div><span style="color:#6b7280">Signatures</span> &nbsp;{SIGNATURES:,}</div>
-      <div><span style="color:#6b7280">Ops scanned</span> &nbsp;{OPS_SCANNED:,}</div>
-      <div><span style="color:#6b7280">Parameters</span> &nbsp;{PARAMS}</div>
-    </div>
+    <div style="display:flex;flex-wrap:wrap">{dist_legend}</div>
   </div>
+</div>
 
-  <!-- TWO-COL: model metadata + scan metadata -->
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:28px">
+<!-- ── TWO-COL METADATA ── -->
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px">
 
-    <div style="background:#0d1117;border:1px solid #1f2937;border-radius:10px;overflow:hidden">
-      <div style="padding:14px 20px;border-bottom:1px solid #1f2937;
-                  font-size:11px;font-weight:700;letter-spacing:.08em;color:#4b5563">MODEL METADATA</div>
+  <div class="card">
+    <div class="card-header">Model Metadata</div>
+    <div class="card-body">
       <table>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px;width:140px">Name</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6;word-break:break-all">{MODEL_NAME}</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Framework</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{FRAMEWORK}</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Format</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{MODEL_FMT}</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Size</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{MODEL_SIZE_MB} MB</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Layers</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{LAYERS}</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Parameters</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{PARAMS}</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px;vertical-align:top">SHA-256</td>
-            <td style="padding:10px 20px"><code style="font-size:11px;color:#6b7280;word-break:break-all">{MODEL_HASH}</code></td></tr>
-      </table>
-    </div>
-
-    <div style="background:#0d1117;border:1px solid #1f2937;border-radius:10px;overflow:hidden">
-      <div style="padding:14px 20px;border-bottom:1px solid #1f2937;
-                  font-size:11px;font-weight:700;letter-spacing:.08em;color:#4b5563">SCAN DETAILS</div>
-      <table>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px;width:160px">Scanner</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">HiddenLayer v2.9.1</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Policy set</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">HL-POL-0012 (Enterprise)</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Scan started</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{SCAN_START.strftime("%Y-%m-%d %H:%M:%S UTC")}</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Scan ended</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{SCAN_END.strftime("%Y-%m-%d %H:%M:%S UTC")}</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Duration</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{SCAN_DURATION:.2f}s</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Signatures checked</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{SIGNATURES:,}</td></tr>
-        <tr><td style="padding:10px 20px;color:#6b7280;font-size:13px">Ops analysed</td>
-            <td style="padding:10px 20px;font-size:13px;color:#f3f4f6">{OPS_SCANNED:,}</td></tr>
+        {meta_row("Name", MODEL_NAME)}
+        {meta_row("Framework", FRAMEWORK)}
+        {meta_row("Format", MODEL_FMT)}
+        {meta_row("File size", f"{MODEL_SIZE_MB} MB")}
+        {meta_row("Layers", str(LAYERS))}
+        {meta_row("Parameters", PARAMS)}
+        {meta_row("SHA-256", MODEL_HASH, mono=True)}
       </table>
     </div>
   </div>
 
-  <!-- FINDINGS TABLE -->
-  <div style="background:#0d1117;border:1px solid #1f2937;border-radius:10px;overflow:hidden;margin-bottom:28px">
-    <div style="padding:16px 20px;border-bottom:1px solid #1f2937;
-                display:flex;align-items:center;justify-content:space-between">
-      <div>
-        <span style="font-size:11px;font-weight:700;letter-spacing:.08em;color:#4b5563">FINDINGS</span>
-        <span style="font-size:12px;color:#374151;margin-left:10px">{len(FINDINGS)} total</span>
-      </div>
-      <div style="font-size:12px;color:#374151">Sorted by severity</div>
-    </div>
-    <div style="overflow-x:auto">
+  <div class="card">
+    <div class="card-header">Scan Details</div>
+    <div class="card-body">
       <table>
-        <thead>
-          <tr>
-            <th style="width:120px">ID</th>
-            <th style="width:100px">SEVERITY</th>
-            <th>FINDING</th>
-            <th style="width:180px">CATEGORY</th>
-            <th style="width:180px">LAYER / LOCATION</th>
-            <th style="width:130px">CONFIDENCE</th>
-          </tr>
-        </thead>
-        <tbody>{findings_rows}</tbody>
+        {meta_row("Scanner", "HiddenLayer v2.9.1")}
+        {meta_row("Policy set", "HL-POL-0012 (Enterprise)")}
+        {meta_row("Scan started", SCAN_START.strftime("%Y-%m-%d %H:%M:%S UTC"))}
+        {meta_row("Scan completed", SCAN_END.strftime("%Y-%m-%d %H:%M:%S UTC"))}
+        {meta_row("Duration", f"{SCAN_DURATION:.2f}s")}
+        {meta_row("Signatures checked", f"{SIGNATURES:,}")}
+        {meta_row("Operations analysed", f"{OPS_SCANNED:,}")}
       </table>
     </div>
-  </div>
-
-  <!-- RISK BREAKDOWN BAR -->
-  <div style="background:#0d1117;border:1px solid #1f2937;border-radius:10px;
-              padding:20px 24px;margin-bottom:28px">
-    <div style="font-size:11px;font-weight:700;letter-spacing:.08em;color:#4b5563;margin-bottom:14px">
-      FINDING DISTRIBUTION
-    </div>
-    <div style="display:flex;height:10px;border-radius:4px;overflow:hidden;gap:2px">
-      {"".join(
-        f'<div title="{s}: {SEV_COUNTS[s]}" style="background:{SEV_COLOUR[s][0]};'
-        f'flex:{SEV_COUNTS[s] or 0.2};min-width:{2 if SEV_COUNTS[s] else 0}px"></div>'
-        for s in ("CRITICAL","HIGH","MEDIUM","LOW","INFO")
-      )}
-    </div>
-    <div style="display:flex;gap:20px;margin-top:10px;flex-wrap:wrap">
-      {"".join(
-        f'<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:#6b7280">'
-        f'<div style="width:10px;height:10px;border-radius:2px;background:{SEV_COLOUR[s][0]}"></div>'
-        f'{s.title()} ({SEV_COUNTS[s]})</div>'
-        for s in ("CRITICAL","HIGH","MEDIUM","LOW","INFO")
-      )}
-    </div>
-  </div>
-
-  <!-- FOOTER -->
-  <div style="text-align:center;font-size:12px;color:#374151;padding:16px 0 8px">
-    HiddenLayer Model Security Scanner · Report generated {scan_dt} ·
-    <span style="color:#4b5563">This report is for authorised use only</span>
   </div>
 
 </div>
+
+<!-- ── FINDINGS TABLE ── -->
+<div class="card">
+  <div class="card-header" style="display:flex;justify-content:space-between;align-items:center">
+    <span>Findings</span>
+    <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#9ca3af">
+      {len(FINDINGS)} findings · sorted by severity
+    </span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:100px">ID</th>
+        <th style="width:90px">SEVERITY</th>
+        <th>FINDING &amp; REMEDIATION</th>
+        <th style="width:160px">CATEGORY</th>
+        <th style="width:160px">LAYER / LOCATION</th>
+        <th style="width:110px">CONFIDENCE</th>
+      </tr>
+    </thead>
+    <tbody>{findings_rows}</tbody>
+  </table>
+</div>
+
+<!-- ── DISCLAIMER ── -->
+<div style="border-top:1px solid #e5e7eb;margin-top:8px;padding-top:10px;
+            font-size:10px;color:#9ca3af;line-height:1.6">
+  This report is generated for authorised security assessment purposes only. Findings are based on
+  static analysis and signature matching; they do not constitute a guarantee of the absence of
+  additional vulnerabilities. Classification: <strong>CONFIDENTIAL</strong> — distribute only to
+  personnel with a need to know.
+</div>
+
 </body>
-</html>
-"""
+</html>"""
 
-# Write to stdout (allows piping / capture)
-sys.stdout.write(html)
-sys.stdout.flush()
+# ── Render HTML → PDF via WeasyPrint ─────────────────────────────────────────
+import weasyprint  # imported late so scan logs print before the ~1s import cost
+
+pdf_bytes = weasyprint.HTML(string=html).write_pdf()
+
+# Write to stdout
+sys.stdout.buffer.write(pdf_bytes)
+sys.stdout.buffer.flush()
 
 # Save to --out path
-OUT_PATH.write_text(html, encoding="utf-8")
+OUT_PATH.write_bytes(pdf_bytes)
 
-# Save to /mnt/artifacts (Domino artifacts dir, or override via $DOMINO_ARTIFACTS_DIR)
+# Save to /mnt/artifacts
 ARTIFACTS_DIR = Path(os.environ.get("DOMINO_ARTIFACTS_DIR", "/mnt/artifacts"))
 artifacts_path = ARTIFACTS_DIR / OUT_PATH.name
 try:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    artifacts_path.write_text(html, encoding="utf-8")
+    artifacts_path.write_bytes(pdf_bytes)
     artifacts_saved = str(artifacts_path)
 except OSError as e:
     artifacts_saved = f"(skipped: {e})"

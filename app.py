@@ -135,6 +135,25 @@ def _engine(a: dict) -> str:
     return "?"
 
 
+def _browser_url(a: dict) -> str:
+    """URL a human can open in a browser tab.
+
+    runningAppUrl (/u/<owner>/<project>/apps/<instanceId>/latest) goes
+    through Domino's normal auth wrapper — no API key header needed.
+    app_url() returns the apps-internal URL which requires X-Domino-Api-Key
+    and is only useful for programmatic tunnel access.
+    """
+    running = a.get("runningAppUrl", "")
+    if not running:
+        return dapi.app_url(a)
+    if running.startswith("http"):
+        return running.rstrip("/")
+    # Relative path — prepend the public host if we have it, otherwise leave
+    # relative so the browser resolves it against the wizard's own origin.
+    host = (dapi.PUBLIC_HOST or "").rstrip("/")
+    return f"{host}{running}".rstrip("/") if host else running.rstrip("/")
+
+
 def _shape(a: dict) -> dict:
     status = a.get("status") or "Unknown"
     return {
@@ -147,6 +166,7 @@ def _shape(a: dict) -> dict:
         "owner": (a.get("publisher") or {}).get("name") or dapi.PROJECT_OWNER,
         "description": a.get("description", ""),
         "url": dapi.app_url(a),
+        "browserUrl": _browser_url(a),
         "environmentId": a.get("environmentId"),
         "hardwareTierId": a.get("hardwareTierId"),
         "isRunning": status.lower() == "running",

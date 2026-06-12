@@ -189,7 +189,7 @@ function renderTable() {
             sLower === "never started"                          ? "badge-pending" :
                                                                   "badge-stopped";
         const conn = db.url
-            ? `<a href="${escapeHtml(db.url)}" target="_blank" rel="noopener">Open DB →</a>`
+            ? `<a href="${escapeHtml(db.browserUrl || db.url)}" target="_blank" rel="noopener">Open DB →</a>`
             : `<span class="muted">—</span>`;
         const created = db.createdAt ? formatDate(db.createdAt) : "<span class=\"muted\">—</span>";
         const isRunning = db.isRunning;

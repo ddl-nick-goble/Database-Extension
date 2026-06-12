@@ -135,10 +135,21 @@ def _engine(a: dict) -> str:
     return "?"
 
 
+def _nav_url(app_id: str) -> str:
+    """Browser-navigable URL for the DB app — goes through the main Domino
+    UI shell and handles auth properly. Distinct from app_url() which returns
+    the apps-internal subdomain URL used only by the WS tunnel client."""
+    host = dapi.PUBLIC_HOST.rstrip("/")
+    if not host or not app_id:
+        return ""
+    return f"{host}/modelproducts/{app_id}?scope=project"
+
+
 def _shape(a: dict) -> dict:
     status = a.get("status") or "Unknown"
+    app_id = a.get("id", "")
     return {
-        "id": a.get("id"),
+        "id": app_id,
         "name": a.get("name"),
         "engine": _engine(a),
         "status": status,
@@ -147,6 +158,7 @@ def _shape(a: dict) -> dict:
         "owner": (a.get("publisher") or {}).get("name") or dapi.PROJECT_OWNER,
         "description": a.get("description", ""),
         "url": dapi.app_url(a),
+        "navUrl": _nav_url(app_id),
         "environmentId": a.get("environmentId"),
         "hardwareTierId": a.get("hardwareTierId"),
         "isRunning": status.lower() == "running",

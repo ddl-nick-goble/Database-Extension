@@ -188,8 +188,9 @@ function renderTable() {
             ["failed", "error"].includes(sLower)                ? "badge-error" :
             sLower === "never started"                          ? "badge-pending" :
                                                                   "badge-stopped";
-        const conn = db.url
-            ? `<a href="${escapeHtml(db.url)}" target="_blank" rel="noopener">Open app →</a>`
+        const connHref = db.navUrl || db.url;
+        const conn = connHref
+            ? `<a href="${escapeHtml(connHref)}" target="_blank" rel="noopener">Open DB →</a>`
             : `<span class="muted">—</span>`;
         const created = db.createdAt ? formatDate(db.createdAt) : "<span class=\"muted\">—</span>";
         const isRunning = db.isRunning;
@@ -301,6 +302,9 @@ async function loadCatalogs() {
     const tierSel = document.getElementById("db-tier");
     tierSel.innerHTML = state.tiers.map(t =>
         `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join("");
+    // Tiers arrive after the first renderWizard(); re-check now that the
+    // <select> has a real value so the Provision button reflects it.
+    updateProvisionEnabled();
 }
 
 // Returns the env id the wizard will submit for the currently-picked
@@ -334,6 +338,24 @@ function renderWizard() {
         tier?.name || ws.hardwareTierId || "—";
     document.getElementById("r-pw").textContent =
         ws.password ? "•".repeat(ws.password.length) : "—";
+
+    updateProvisionEnabled();
+}
+
+// The Provision button stays disabled until all four required choices are
+// made: an engine card is picked, and Name / Hardware tier / Password are
+// filled. We read the live DOM values (not just state.wizard) so the
+// hardware-tier <select>'s auto-selected option counts even before the
+// user touches it. renderWizard() — called on every engine pick, field
+// edit, and wizard open — is the single place this is kept in sync.
+function updateProvisionEnabled() {
+    const btn = document.getElementById("btn-next");
+    if (!btn) return;
+    const engine = state.wizard.engine;
+    const name   = (document.getElementById("db-name").value || "").trim();
+    const tier   = document.getElementById("db-tier").value;
+    const pw     = document.getElementById("db-pw").value;
+    btn.disabled = !(engine && name && tier && pw);
 }
 
 function readFormToWizard() {

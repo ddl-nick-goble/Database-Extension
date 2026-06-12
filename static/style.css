@@ -465,8 +465,8 @@ code {
 }
 
 #env-cards {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
     gap: 16px;
 }
 
@@ -557,15 +557,6 @@ code {
 .env-source-missing { background: #f3f4f6; color: #6b7280; }
 
 /* Revision number chip */
-.env-link {
-    font-size: 14px;
-    color: var(--text-soft);
-    text-decoration: none;
-    line-height: 1;
-    opacity: 0.7;
-    transition: opacity 0.15s;
-}
-.env-link:hover { opacity: 1; color: var(--accent); }
 
 .env-rev-chip {
     display: inline-block;

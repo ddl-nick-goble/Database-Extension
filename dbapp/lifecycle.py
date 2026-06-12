@@ -201,6 +201,83 @@ def snapshot_path(cfg: dict) -> Path:
     return Path(base) / project / f"db-{cfg['db_id']}"
 
 
+_BACKUP_OVERRIDE = Path("/tmp/dd-backup-override.json")
+
+
+def load_backup_override(cfg: dict) -> dict:
+    """Merge a persisted backup config (snapshot_dir) into cfg.
+
+    Checks:
+      1. /tmp/dd-backup-override.json (set by the router at runtime)
+      2. {DATASETS_DIR}/*/_dd_backup_config.json (survives container restart)
+
+    Returns updated cfg dict (caller should replace their reference).
+    """
+    db_id = cfg.get("db_id", "")
+
+    # Fast path: in-memory override written by the router this session.
+    if _BACKUP_OVERRIDE.exists():
+        try:
+            data = json.loads(_BACKUP_OVERRIDE.read_text())
+            if data.get("db_id") == db_id and data.get("snapshot_dir"):
+                cfg = dict(cfg)
+                cfg["snapshot_dir"] = data["snapshot_dir"]
+                sys.stderr.write(
+                    f"[lifecycle] backup override from {_BACKUP_OVERRIDE}: "
+                    f"snapshot_dir={cfg['snapshot_dir']}\n"
+                )
+                return cfg
+        except Exception as e:
+            sys.stderr.write(f"[lifecycle] ignoring malformed {_BACKUP_OVERRIDE}: {e}\n")
+
+    # Persistent path: scan all mounted dataset dirs.
+    datasets_dir = Path(os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data"))
+    if datasets_dir.exists():
+        for ds_dir in datasets_dir.iterdir():
+            candidate = ds_dir / "_dd_backup_config.json"
+            if not candidate.exists():
+                continue
+            try:
+                data = json.loads(candidate.read_text())
+                if data.get("db_id") == db_id and data.get("snapshot_dir"):
+                    cfg = dict(cfg)
+                    cfg["snapshot_dir"] = data["snapshot_dir"]
+                    # Warm the in-memory cache for sibling processes.
+                    try:
+                        _BACKUP_OVERRIDE.write_text(json.dumps(data))
+                    except Exception:
+                        pass
+                    sys.stderr.write(
+                        f"[lifecycle] backup config loaded from {candidate}: "
+                        f"snapshot_dir={cfg['snapshot_dir']}\n"
+                    )
+                    return cfg
+            except Exception as e:
+                sys.stderr.write(f"[lifecycle] skipping {candidate}: {e}\n")
+    return cfg
+
+
+def save_backup_config(cfg: dict, snapshot_dir: Path) -> None:
+    """Persist the backup location to both the in-memory and on-disk stores."""
+    db_id = cfg.get("db_id", "")
+    data = {"db_id": db_id, "snapshot_dir": str(snapshot_dir)}
+
+    # In-memory (picked up by snapshotters on next tick without restart).
+    try:
+        _BACKUP_OVERRIDE.write_text(json.dumps(data))
+    except Exception as e:
+        sys.stderr.write(f"[lifecycle] could not write {_BACKUP_OVERRIDE}: {e}\n")
+
+    # Persistent (survives container restart).
+    try:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        persistent = snapshot_dir / "_dd_backup_config.json"
+        persistent.write_text(json.dumps({**data, "configured_at": __import__("datetime").datetime.utcnow().isoformat() + "Z"}))
+        sys.stderr.write(f"[lifecycle] backup config saved to {persistent}\n")
+    except Exception as e:
+        sys.stderr.write(f"[lifecycle] could not write persistent backup config: {e}\n")
+
+
 def restore_or_init_postgres(cfg: dict) -> None:
     pgdata = Path(cfg.get("pgdata", "/mnt/db/pgdata"))
     snapshot_dir = snapshot_path(cfg)
@@ -576,6 +653,7 @@ def schedule_snapshotter(cfg: dict, adapter=None) -> None:
 def boot() -> dict:
     Path("/var/log/dd").mkdir(parents=True, exist_ok=True)
     cfg = find_config()
+    cfg = load_backup_override(cfg)
     engine_name = cfg["engine"]
     sys.stderr.write(f"[lifecycle] booting engine={engine_name} db_id={cfg['db_id']}\n")
 

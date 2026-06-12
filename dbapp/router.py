@@ -19,9 +19,11 @@ name directly.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import socket
+import subprocess as _sp
 import sys
 import threading
 from pathlib import Path
@@ -29,6 +31,7 @@ from pathlib import Path
 import requests
 from flask import Flask, Response, jsonify, render_template_string, request
 from flask_sock import Sock
+from dbapp import lifecycle
 
 # --------------------------------------------------------------------------
 # Config — dbapp/app.sh writes /tmp/dd-config.json after lifecycle.boot()
@@ -41,6 +44,8 @@ if not CONFIG_CACHE.exists():
         f"Check /var/log/dd/preRun.log."
     )
 CFG = json.loads(CONFIG_CACHE.read_text())
+# Mutable — updated in-place when the user reconfigures backup via the UI.
+_cfg_lock = threading.Lock()
 ENGINE = CFG["engine"]
 
 # Resolve the engine adapter once. The Python import machinery has
@@ -147,6 +152,119 @@ STATUS_HTML = """<!doctype html>
     </p>
     {% endif %}
   </div>
+  <div class="card" id="backup-card">
+    <h2>Backup</h2>
+    <div id="backup-status-rows"></div>
+    <div style="margin-top:16px;">
+      <div style="display:flex;gap:12px;margin-bottom:12px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;">
+          <input type="radio" name="backup-mode" value="path" checked> Use existing dataset path
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;">
+          <input type="radio" name="backup-mode" value="create"> Create new Domino dataset
+        </label>
+      </div>
+      <div id="backup-path-input">
+        <input id="backup-path" type="text" placeholder="/mnt/data/my-dataset"
+          style="width:100%;box-sizing:border-box;font-family:monospace;font-size:13px;
+                 padding:8px 10px;border:1px solid #d1d5db;border-radius:4px;margin-bottom:8px;">
+        <div style="font-size:12px;color:#6b7280;">Path to a mounted dataset directory. Backups are written to a <code>db-{{ cfg.db_id }}</code> subdirectory within it.</div>
+      </div>
+      <div id="backup-create-input" style="display:none;">
+        <input id="backup-ds-name" type="text" placeholder="my-db-backups"
+          style="width:100%;box-sizing:border-box;font-size:13px;
+                 padding:8px 10px;border:1px solid #d1d5db;border-radius:4px;margin-bottom:8px;">
+        <div style="font-size:12px;color:#6b7280;">Creates a new Domino dataset in this project. The app needs to be restarted once after creation for the dataset to be mounted.</div>
+      </div>
+      <button onclick="configureBackup()" style="background:#6366f1;color:white;border:none;
+        padding:8px 16px;border-radius:4px;font-size:13px;font-weight:500;cursor:pointer;">
+        Save backup location
+      </button>
+      <button onclick="snapshotNow()" style="background:white;color:#374151;border:1px solid #d1d5db;
+        padding:8px 16px;border-radius:4px;font-size:13px;font-weight:500;cursor:pointer;margin-left:8px;">
+        Snapshot now
+      </button>
+    </div>
+    <div id="backup-msg" style="margin-top:10px;font-size:13px;"></div>
+  </div>
+  <script>
+  (function() {
+    // Toggle path vs create inputs
+    document.querySelectorAll('input[name="backup-mode"]').forEach(r => {
+      r.addEventListener('change', function() {
+        document.getElementById('backup-path-input').style.display = this.value === 'path' ? '' : 'none';
+        document.getElementById('backup-create-input').style.display = this.value === 'create' ? '' : 'none';
+      });
+    });
+
+    function setMsg(msg, color) {
+      var el = document.getElementById('backup-msg');
+      el.style.color = color || '#374151';
+      el.textContent = msg;
+    }
+
+    function renderStatus(data) {
+      var rows = document.getElementById('backup-status-rows');
+      var snapshotDir = data.snapshot_dir || '(not configured)';
+      var lastSnap = data.last_snapshot || '—';
+      var lastStatus = data.last_status || '—';
+      rows.innerHTML =
+        '<div class="row"><div class="key">Backup location</div><div class="val">' + snapshotDir + '</div></div>' +
+        '<div class="row"><div class="key">Last snapshot</div><div class="val">' + lastSnap + '</div></div>' +
+        '<div class="row"><div class="key">Last status</div><div class="val ' + (lastStatus === 'ok' ? 'ok' : '') + '">' + lastStatus + '</div></div>';
+      if (data.snapshot_dir) {
+        document.getElementById('backup-path').value = data.snapshot_dir.replace(/[/]db-[^/]+$/, '');
+      }
+    }
+
+    function loadStatus() {
+      fetch('api/backup/status').then(r => r.json()).then(renderStatus).catch(function(e) {
+        document.getElementById('backup-status-rows').innerHTML = '<div class="row"><div class="key">Status</div><div class="val" style="color:#ca8a04">Could not load backup status</div></div>';
+      });
+    }
+
+    window.configureBackup = function() {
+      var mode = document.querySelector('input[name="backup-mode"]:checked').value;
+      var body = {mode: mode};
+      if (mode === 'path') {
+        var p = document.getElementById('backup-path').value.trim();
+        if (!p) { setMsg('Enter a dataset path.', '#ca8a04'); return; }
+        body.path = p;
+      } else {
+        var n = document.getElementById('backup-ds-name').value.trim();
+        if (!n) { setMsg('Enter a dataset name.', '#ca8a04'); return; }
+        body.name = n;
+      }
+      setMsg('Saving…', '#6b7280');
+      fetch('api/backup/configure', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      }).then(r => r.json()).then(function(data) {
+        if (data.error) { setMsg('Error: ' + data.error, '#dc2626'); return; }
+        if (data.status === 'needs_restart') {
+          setMsg('Dataset created at ' + data.mount_path + '. Restart this app for it to be mounted, then set the path above.', '#ca8a04');
+        } else {
+          setMsg('Saved. Backups will write to ' + data.snapshot_dir, '#16a34a');
+          loadStatus();
+        }
+      }).catch(function(e) { setMsg('Request failed: ' + e, '#dc2626'); });
+    };
+
+    window.snapshotNow = function() {
+      setMsg('Running snapshot…', '#6b7280');
+      fetch('api/backup/snapshot', {method: 'POST'})
+        .then(r => r.json())
+        .then(function(d) {
+          setMsg(d.error ? 'Error: ' + d.error : 'Snapshot done: ' + (d.detail || 'ok'), d.error ? '#dc2626' : '#16a34a');
+          loadStatus();
+        })
+        .catch(function(e) { setMsg('Request failed: ' + e, '#dc2626'); });
+    };
+
+    loadStatus();
+  })();
+  </script>
 </body></html>
 """
 
@@ -303,6 +421,123 @@ def healthz():
         return (f"{ENGINE} unhealthy", 503)
     except Exception as e:
         return (f"{ENGINE} unhealthy: {e}", 503)
+
+
+@app.route("/api/backup/status")
+def api_backup_status():
+    snap_dir = str(lifecycle.snapshot_path(CFG))
+    last_snap, last_status = _last_snapshot_info(snap_dir)
+    return jsonify({
+        "snapshot_dir": snap_dir,
+        "last_snapshot": last_snap,
+        "last_status": last_status,
+    })
+
+
+@app.route("/api/backup/configure", methods=["POST"])
+def api_backup_configure():
+    body = request.get_json(force=True) or {}
+    mode = body.get("mode", "path")
+    datasets_dir = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
+
+    if mode == "create":
+        name = (body.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "dataset name is required"}), 400
+        project_id = os.environ.get("DOMINO_PROJECT_ID", "")
+        try:
+            if "/mnt/code" not in sys.path:
+                sys.path.insert(0, "/mnt/code")
+            import domino_api as _dapi
+            _dapi.create_dataset(name, project_id)
+        except Exception as e:
+            return jsonify({"error": f"Dataset creation failed: {e}"}), 502
+        mount_path = Path(datasets_dir) / name
+        if mount_path.exists():
+            # Already mounted — configure immediately.
+            snap_dir = mount_path / f"db-{CFG['db_id']}"
+            _apply_backup_config(snap_dir)
+            return jsonify({"status": "ok", "snapshot_dir": str(snap_dir)})
+        return jsonify({
+            "status": "needs_restart",
+            "mount_path": str(mount_path),
+            "detail": f"Dataset '{name}' created. Restart the app and then set path to {mount_path}.",
+        })
+
+    # mode == "path"
+    raw_path = (body.get("path") or "").strip()
+    if not raw_path:
+        return jsonify({"error": "path is required"}), 400
+    base = Path(raw_path)
+    if not base.exists():
+        return jsonify({"error": f"Path does not exist: {base}. Is the dataset mounted?"}), 400
+    # Test writability.
+    test_file = base / ".dd_write_test"
+    try:
+        test_file.write_text("ok")
+        test_file.unlink()
+    except OSError as e:
+        return jsonify({"error": f"Path not writable: {e}"}), 400
+    snap_dir = base / f"db-{CFG['db_id']}"
+    _apply_backup_config(snap_dir)
+    return jsonify({"status": "ok", "snapshot_dir": str(snap_dir)})
+
+
+@app.route("/api/backup/snapshot", methods=["POST"])
+def api_backup_snapshot():
+    """Trigger an immediate snapshot for this DB engine."""
+    from dbapp import engines as _eng
+    adapter = _eng.get(ENGINE)
+    script_name = adapter.snapshot_script_name()
+    script = None
+    for candidate in (f"/mnt/code/snapshotter/{script_name}", f"/opt/dd/snapshotter/{script_name}"):
+        if Path(candidate).exists():
+            script = candidate
+            break
+    if not script:
+        return jsonify({"error": f"Snapshotter script not found: {script_name}"}), 500
+
+    snap_dir = lifecycle.snapshot_path(CFG)
+    env = os.environ.copy()
+    env.update({"DD_DB_ID": CFG["db_id"], "DD_SNAPSHOT_DIR": str(snap_dir)})
+    env.update(adapter.snapshot_env(CFG))
+    try:
+        result = _sp.run(
+            ["python3", script], env=env, capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            return jsonify({"error": "Snapshot failed", "detail": result.stdout[-1000:] + result.stderr[-500:]}), 500
+        last_line = (result.stdout.strip().splitlines() or ["done"])[-1]
+        return jsonify({"status": "ok", "detail": last_line})
+    except _sp.TimeoutExpired:
+        return jsonify({"error": "Snapshot timed out after 300s"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _apply_backup_config(snap_dir: Path) -> None:
+    """Update the in-memory config and persist the backup location."""
+    with _cfg_lock:
+        CFG["snapshot_dir"] = str(snap_dir)
+    lifecycle.save_backup_config(CFG, snap_dir)
+
+
+def _last_snapshot_info(snap_dir: str) -> tuple[str, str]:
+    """Parse the last line of _diag/snapshot.out for time and status."""
+    try:
+        log_file = Path(snap_dir) / "_diag" / "snapshot.out"
+        if not log_file.exists():
+            return "—", "—"
+        lines = log_file.read_text().strip().splitlines()
+        # Look for a timestamp + "done" or "failed" line.
+        for line in reversed(lines):
+            if "done" in line.lower():
+                return line[:40], "ok"
+            if "fail" in line.lower() or "error" in line.lower():
+                return line[:40], "failed"
+        return lines[-1][:40] if lines else "—", "—"
+    except Exception:
+        return "—", "—"
 
 
 if __name__ == "__main__":

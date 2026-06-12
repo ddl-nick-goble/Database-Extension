@@ -109,6 +109,26 @@ def list_environments() -> list[dict]:
     return _unwrap_list(_get("/v1/environments"))
 
 
+def list_datasets(project_id: str = "") -> list[dict]:
+    """List datasets for a project. Returns the inner `dataset` dicts."""
+    r = _get("/api/datasetrw/v2/datasets",
+             params={"projectIdsToInclude": project_id or PROJECT_ID})
+    return [w.get("dataset", w) for w in (r.get("datasets", []) if isinstance(r, dict) else [])]
+
+
+def create_dataset(name: str, project_id: str = "") -> dict:
+    """Create a new Domino dataset in the project. Returns the dataset object.
+    Raises DominoApiError on failure."""
+    r = _post("/api/datasetrw/v2/datasets", json={
+        "name": name,
+        "projectId": project_id or PROJECT_ID,
+    })
+    # API may return {"dataset": {...}} or the object directly
+    if isinstance(r, dict) and "dataset" in r:
+        return r["dataset"]
+    return r if isinstance(r, dict) else {}
+
+
 def default_environment_image() -> str:
     """Return the dockerImage of the default Domino Standard Environment."""
     data = _get("/v4/environments/defaultEnvironment")
@@ -343,6 +363,33 @@ def create_app(
         "version": {
             "hardwareTierId": hardware_tier_id,
             "environmentId": environment_id,
+            "extendedIdentityPropagationToAppsEnabled": True,
+        },
+    })
+
+
+def register_extension(app_id: str, app_version_id: str, name: str) -> dict:
+    """Register the app as a project-sidebar extension visible across all projects."""
+    return _post("/api/extensions/beta/extensions", json={
+        "name": name,
+        "appId": app_id,
+        "appVersionId": app_version_id,
+        "enabled": True,
+        "uiMountPointTypeConfigs": {
+            "projectSidebar": {
+                "allProjects": True,
+                "enabled": True,
+                "mountPoints": [],
+                "urlConfig": {
+                    "contextualQueryParams": ["projectId"],
+                },
+            },
+            "datasetFileContext":       {"enabled": False},
+            "netAppVolumeFileContext":  {"enabled": False},
+            "dataset":                 {"enabled": False},
+            "netAppVolume":            {"enabled": False},
+            "modelDetails":            {"enabled": False},
+            "adminPanel":              {"enabled": False},
         },
     })
 

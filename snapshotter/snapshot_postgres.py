@@ -153,6 +153,21 @@ def trigger_domino_snapshot() -> None:
 # Entry
 # --------------------------------------------------------------------------
 def main() -> int:
+    # Pick up runtime backup path change without requiring container restart.
+    _override = Path("/tmp/dd-backup-override.json")
+    if _override.exists():
+        try:
+            import json as _json
+            _d = _json.loads(_override.read_text())
+            if _d.get("db_id") == DB_ID and _d.get("snapshot_dir"):
+                global SNAPSHOT_ROOT, BASEBACKUP_DIR, WAL_DIR, DATASET_RELPATH
+                SNAPSHOT_ROOT = Path(_d["snapshot_dir"])
+                BASEBACKUP_DIR = SNAPSHOT_ROOT / "basebackup"
+                WAL_DIR = SNAPSHOT_ROOT / "wal"
+                DATASET_RELPATH = f"db-{DB_ID}"
+        except Exception:
+            pass
+
     if not PG_PASSWORD:
         log("DD_PG_PASSWORD not set — refusing to run")
         return 2

@@ -133,13 +133,13 @@ function renderEngineCards() {
 // =====================================================================
 async function refreshDatabases() {
     const tbody = document.getElementById("db-tbody");
-    tbody.innerHTML = `<tr><td colspan="6" class="muted">Loading…</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="muted">Loading…</td></tr>`;
     try {
         const data = await api("/databases");
         state.databases = data.databases || [];
         state.summary   = data.summary   || {};
     } catch (e) {
-        tbody.innerHTML = `<tr><td colspan="6" class="muted">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="muted">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
         return;
     }
     renderTable();
@@ -161,7 +161,7 @@ function renderTable() {
     });
 
     if (!rows.length) {
-        tbody.innerHTML = `<tr><td colspan="7" class="muted">No databases yet. Click <b>+ New Database</b> to create one.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="muted">No databases yet. Click <b>+ New Database</b> to create one.</td></tr>`;
         return;
     }
 
@@ -177,7 +177,10 @@ function renderTable() {
             sLower === "never started"                          ? "badge-pending" :
                                                                   "badge-stopped";
         const conn = db.url
-            ? `<a href="${escapeHtml(db.browserUrl || db.url)}" target="_blank" rel="noopener">Open DB →</a>`
+            ? `<a href="${escapeHtml(db.browserUrl || db.url)}" target="_blank" rel="noopener">Open DB ↗</a>`
+            : `<span class="muted">—</span>`;
+        const configLink = db.configUrl
+            ? `<a href="${escapeHtml(db.configUrl)}" target="_blank" rel="noopener">Open Setup ↗</a>`
             : `<span class="muted">—</span>`;
         const created = db.createdAt ? formatDate(db.createdAt) : "<span class=\"muted\">—</span>";
         const isRunning = db.isRunning;
@@ -195,9 +198,10 @@ function renderTable() {
                 <td>${escapeHtml(db.owner || "")}</td>
                 <td>${created}</td>
                 <td>${conn}</td>
+                <td>${configLink}</td>
                 <td class="td-actions">
                     ${actionBtns}
-                    <button class="btn btn-secondary btn-small btn-danger" data-delete="${db.id}" title="Delete app">×</button>
+                    <button class="btn btn-secondary btn-small btn-danger" data-delete="${db.id}">Delete</button>
                 </td>
             </tr>
         `;
@@ -592,7 +596,7 @@ function renderEnvCards(envs) {
                 <div class="env-card-status">
                     ${badge}
                     ${revNum ? `<span class="env-rev-chip">${escapeHtml(revNum)}</span>` : ""}
-                    ${e.envUrl ? `<a class="env-link" href="${escapeHtml(e.envUrl)}" target="_blank" rel="noopener" title="Open in Domino">↗</a>` : ""}
+                    ${e.envUrl ? `<a class="btn btn-secondary btn-small env-open-btn" href="${escapeHtml(e.envUrl)}" target="_blank" rel="noopener">Open Environment</a>` : ""}
                 </div>
             </div>
             <div class="env-card-meta">

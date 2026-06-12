@@ -138,6 +138,20 @@ def trigger_domino_snapshot() -> None:
 
 
 def main() -> int:
+    # Pick up runtime backup path change without requiring container restart.
+    _override = Path("/tmp/dd-backup-override.json")
+    if _override.exists():
+        try:
+            import json as _json
+            _d = _json.loads(_override.read_text())
+            if _d.get("db_id") == DB_ID and _d.get("snapshot_dir"):
+                global SNAPSHOT_ROOT, SNAPSHOTS_DIR, DATASET_RELPATH
+                SNAPSHOT_ROOT = Path(_d["snapshot_dir"])
+                SNAPSHOTS_DIR = SNAPSHOT_ROOT / "snapshots"
+                DATASET_RELPATH = f"db-{DB_ID}"
+        except Exception:
+            pass
+
     if not MYSQL_PASSWORD:
         log("DD_MYSQL_PASSWORD not set — refusing to run")
         return 2

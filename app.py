@@ -39,7 +39,14 @@ _DD_CONFIGS_DEFAULT = (
     f"{os.environ.get('DOMINO_PROJECT_NAME', 'default')}/_dd_configs"
 )
 DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR", _DD_CONFIGS_DEFAULT))
-DBAPPS_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    DBAPPS_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as e:
+    log.warning(
+        "Could not create DBAPPS_DIR %s: %s — wizard will run without dataset-backed config storage "
+        "(DD_CONFIG_JSON is the primary delivery mechanism and does not require this path)",
+        DBAPPS_DIR, e,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -163,6 +170,17 @@ def _browser_url(a: dict) -> str:
     return running if running.startswith("http") else dapi.app_url(a)
 
 
+def _config_url(a: dict) -> str:
+    """Domino app details/overview page for configuration."""
+    app_id = a.get("id", "")
+    host = (dapi.PUBLIC_HOST or "").rstrip("/")
+    owner = dapi.PROJECT_OWNER
+    project = dapi.PROJECT_NAME
+    if app_id and host and owner and project:
+        return f"{host}/u/{owner}/{project}/apps/{app_id}/latest/details/overview"
+    return _browser_url(a)
+
+
 def _shape(a: dict) -> dict:
     status = a.get("status") or "Unknown"
     return {
@@ -176,6 +194,7 @@ def _shape(a: dict) -> dict:
         "description": a.get("description", ""),
         "url": dapi.app_url(a),
         "browserUrl": _browser_url(a),
+        "configUrl": _config_url(a),
         "environmentId": a.get("environmentId"),
         "hardwareTierId": a.get("hardwareTierId"),
         "isRunning": status.lower() == "running",
@@ -314,8 +333,25 @@ def api_create_database():
             return
 
         app_id_str = a.get("id", "")
+        app_version_id = (a.get("currentVersion") or {}).get("id", "")
         yield sse("ok", msg=f"App created (id={app_id_str})", ms=since(t3))
-        log.info("created app id=%s — starting", app_id_str)
+        log.info("created app id=%s version=%s — registering extension", app_id_str, app_version_id)
+
+        # 3b. Register as a project-sidebar extension so it acts on behalf of
+        #     the user and appears in the sidebar across all projects.
+        #     Non-fatal — log a warning and continue if the extensions API is
+        #     unavailable or the caller lacks the required privilege.
+        if app_id_str and app_version_id:
+            try:
+                ext = dapi.register_extension(app_id_str, app_version_id, full_name)
+                log.info("registered extension id=%s", ext.get("id", "?"))
+                yield sse("ok", msg=f"Extension registered (id={ext.get('id', '?')})")
+            except dapi.DominoApiError as e:
+                log.warning("extension registration failed (HTTP %s): %s", e.status, e.body[:400])
+                yield sse("warn", msg=f"Extension registration skipped (HTTP {e.status}) — app will work but won't appear as sidebar extension")
+            except Exception as e:
+                log.warning("extension registration failed: %s", e)
+                yield sse("warn", msg=f"Extension registration skipped: {e}")
 
         # 4. Pin tunnel URL into cfg, then finalise DD_CONFIG_JSON.
         #    The JSON blob is passed as an env var at start time so the
@@ -333,23 +369,28 @@ def api_create_database():
         yield sse("ok", msg="Config finalised", ms=since(t4))
 
         # 5. Start it — create only makes the App object, doesn't launch the
-        #    container. Pass env+hw explicitly; create's version.environmentId
-        #    is silently dropped on this Domino build, so without it the
-        #    container would launch against the project's default DSE.
+        #    container. Pass env+hw explicitly on the FIRST attempt only;
+        #    create's version.environmentId is silently dropped on this Domino
+        #    build, so without it the container would launch against the project's
+        #    default DSE.
         #
         #    Domino's Apps API is racy here: ~50% of the time the first
         #    /start leaves the App stuck in Stopped indefinitely. A second
         #    /start consistently recovers. We retry up to 3 attempts, and
         #    break the 8s status-probe into 2s ticks so the user sees a
         #    heartbeat at least every 2s.
+        #
+        #    Passing env+hw on each retry creates an unnecessary new app version.
+        #    Retries omit env+hw so Domino re-triggers the instance on the
+        #    version already created by attempt 1, avoiding extra versions.
         start_ok = False
         for attempt in (1, 2, 3):
             yield sse("step", msg=f"/start attempt {attempt}", phase="start", attempt=attempt)
             try:
                 dapi.start_app(
                     a["id"],
-                    environment_id=env_id,
-                    hardware_tier_id=hw_id,
+                    environment_id=env_id if attempt == 1 else None,
+                    hardware_tier_id=hw_id if attempt == 1 else None,
                     environment_variables={"DD_CONFIG_JSON": json.dumps(cfg)},
                 )
                 a["status"] = "Starting"

@@ -14,6 +14,8 @@ import time
 import traceback
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent
+
 from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
 
@@ -56,6 +58,30 @@ def catch_all(_):
 # --------------------------------------------------------------------------
 # Config endpoint
 # --------------------------------------------------------------------------
+def _req_project_id() -> str:
+    """Return the effective project ID for this request.
+
+    Callers can pass ?projectId=<id> to scope operations to any project they
+    have access to.  Falls back to the wizard's own PROJECT_ID so it works
+    with zero configuration when not accessed as a cross-project extension.
+    """
+    return (request.args.get("projectId") or "").strip() or dapi.PROJECT_ID
+
+
+def _resolve_engine_env(adapter, envs_by_name: dict) -> dict:
+    """Return resolution info for one engine adapter given a name→id map."""
+    explicit = os.environ.get(adapter.env_id_var, "").strip()
+    canonical_name = f"dd-{adapter.name}-app"
+    resolved = explicit or envs_by_name.get(canonical_name, "")
+    source = "envvar" if explicit else ("byname" if resolved else "missing")
+    return {
+        "envId": resolved,
+        "envIdVar": adapter.env_id_var,
+        "envIdSource": source,
+        "expectedEnvName": canonical_name,
+    }
+
+
 @app.route("/api/config")
 def api_config():
     # Engine catalog — drives the wizard's engine cards + auto-resolved
@@ -77,9 +103,7 @@ def api_config():
     img_root = Path(app.static_folder) / "img"
     engine_catalog = []
     for a in engines.all_engines():
-        explicit = os.environ.get(a.env_id_var, "").strip()
-        canonical_name = f"dd-{a.name}-app"
-        resolved = explicit or envs_by_name.get(canonical_name, "")
+        res = _resolve_engine_env(a, envs_by_name)
         icon_path = img_root / f"{a.name}.png"
         engine_catalog.append({
             "name": a.name,
@@ -89,20 +113,13 @@ def api_config():
             "description": a.description,
             "appPrefix": a.app_prefix,
             "defaultPort": a.default_port,
-            "envId": resolved,
-            "envIdVar": a.env_id_var,
-            # Surfaced for the wizard UI to render a helpful tooltip if
-            # something is unresolved.
-            "envIdSource": (
-                "envvar" if explicit
-                else ("byname" if resolved else "missing")
-            ),
-            "expectedEnvName": canonical_name,
+            **res,
         })
+    project_id = _req_project_id()
     return jsonify({
         "owner": dapi.PROJECT_OWNER,
         "project": dapi.PROJECT_NAME,
-        "projectId": dapi.PROJECT_ID,
+        "projectId": project_id,
         "publicHost": dapi.PUBLIC_HOST,
         "engines": engine_catalog,
         # Legacy fields — kept so an older static/app.js still works
@@ -136,22 +153,14 @@ def _engine(a: dict) -> str:
 
 
 def _browser_url(a: dict) -> str:
-    """URL a human can open in a browser tab.
-
-    runningAppUrl (/u/<owner>/<project>/apps/<instanceId>/latest) goes
-    through Domino's normal auth wrapper — no API key header needed.
-    app_url() returns the apps-internal URL which requires X-Domino-Api-Key
-    and is only useful for programmatic tunnel access.
-    """
-    running = a.get("runningAppUrl", "")
-    if not running:
-        return dapi.app_url(a)
-    if running.startswith("http"):
-        return running.rstrip("/")
-    # Relative path — prepend the public host if we have it, otherwise leave
-    # relative so the browser resolves it against the wizard's own origin.
+    """Domino modelproducts page — the canonical browser URL for this app."""
+    app_id = a.get("id", "")
     host = (dapi.PUBLIC_HOST or "").rstrip("/")
-    return f"{host}{running}".rstrip("/") if host else running.rstrip("/")
+    if app_id and host:
+        return f"{host}/modelproducts/{app_id}?scope=project"
+    # Fallback for local dev without PUBLIC_HOST.
+    running = a.get("runningAppUrl", "")
+    return running if running.startswith("http") else dapi.app_url(a)
 
 
 def _shape(a: dict) -> dict:
@@ -176,7 +185,7 @@ def _shape(a: dict) -> dict:
 @app.route("/api/databases")
 def api_list_databases():
     try:
-        apps = dapi.list_apps()
+        apps = dapi.list_apps(project_id=_req_project_id())
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     dbs = [_shape(a) for a in apps if _is_db_app(a)]
@@ -203,6 +212,7 @@ def api_create_database():
     password = body.get("password") or ""
     user = body.get("user", "domino")
     snapshot_interval_min = int(body.get("snapshotIntervalMin", 60))
+    target_project_id = (body.get("projectId") or "").strip() or _req_project_id()
 
     def stream():
         def sse(kind, **payload):
@@ -254,11 +264,13 @@ def api_create_database():
             return
         yield sse("ok", msg=f"Name '{full_name}' is available", ms=since(t1))
 
-        # 2. Write per-DB config BEFORE creating the app. The DB app's
-        #    lifecycle.find_config() picks it up by app name on first boot.
+        # 2. Build config. Written to the dataset as a fallback for the
+        #    API-lookup path, but the primary delivery is DD_CONFIG_JSON
+        #    passed as an env var at start time — making the DB app
+        #    fully project-independent (no file needed in any project).
         t2 = time.monotonic()
         config_path = DBAPPS_DIR / f"{full_name}.json"
-        yield sse("step", msg=f"Writing dbapps/{full_name}.json", phase="config")
+        yield sse("step", msg=f"Writing dbapps/{full_name}.json (fallback config)", phase="config")
         cfg = {
             "engine": engine,
             "db_id": full_name,
@@ -270,12 +282,14 @@ def api_create_database():
         }
         config_path.write_text(json.dumps(cfg, indent=2))
         os.chmod(config_path, 0o600)
-        yield sse("ok", msg="Config written", ms=since(t2))
+        yield sse("ok", msg="Config ready", ms=since(t2))
 
-        # 3. Create the Domino App. Its DD_ROLE env (baked into the
-        #    chosen env image) routes /mnt/code/app.sh → dbapp/app.sh.
+        # 3. Create the Domino App.
+        #    entryPoint="/opt/dd/app.sh" is baked into every dd-*-app env
+        #    image — the app runs entirely from the image, no app.sh needed
+        #    in the project repo, so DB apps work in any project.
         t3 = time.monotonic()
-        yield sse("step", msg=f"Calling Domino /v4/modelProducts (create {engine})", phase="create")
+        yield sse("step", msg=f"Creating app (engine={engine}, entryPoint=/opt/dd/app.sh)", phase="create")
         log.info("provisioning %s engine=%s env=%s hw=%s", full_name, engine, env_id, hw_id)
         try:
             a = dapi.create_app(
@@ -283,6 +297,8 @@ def api_create_database():
                 description=f"Domino Databases — {engine} ({full_name})",
                 environment_id=env_id,
                 hardware_tier_id=hw_id,
+                entry_point="/opt/dd/app.sh",
+                project_id=target_project_id,
             )
         except dapi.DominoApiError as e:
             log.warning("create failed: %s", e)
@@ -301,11 +317,11 @@ def api_create_database():
         yield sse("ok", msg=f"App created (id={app_id_str})", ms=since(t3))
         log.info("created app id=%s — starting", app_id_str)
 
-        # 4. Pin the apps-subdomain URL into the config now that we know
-        #    the App ID. The DB-app's status page reads this to render
-        #    a copy-pasteable tunnel command.
+        # 4. Pin tunnel URL into cfg, then finalise DD_CONFIG_JSON.
+        #    The JSON blob is passed as an env var at start time so the
+        #    container carries its full config without needing any dataset file.
         t4 = time.monotonic()
-        yield sse("step", msg="Pinning tunnel URL into config", phase="pin")
+        yield sse("step", msg="Finalising config + tunnel URL", phase="pin")
         if app_id_str:
             apps_host = dapi.PUBLIC_HOST.rstrip("/")
             if apps_host.startswith("https://") and not apps_host.startswith("https://apps."):
@@ -314,7 +330,7 @@ def api_create_database():
             cfg["app_id"] = app_id_str
             config_path.write_text(json.dumps(cfg, indent=2))
             os.chmod(config_path, 0o600)
-        yield sse("ok", msg="Config updated with app_id + tunnel_url", ms=since(t4))
+        yield sse("ok", msg="Config finalised", ms=since(t4))
 
         # 5. Start it — create only makes the App object, doesn't launch the
         #    container. Pass env+hw explicitly; create's version.environmentId
@@ -330,7 +346,12 @@ def api_create_database():
         for attempt in (1, 2, 3):
             yield sse("step", msg=f"/start attempt {attempt}", phase="start", attempt=attempt)
             try:
-                dapi.start_app(a["id"], environment_id=env_id, hardware_tier_id=hw_id)
+                dapi.start_app(
+                    a["id"],
+                    environment_id=env_id,
+                    hardware_tier_id=hw_id,
+                    environment_variables={"DD_CONFIG_JSON": json.dumps(cfg)},
+                )
                 a["status"] = "Starting"
             except dapi.DominoApiError as e:
                 log.warning("start attempt %d failed: %s", attempt, e)
@@ -412,8 +433,25 @@ def api_start_database(app_id: str):
             hw_id = hw_id or cv.get("hardwareTierId")
         except Exception:
             pass
+    # Re-inject DD_CONFIG_JSON from the fallback file so the resumed container
+    # still gets its config even if the original start env vars weren't persisted.
+    env_vars: dict | None = None
+    app_name = None
     try:
-        result = dapi.start_app(app_id, environment_id=env_id, hardware_tier_id=hw_id)
+        app_doc = app_doc if 'app_doc' in dir() else dapi.get_app(app_id)  # type: ignore[name-defined]
+        app_name = app_doc.get("name", "")
+    except Exception:
+        pass
+    if app_name:
+        cfg_path = DBAPPS_DIR / f"{app_name}.json"
+        if cfg_path.exists():
+            try:
+                env_vars = {"DD_CONFIG_JSON": cfg_path.read_text()}
+            except OSError:
+                pass
+    try:
+        result = dapi.start_app(app_id, environment_id=env_id, hardware_tier_id=hw_id,
+                                environment_variables=env_vars)
     except dapi.DominoApiError as e:
         return jsonify({"error": "start failed", "status": e.status,
                         "dominoBody": e.body[:1500]}), 502
@@ -440,7 +478,7 @@ def api_environments():
 @app.route("/api/hardware-tiers")
 def api_hardware_tiers():
     try:
-        tiers = dapi.list_hardware_tiers()
+        tiers = dapi.list_hardware_tiers(project_id=_req_project_id())
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     out = []
@@ -456,6 +494,287 @@ def api_hardware_tiers():
             continue
         out.append({"id": ht.get("id"), "name": ht.get("name") or ht.get("id")})
     return jsonify(out)
+
+
+# --------------------------------------------------------------------------
+# Environment management (admin)
+# --------------------------------------------------------------------------
+def _fmt_bytes(n: int) -> str:
+    """Human-readable byte count, e.g. 3.2 GB."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return str(n)
+
+
+@app.route("/api/environments/status")
+def api_environments_status():
+    """Per-engine environment status for the Environments admin tab."""
+    try:
+        all_envs = dapi.list_environments()
+    except Exception as e:
+        log.warning("list_environments failed during /api/environments/status: %s", e)
+        all_envs = []
+
+    envs_by_name = {
+        e.get("name", ""): e
+        for e in all_envs if isinstance(e, dict)
+    }
+    img_root = Path(app.static_folder) / "img"
+    result = []
+    for a in engines.all_engines():
+        canonical_name = f"dd-{a.name}-app"
+        res = _resolve_engine_env(
+            a,
+            {k: v.get("id", "") for k, v in envs_by_name.items()},
+        )
+
+        # Pull rich details from the v4 endpoint when we have an env id.
+        env_v4: dict = {}
+        if res["envId"]:
+            try:
+                env_v4 = dapi.get_environment(res["envId"]) or {}
+            except Exception as e:
+                log.warning("get_environment(%s) failed: %s", res["envId"], e)
+
+        latest_rev = env_v4.get("latestRevision") or {}
+        rev_details = env_v4.get("latestRevisionDetails") or {}
+
+        # Base Docker image — strip the registry prefix, keep repo:tag.
+        docker_image = rev_details.get("dockerImage", "")
+        # e.g. "339712...ecr.../domino/domino-standard-environment:develop.d4421902"
+        # → show "domino-standard-environment:develop.d4421902"
+        image_display = docker_image.split("/")[-1] if "/" in docker_image else docker_image
+
+        # Compressed image size in human-readable form.
+        size_obj = rev_details.get("compressedImageSize") or {}
+        size_bytes = size_obj.get("value")
+        image_size = _fmt_bytes(int(size_bytes)) if size_bytes else ""
+
+        owner_obj = env_v4.get("owner") or {}
+
+        df_path = REPO_ROOT / "envs" / canonical_name / "Dockerfile"
+        dockerfile_text = ""
+        dockerfile_exists = df_path.exists()
+        if dockerfile_exists:
+            try:
+                dockerfile_text = df_path.read_text()
+            except OSError:
+                pass
+
+        icon_path = img_root / f"{a.name}.png"
+        result.append({
+            "name": a.name,
+            "label": a.docs_label,
+            "icon": a.icon,
+            "iconUrl": f"img/{a.name}.png" if icon_path.exists() else "",
+            "expectedEnvName": canonical_name,
+            "envId": res["envId"],
+            "envIdVar": res["envIdVar"],
+            "envIdSource": res["envIdSource"],
+            # Latest revision
+            "latestRevision": latest_rev,
+            "revisionNumber": latest_rev.get("number"),
+            "revisionSummary": rev_details.get("summary", ""),
+            # Image info
+            "dockerImage": docker_image,
+            "imageDisplay": image_display,
+            "imageSize": image_size,
+            # Environment metadata
+            "visibility": env_v4.get("visibility", ""),
+            "owner": owner_obj.get("username", ""),
+            "lastUpdated": env_v4.get("lastUpdated", ""),
+            "projectsCount": env_v4.get("projectsCount"),
+            "envUrl": f"{dapi.PUBLIC_HOST.rstrip('/')}/environment/{res['envId']}" if res["envId"] and dapi.PUBLIC_HOST else "",
+            # Dockerfile source
+            "dockerfile": dockerfile_text,
+            "dockerfileExists": dockerfile_exists,
+        })
+    return jsonify(result)
+
+
+@app.route("/api/environments/<engine>/build", methods=["POST"])
+def api_build_environment(engine: str):
+    """SSE stream that builds (or rebuilds) the dd-<engine>-app environment."""
+    # Validate + read Dockerfile before entering the generator so we have no
+    # request-context access inside the stream (same pattern as api_create_database).
+    try:
+        adapter = engines.get(engine)
+    except KeyError:
+        return jsonify({"error": f"unknown engine {engine!r}"}), 400
+
+    canonical_name = f"dd-{adapter.name}-app"
+    df_path = REPO_ROOT / "envs" / canonical_name / "Dockerfile"
+    if not df_path.exists():
+        return jsonify({"error": f"Dockerfile not found at {df_path}"}), 400
+    dockerfile = df_path.read_text()
+
+    def stream():
+        def sse(kind, **payload):
+            return f"event: {kind}\ndata: {json.dumps(payload)}\n\n"
+
+        def since(t0):
+            return int((time.monotonic() - t0) * 1000)
+
+        # Flush bytes to defeat L7 proxy buffering.
+        yield ":" + (" " * 2048) + "\n\n"
+
+        t_total = time.monotonic()
+
+        # 1. Fetch DSE base image
+        yield sse("step", msg="Fetching DSE base image")
+        try:
+            image = dapi.default_environment_image()
+        except Exception as e:
+            yield sse("error", msg="Could not fetch default environment image", detail=str(e))
+            return
+        yield sse("ok", msg=f"Base image: {image}", ms=since(t_total))
+
+        # 2. Find or create the environment
+        t2 = time.monotonic()
+        yield sse("step", msg=f"Looking up environment '{canonical_name}'")
+        try:
+            existing_id = dapi.find_environment_by_name(canonical_name)
+        except Exception as e:
+            yield sse("error", msg="Could not list environments", detail=str(e))
+            return
+
+        action = "revised"
+        if existing_id:
+            env_id = existing_id
+            yield sse("ok", msg=f"Found existing env {env_id} — adding new revision", ms=since(t2))
+        else:
+            yield sse("step", msg=f"Creating new environment '{canonical_name}'")
+            try:
+                env_id = dapi.create_environment(canonical_name, image, visibility="Global")
+            except Exception as e:
+                yield sse("error", msg="create_environment failed", detail=str(e))
+                return
+            action = "created"
+            yield sse("ok", msg=f"Created env {env_id}", ms=since(t2))
+
+        # 2b. Ensure visibility is Organization (covers both new and pre-existing envs).
+        yield sse("step", msg="Setting visibility to Organization")
+        try:
+            env_meta = dapi.get_environment(env_id)
+            owner_id = (env_meta.get("owner") or {}).get("id", "")
+            if not owner_id:
+                yield sse("error", msg="Cannot set visibility — owner ID missing from env metadata")
+                return
+            dapi.set_environment_visibility(env_id, owner_id)
+            yield sse("ok", msg="Visibility set to Organization")
+        except Exception as e:
+            yield sse("error", msg="Failed to set visibility", detail=str(e))
+            return
+
+        # 3. Add the Dockerfile revision
+        t3 = time.monotonic()
+        yield sse("step", msg="Queuing Dockerfile revision build")
+        try:
+            rev_resp = dapi.add_environment_revision(
+                env_id, dockerfile, image,
+                summary=f"dd-{engine}-app baseline — built via Environments tab",
+            )
+        except Exception as e:
+            yield sse("error", msg="add_environment_revision failed", detail=str(e))
+            return
+        revision_id = dapi._revision_id_from_resp(rev_resp)
+        build_id = dapi._build_id_from_resp(rev_resp)
+        yield sse("ok", msg=f"Revision queued (rev={revision_id or '?'})", ms=since(t3))
+
+        # 4. If the revision response didn't include a build ID (common — Domino
+        #    creates the build record asynchronously), poll the v4 env endpoint
+        #    for up to 45 s while emitting progress ticks so the UI stays alive.
+        if revision_id and not build_id:
+            yield sse("step", msg="Waiting for Domino to assign a build ID…")
+            _wait_start = time.monotonic()
+            _wait_deadline = _wait_start + 45
+            _tick_interval = 3
+            while time.monotonic() < _wait_deadline and not build_id:
+                time.sleep(_tick_interval)
+                try:
+                    env_data = dapi.get_environment(env_id) or {}
+                    rev = env_data.get("latestRevision") or {}
+                    details = env_data.get("latestRevisionDetails") or {}
+                    build_id = (
+                        rev.get("buildId")
+                        or (rev.get("build") or {}).get("id")
+                        or details.get("buildId")
+                        or (details.get("build") or {}).get("id")
+                        or ""
+                    )
+                    if not build_id:
+                        waited = int(time.monotonic() - _wait_start)
+                        yield sse("tick", msg=f"waiting for build ID… ({waited}s)", elapsed_s=waited)
+                except Exception as e:
+                    yield sse("warn", msg=f"env probe failed: {e}")
+            if build_id:
+                yield sse("ok", msg=f"Build ID found: {build_id}")
+            else:
+                yield sse("warn", msg="Build ID not found after 45 s — falling back to status polling")
+
+        # 5. Stream real Docker build logs when we have the build_id; otherwise
+        #    fall back to periodic status polling (10s ticks).
+        yield sse("step", msg="Streaming build log (this takes ~3–5 min)…")
+        deadline = time.monotonic() + 20 * 60
+        elapsed_s = 0
+        poll_interval = 3    # seconds between log fetches when logs are streaming
+        status_interval = 10  # seconds between status polls when falling back
+        final_status = "Unknown"
+        since_nano = 0
+
+        use_log_api = bool(revision_id and build_id)
+
+        while time.monotonic() < deadline:
+            sleep_s = poll_interval if use_log_api else status_interval
+            time.sleep(sleep_s)
+            elapsed_s += sleep_s
+
+            # Check build status
+            try:
+                rev_info = dapi.environment_latest_revision(env_id)
+                final_status = rev_info.get("status", "Unknown")
+            except Exception as e:
+                yield sse("warn", msg=f"status probe failed: {e}")
+                final_status = "Unknown"
+
+            if use_log_api:
+                # Fetch real log lines and stream them
+                try:
+                    new_lines, since_nano = dapi.fetch_build_logs(
+                        env_id, revision_id, build_id, since_nano
+                    )
+                    for line in new_lines:
+                        if line:  # skip blank lines
+                            yield sse("tick", msg=line, elapsed_s=elapsed_s)
+                except Exception as e:
+                    yield sse("warn", msg=f"build log fetch failed: {e}")
+                    use_log_api = False  # fall back to status ticks
+            else:
+                yield sse("tick", msg=f"status={final_status}", elapsed_s=elapsed_s)
+
+            if final_status == "Succeeded":
+                break
+            if final_status == "Failed":
+                yield sse("error", msg="Domino build FAILED — check the environment's revision log in the Domino UI",
+                          detail=f"env_id={env_id}")
+                return
+
+        total_ms = since(t_total)
+        if final_status == "Succeeded":
+            yield sse("result", engine=engine, envId=env_id, status=final_status,
+                      action=action, totalMs=total_ms)
+        else:
+            yield sse("warn", msg=f"Build timed out or status unknown ({final_status}) — "
+                      f"check the Domino UI for env {env_id}")
+            yield sse("result", engine=engine, envId=env_id, status=final_status,
+                      action=action, totalMs=total_ms)
+
+    resp = Response(stream(), mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
 
 
 # --------------------------------------------------------------------------

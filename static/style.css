@@ -76,6 +76,15 @@ code {
     font-weight: 600;
     letter-spacing: -0.01em;
 }
+.project-scope-badge {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 12px;
+    background: #ede9fe;
+    color: #6d28d9;
+    letter-spacing: 0.02em;
+}
 
 /* ============== PAGE ============== */
 .page {
@@ -109,38 +118,6 @@ code {
 }
 
 /* ============== STATS ============== */
-.stats-row {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 16px;
-    margin-bottom: 24px;
-}
-.stat {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 16px 20px;
-}
-.stat-label {
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    color: var(--text-soft);
-    text-transform: uppercase;
-    margin-bottom: 6px;
-}
-.stat-value {
-    font-size: 32px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    color: var(--text);
-}
-.stat-postgres { color: var(--postgres); }
-.stat-mongo    { color: var(--mongo); }
-.stat-mysql    { color: var(--mysql); }
-.stat-redis    { color: var(--redis); }
-.stat-running  { color: var(--success); }
-.stat-stopped  { color: var(--text-faint); }
 
 /* ============== FILTERS ============== */
 .filters {
@@ -462,6 +439,154 @@ code {
     color: var(--text-soft);
     font-weight: 500;
     width: 160px;
+}
+
+/* Generic hidden utility — panels/elements toggled by JS */
+.hidden { display: none !important; }
+
+/* ============== ENVIRONMENTS TAB ============== */
+.env-panel-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 24px;
+}
+.env-panel-title {
+    margin: 0 0 4px 0;
+    font-size: 16px;
+    font-weight: 600;
+}
+.env-panel-sub {
+    margin: 0;
+    color: var(--text-soft);
+    font-size: 13px;
+    max-width: 680px;
+}
+
+#env-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.env-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+}
+.env-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+}
+.env-card-identity {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+.env-card-label {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 2px;
+}
+.env-card-name {
+    font-size: 12px;
+    color: var(--text-soft);
+}
+.env-card-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.env-card-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 16px;
+}
+.env-meta-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+}
+.env-meta-key {
+    min-width: 110px;
+    color: var(--text-soft);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+.env-meta-val {
+    color: var(--text);
+}
+.env-card-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.env-card .provision-log {
+    margin-top: 14px;
+    max-height: 260px;
+}
+.env-card .dockerfile-view {
+    background: #f8fafc;
+    color: #1e293b;
+    border: 1px solid var(--border);
+    max-height: 480px;
+    font-size: 12.5px;
+}
+
+/* Resolution source chips */
+.env-source-chip {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 10px;
+}
+.env-source-envvar { background: #e0f2fe; color: #0369a1; }
+.env-source-byname { background: #dcfce7; color: #15803d; }
+.env-source-missing { background: #f3f4f6; color: #6b7280; }
+
+/* Revision number chip */
+.env-link {
+    font-size: 14px;
+    color: var(--text-soft);
+    text-decoration: none;
+    line-height: 1;
+    opacity: 0.7;
+    transition: opacity 0.15s;
+}
+.env-link:hover { opacity: 1; color: var(--accent); }
+
+.env-rev-chip {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 7px;
+    border-radius: 10px;
+    background: #f3f4f6;
+    color: #374151;
+    letter-spacing: 0.03em;
+}
+
+/* Base image tag — monospace, subtle tint */
+.env-image-tag {
+    font-family: var(--font-mono, monospace);
+    font-size: 12px;
+    background: #f0f9ff;
+    color: #0369a1;
+    padding: 1px 6px;
+    border-radius: 4px;
+    cursor: default;
 }
 
 .provision-log {

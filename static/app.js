@@ -6,11 +6,17 @@
 
 const API = "./api";
 
+// Project scoping — read from ?projectId= so the wizard can be opened
+// from any project and create databases there instead of its own project.
+const _urlParams = new URLSearchParams(location.search);
+const _scopedProjectId = _urlParams.get("projectId") || "";
+
 const state = {
     config: {},
     databases: [],
     summary: {},
     tiers: [],
+    envsLoaded: false,
     wizard: {
         step: 1,
         engine: null,
@@ -25,7 +31,11 @@ const state = {
 // API helpers
 // =====================================================================
 async function api(path, opts = {}) {
-    const r = await fetch(`${API}${path}`, {
+    const sep = path.includes("?") ? "&" : "?";
+    const url = _scopedProjectId
+        ? `${API}${path}${sep}projectId=${encodeURIComponent(_scopedProjectId)}`
+        : `${API}${path}`;
+    const r = await fetch(url, {
         headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
         ...opts,
     });
@@ -50,13 +60,22 @@ async function api(path, opts = {}) {
 // =====================================================================
 async function boot() {
     bindUi();
+    if (_scopedProjectId) {
+        const badge = document.getElementById("project-scope-badge");
+        if (badge) {
+            badge.textContent = `Project: ${_scopedProjectId}`;
+            badge.classList.remove("hidden");
+        }
+    }
     try {
         state.config = await api("/config");
-        // Engine catalog drives the entire UI — paint it before anything
-        // else so the filter dropdown / engine cards / stat tiles all
-        // exist before refreshDatabases() tries to populate them.
+        if (_scopedProjectId) {
+            const badge = document.getElementById("project-scope-badge");
+            if (badge && state.config.project) {
+                badge.textContent = `Project: ${state.config.project}`;
+            }
+        }
         renderEngineDropdown();
-        renderStatTiles();
         renderEngineCards();
     } catch (e) {
         console.error("config load failed", e);
@@ -82,24 +101,6 @@ function renderEngineDropdown() {
     ).join("");
 }
 
-function renderStatTiles() {
-    // Insert per-engine stat tiles after the TOTAL tile, before RUNNING.
-    const row = document.getElementById("stats-row");
-    if (!row) return;
-    // Strip any previously-injected tiles (idempotent reload).
-    row.querySelectorAll("[data-engine-stat]").forEach(el => el.remove());
-    const runningTile = row.querySelector(".stat-value.stat-running")?.closest(".stat");
-    enginesCatalog().forEach(e => {
-        const tile = document.createElement("div");
-        tile.className = "stat";
-        tile.setAttribute("data-engine-stat", e.name);
-        tile.innerHTML = `
-            <div class="stat-label">${escapeHtml(e.label.toUpperCase())}</div>
-            <div class="stat-value" id="stat-engine-${e.name}">—</div>
-        `;
-        row.insertBefore(tile, runningTile);
-    });
-}
 
 function renderEngineCards() {
     const grid = document.getElementById("engine-grid");
@@ -141,20 +142,7 @@ async function refreshDatabases() {
         tbody.innerHTML = `<tr><td colspan="6" class="muted">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
         return;
     }
-    renderStats();
     renderTable();
-}
-
-function renderStats() {
-    const s = state.summary;
-    const total = (s.total ?? state.databases.length) || 0;
-    document.getElementById("stat-total").textContent    = total;
-    enginesCatalog().forEach(e => {
-        const el = document.getElementById(`stat-engine-${e.name}`);
-        if (el) el.textContent = s[e.name] ?? "0";
-    });
-    document.getElementById("stat-running").textContent  = s.running  ?? "0";
-    document.getElementById("stat-stopped").textContent  = Math.max(0, total - (s.running || 0));
 }
 
 function renderTable() {
@@ -388,56 +376,21 @@ async function submitWizard() {
     await provision();
 }
 
-async function provision() {
-    const log = document.getElementById("provision-log");
-    log.classList.remove("hidden");
-    log.innerHTML = "";
-    document.getElementById("btn-next").disabled = true;
+// =====================================================================
+// SSE streaming — shared by provision() and buildEnv()
+// =====================================================================
 
-    const append = (cls, marker, msg, extra) => {
-        const tail = extra ? ` <span class="muted">(${escapeHtml(extra)})</span>` : "";
-        const cleanCls = cls ? ` class="${cls}"` : "";
-        log.innerHTML += `<span${cleanCls}>${escapeHtml(marker)} ${escapeHtml(msg)}</span>${tail}\n`;
-        log.scrollTop = log.scrollHeight;
-    };
-    const renderEvent = (kind, data) => {
-        const msg = data.msg || "";
-        const ms = (typeof data.ms === "number" && data.ms > 0) ? `${data.ms}ms` : "";
-        if (kind === "step")        append("step",  "→", msg, ms);
-        else if (kind === "ok")     append("ok",    "✓", msg, ms);
-        else if (kind === "tick")   append("muted", "·", `${msg} (${data.elapsed_s}s)`);
-        else if (kind === "warn")   append("warn",  "⚠", msg + (data.detail ? ` — ${data.detail}` : ""));
-        else if (kind === "error")  append("err",   "✗", msg + (data.detail ? ` — ${data.detail}` : ""));
-        else if (kind === "result") {
-            append("ok", "✓", `Created App ${data.id} — status ${data.status}`,
-                   (typeof data.totalMs === "number") ? `total ${data.totalMs}ms` : "");
-            if (data.url) {
-                log.innerHTML += `<span class="ok">→</span> Open: <a href="${escapeHtml(data.url)}" target="_blank">${escapeHtml(data.url)}</a>\n`;
-                log.scrollTop = log.scrollHeight;
-            }
-            if (data.startError) {
-                append("warn", "⚠", `Start: ${data.startError}`);
-            }
-        }
-    };
-
-    let terminal = null;  // { kind: 'result'|'error', data }
+// Consume an SSE stream from url (POST with body), calling renderEvent(kind, data) for
+// each event. Returns { terminal: { kind, data } | null }.
+async function streamSse(url, body, renderEvent, onAppend) {
+    let terminal = null;
     try {
-        const w = state.wizard;
-        const body = JSON.stringify({
-            engine: w.engine,
-            name: w.name,
-            environmentId: w.environmentId,
-            hardwareTierId: w.hardwareTierId,
-            password: w.password,
-        });
-        const resp = await fetch(`${API}/databases`, {
+        const resp = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
             body,
         });
         const ct = resp.headers.get("Content-Type") || "";
-        // Non-SSE error response (pre-stream failure, e.g. malformed JSON).
         if (!ct.includes("event-stream")) {
             const text = await resp.text();
             let detail = text;
@@ -452,12 +405,10 @@ async function provision() {
             const { value, done } = await reader.read();
             if (done) break;
             buf += dec.decode(value, { stream: true });
-            // SSE records separated by blank line.
             let idx;
             while ((idx = buf.indexOf("\n\n")) !== -1) {
                 const record = buf.slice(0, idx);
                 buf = buf.slice(idx + 2);
-                // Skip SSE comments (lines starting with ':') — used for padding/flush.
                 const lines = record.split("\n").filter(l => l && !l.startsWith(":"));
                 if (lines.length === 0) continue;
                 let kind = "message", dataStr = "";
@@ -472,26 +423,296 @@ async function provision() {
             }
         }
     } catch (e) {
-        append("err", "✗", e.message || String(e));
+        onAppend("err", "✗", e.message || String(e));
     }
+    return terminal;
+}
+
+async function provision() {
+    const logEl = document.getElementById("provision-log");
+    logEl.classList.remove("hidden");
+    logEl.innerHTML = "";
+    document.getElementById("btn-next").disabled = true;
+
+    const append = (cls, marker, msg, extra) => {
+        const tail = extra ? ` <span class="muted">(${escapeHtml(extra)})</span>` : "";
+        const cleanCls = cls ? ` class="${cls}"` : "";
+        logEl.innerHTML += `<span${cleanCls}>${escapeHtml(marker)} ${escapeHtml(msg)}</span>${tail}\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+    };
+    const renderEvent = (kind, data) => {
+        const msg = data.msg || "";
+        const ms = (typeof data.ms === "number" && data.ms > 0) ? `${data.ms}ms` : "";
+        if (kind === "step")        append("step",  "→", msg, ms);
+        else if (kind === "ok")     append("ok",    "✓", msg, ms);
+        else if (kind === "tick")   append("muted", "·", `${msg} (${data.elapsed_s}s)`);
+        else if (kind === "warn")   append("warn",  "⚠", msg + (data.detail ? ` — ${data.detail}` : ""));
+        else if (kind === "error")  append("err",   "✗", msg + (data.detail ? ` — ${data.detail}` : ""));
+        else if (kind === "result") {
+            append("ok", "✓", `Created App ${data.id} — status ${data.status}`,
+                   (typeof data.totalMs === "number") ? `total ${data.totalMs}ms` : "");
+            if (data.url) {
+                logEl.innerHTML += `<span class="ok">→</span> Open: <a href="${escapeHtml(data.url)}" target="_blank">${escapeHtml(data.url)}</a>\n`;
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+            if (data.startError) {
+                append("warn", "⚠", `Start: ${data.startError}`);
+            }
+        }
+    };
+
+    const w = state.wizard;
+    const body = JSON.stringify({
+        engine: w.engine,
+        name: w.name,
+        environmentId: w.environmentId,
+        hardwareTierId: w.hardwareTierId,
+        password: w.password,
+        ...(_scopedProjectId ? { projectId: _scopedProjectId } : {}),
+    });
+    const terminal = await streamSse(`${API}/databases`, body, renderEvent, append);
 
     if (terminal && terminal.kind === "result") {
         setTimeout(() => { closeWizard(); refreshDatabases(); }, 1800);
     } else {
-        // error, or stream ended without a terminal event — let the user retry.
         document.getElementById("btn-next").disabled = false;
+    }
+}
+
+// =====================================================================
+// Environments tab
+// =====================================================================
+async function loadEnvironments() {
+    const container = document.getElementById("env-cards");
+    container.innerHTML = `<p class="muted">Loading environments…</p>`;
+    let envs;
+    try {
+        envs = await api("/environments/status");
+    } catch (e) {
+        container.innerHTML = `<p class="muted">Failed to load: ${escapeHtml(e.message)}</p>`;
+        return;
+    }
+    state.envsLoaded = true;
+    renderEnvCards(envs);
+}
+
+function envStatusBadge(envIdSource, latestRevision) {
+    const revStatus = (latestRevision?.status || "").toLowerCase();
+    if (envIdSource === "missing") {
+        return `<span class="badge badge-pending">Not Built</span>`;
+    }
+    if (revStatus === "succeeded") {
+        return `<span class="badge badge-running">Succeeded</span>`;
+    }
+    if (["queued", "building"].includes(revStatus)) {
+        return `<span class="badge badge-starting">${latestRevision.status}</span>`;
+    }
+    if (revStatus === "failed") {
+        return `<span class="badge badge-error">Failed</span>`;
+    }
+    if (revStatus) {
+        return `<span class="badge badge-stopped">${escapeHtml(latestRevision.status)}</span>`;
+    }
+    return `<span class="badge badge-pending">Pending</span>`;
+}
+
+function fmtEnvDate(ts) {
+    if (!ts) return "";
+    try {
+        const d = new Date(ts);
+        return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+    } catch { return ts; }
+}
+
+function renderEnvCards(envs) {
+    const container = document.getElementById("env-cards");
+    if (!envs || !envs.length) {
+        container.innerHTML = `<p class="muted">No engines registered.</p>`;
+        return;
+    }
+    container.innerHTML = envs.map(e => {
+        const icon = e.iconUrl
+            ? `<img class="engine-icon-img" src="${escapeHtml(e.iconUrl)}" alt="${escapeHtml(e.label)}" style="width:36px;height:36px;">`
+            : e.icon
+                ? `<span class="engine-icon" style="font-size:32px;">${escapeHtml(e.icon)}</span>`
+                : "";
+        const badge = envStatusBadge(e.envIdSource, e.latestRevision);
+        const revNum = e.revisionNumber != null ? `v${e.revisionNumber}` : "";
+        const envIdLine = e.envId
+            ? `<span class="env-meta-val"><code>${escapeHtml(e.envId)}</code></span>`
+            : `<span class="muted">—</span>`;
+        const sourceLine = {
+            envvar: `<span class="env-source-chip env-source-envvar">env var</span>`,
+            byname: `<span class="env-source-chip env-source-byname">resolved by name</span>`,
+            missing: `<span class="env-source-chip env-source-missing">not found</span>`,
+        }[e.envIdSource] || "";
+        const dfBtn = e.dockerfileExists
+            ? `<button class="btn btn-secondary btn-small" onclick="toggleDockerfile('${escapeHtml(e.name)}')">View Dockerfile</button>`
+            : `<span class="muted" title="Dockerfile not present in repo">No Dockerfile</span>`;
+        const buildLabel = e.envIdSource === "missing" ? "Build" : "Rebuild";
+        const dfId = `df-${e.name}`;
+        const logId = `env-log-${e.name}`;
+        const dfEscaped = escapeHtml(e.dockerfile || "(no Dockerfile found)");
+
+        // Rich v4 fields
+        const baseImageTag = e.imageDisplay
+            ? e.imageDisplay.includes(":") ? e.imageDisplay.split(":")[1] : e.imageDisplay
+            : "";
+        const baseImageRow = e.imageDisplay ? `
+            <div class="env-meta-row">
+                <span class="env-meta-key">Base image</span>
+                <span class="env-meta-val env-image-tag" title="${escapeHtml(e.dockerImage || "")}">${escapeHtml(baseImageTag)}</span>
+            </div>` : "";
+        const sizeRow = e.imageSize ? `
+            <div class="env-meta-row">
+                <span class="env-meta-key">Image size</span>
+                <span class="env-meta-val">${escapeHtml(e.imageSize)}</span>
+            </div>` : "";
+        const ownerRow = e.owner ? `
+            <div class="env-meta-row">
+                <span class="env-meta-key">Owner</span>
+                <span class="env-meta-val">${escapeHtml(e.owner)}${e.visibility ? ` <span class="env-source-chip">${escapeHtml(e.visibility)}</span>` : ""}</span>
+            </div>` : "";
+        const updatedRow = e.lastUpdated ? `
+            <div class="env-meta-row">
+                <span class="env-meta-key">Last updated</span>
+                <span class="env-meta-val">${escapeHtml(fmtEnvDate(e.lastUpdated))}</span>
+            </div>` : "";
+
+        return `
+        <div class="env-card" id="env-card-${escapeHtml(e.name)}">
+            <div class="env-card-header">
+                <div class="env-card-identity">
+                    ${icon}
+                    <div>
+                        <div class="env-card-label">${escapeHtml(e.label)}</div>
+                        <code class="env-card-name">${escapeHtml(e.expectedEnvName)}</code>
+                    </div>
+                </div>
+                <div class="env-card-status">
+                    ${badge}
+                    ${revNum ? `<span class="env-rev-chip">${escapeHtml(revNum)}</span>` : ""}
+                    ${e.envUrl ? `<a class="env-link" href="${escapeHtml(e.envUrl)}" target="_blank" rel="noopener" title="Open in Domino">↗</a>` : ""}
+                </div>
+            </div>
+            <div class="env-card-meta">
+                ${baseImageRow}
+                ${sizeRow}
+                ${ownerRow}
+                ${updatedRow}
+                <div class="env-meta-row">
+                    <span class="env-meta-key">Env ID</span>
+                    ${envIdLine}
+                    ${sourceLine}
+                </div>
+                <div class="env-meta-row">
+                    <span class="env-meta-key">Resolved via</span>
+                    <code class="env-meta-val">${escapeHtml(e.envIdVar)}</code>
+                </div>
+            </div>
+            <div class="env-card-actions">
+                ${dfBtn}
+                <button class="btn btn-primary btn-small" id="btn-build-${escapeHtml(e.name)}"
+                    onclick="buildEnv('${escapeHtml(e.name)}')">${buildLabel}</button>
+            </div>
+            <pre class="provision-log dockerfile-view hidden" id="${dfId}">${dfEscaped}</pre>
+            <pre class="provision-log hidden" id="${logId}"></pre>
+        </div>
+        `;
+    }).join("");
+}
+
+function toggleDockerfile(engine) {
+    const el = document.getElementById(`df-${engine}`);
+    if (!el) return;
+    el.classList.toggle("hidden");
+}
+
+async function buildEnv(engine) {
+    const logId = `env-log-${engine}`;
+    const logEl = document.getElementById(logId);
+    const btn = document.getElementById(`btn-build-${engine}`);
+    if (!logEl || !btn) return;
+
+    logEl.classList.remove("hidden");
+    logEl.innerHTML = "";
+    btn.disabled = true;
+
+    const append = (cls, marker, msg, extra) => {
+        const tail = extra ? ` <span class="muted">(${escapeHtml(extra)})</span>` : "";
+        const cleanCls = cls ? ` class="${cls}"` : "";
+        logEl.innerHTML += `<span${cleanCls}>${escapeHtml(marker)} ${escapeHtml(msg)}</span>${tail}\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+    };
+    const renderEvent = (kind, data) => {
+        const msg = data.msg || "";
+        const ms = (typeof data.ms === "number" && data.ms > 0) ? `${data.ms}ms` : "";
+        if (kind === "step")        append("step",  "→", msg, ms);
+        else if (kind === "ok")     append("ok",    "✓", msg, ms);
+        else if (kind === "tick")   append("muted", "·", `${msg} (${data.elapsed_s}s)`);
+        else if (kind === "warn")   append("warn",  "⚠", msg + (data.detail ? ` — ${data.detail}` : ""));
+        else if (kind === "error")  append("err",   "✗", msg + (data.detail ? ` — ${data.detail}` : ""));
+        else if (kind === "result") {
+            const statusWord = data.status || "done";
+            const action = data.action || "built";
+            append("ok", "✓", `Environment ${action} — build status: ${statusWord}`,
+                   (typeof data.totalMs === "number") ? `total ${data.totalMs}ms` : "");
+        }
+    };
+
+    const terminal = await streamSse(
+        `${API}/environments/${encodeURIComponent(engine)}/build`,
+        "{}",
+        renderEvent,
+        append,
+    );
+
+    btn.disabled = false;
+    btn.textContent = "Rebuild";
+
+    if (terminal && terminal.kind === "result") {
+        // Refresh just this card's status without blowing away the whole list.
+        try {
+            const envs = await api("/environments/status");
+            renderEnvCards(envs);
+            // Re-reveal the log for the engine we just built.
+            const newLog = document.getElementById(`env-log-${engine}`);
+            if (newLog) {
+                newLog.classList.remove("hidden");
+                newLog.innerHTML = logEl.innerHTML;
+                newLog.scrollTop = newLog.scrollHeight;
+            }
+        } catch (_) {}
     }
 }
 
 // =====================================================================
 // UI bindings
 // =====================================================================
+function bindTabs() {
+    document.querySelectorAll(".tab[data-tab]").forEach(btn => {
+        btn.onclick = () => {
+            document.querySelectorAll(".tab[data-tab]").forEach(b => b.classList.remove("active"));
+            btn.classList.add("active");
+            const tab = btn.getAttribute("data-tab");
+            document.querySelectorAll("[id^='panel-']").forEach(p => p.classList.add("hidden"));
+            const panel = document.getElementById(`panel-${tab}`);
+            if (panel) panel.classList.remove("hidden");
+            if (tab === "environments" && !state.envsLoaded) {
+                loadEnvironments();
+            }
+        };
+    });
+}
+
 function bindUi() {
+    bindTabs();
     document.getElementById("btn-new-db").onclick    = openWizard;
     document.getElementById("btn-close-wizard").onclick = closeWizard;
     document.getElementById("btn-cancel").onclick    = closeWizard;
     document.getElementById("btn-next").onclick      = submitWizard;
     document.getElementById("btn-refresh").onclick   = refreshDatabases;
+    document.getElementById("btn-refresh-envs").onclick = loadEnvironments;
     document.getElementById("filter-engine").onchange = renderTable;
     document.getElementById("filter-status").onchange = renderTable;
     document.getElementById("filter-search").oninput  = renderTable;

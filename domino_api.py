@@ -10,8 +10,10 @@ is now a Domino App (not a workspace).
 
 from __future__ import annotations
 
+import html as _html
 import logging
 import os
+import re
 from typing import Any
 
 import requests
@@ -76,6 +78,10 @@ def _post(path: str, json: dict | None = None) -> Any:
     return _request("POST", path, json=json)
 
 
+def _put(path: str, json: dict | None = None) -> Any:
+    return _request("PUT", path, json=json)
+
+
 def _delete(path: str) -> None:
     """Raises DominoApiError on any non-2xx (including 404). Callers decide
     whether 404 is fatal — we don't swallow it here."""
@@ -103,19 +109,207 @@ def list_environments() -> list[dict]:
     return _unwrap_list(_get("/v1/environments"))
 
 
-def list_hardware_tiers() -> list[dict]:
-    # Confirmed working endpoint on this Domino. If it stops working,
-    # surface the failure rather than silently switching paths.
-    return _unwrap_list(_get(f"/v4/projects/{PROJECT_ID}/hardwareTiers"))
+def default_environment_image() -> str:
+    """Return the dockerImage of the default Domino Standard Environment."""
+    data = _get("/v4/environments/defaultEnvironment")
+    base = data.get("base") or {}
+    img = base.get("dockerImage", "")
+    if not img:
+        raise RuntimeError("Could not find dockerImage on defaultEnvironment.base")
+    return img
+
+
+def find_environment_by_name(name: str) -> str | None:
+    """Return the env id for the first environment with exactly this name, or None."""
+    for e in list_environments():
+        if isinstance(e, dict) and e.get("name") == name:
+            return e.get("id")
+    return None
+
+
+def set_environment_visibility(env_id: str, owner_id: str, visibility: str = "Organization") -> None:
+    """Set the visibility of an environment.  Raises DominoApiError on failure."""
+    _post(f"/v4/environments/{env_id}/visibility", json={
+        "visibility": visibility,
+        "ownerId": owner_id,
+    })
+
+
+def create_environment(name: str, image: str, visibility: str = "Global") -> str:
+    """Create a new compute environment and return its id."""
+    r = _post("/api/environments/beta/environments", json={
+        "name": name,
+        "visibility": visibility,
+        "image": image,
+        "addBaseDependencies": True,
+    })
+    env_id = (r.get("environment") or r).get("id", "")
+    if not env_id:
+        raise RuntimeError(f"create_environment returned no id: {r}")
+    return env_id
+
+
+def add_environment_revision(env_id: str, dockerfile: str, image: str, summary: str = "") -> dict:
+    """Add a new revision. Returns the full API response dict so callers can
+    extract revision id, build id, etc."""
+    body = {
+        "dockerfileInstructions": dockerfile,
+        "environmentVariables": [],
+        "image": image,
+        "postRunScript": "",
+        "postSetupScript": "",
+        "preRunScript": "",
+        "preSetupScript": "",
+        "skipCache": False,
+        "summary": summary,
+        "supportedClusters": [],
+        "tags": [],
+        "useVpn": False,
+        "workspaceTools": [],
+    }
+    r = _post(f"/api/environments/beta/environments/{env_id}/revisions", json=body)
+    return r if isinstance(r, dict) else {}
+
+
+def _revision_id_from_resp(rev_resp: dict) -> str:
+    """Extract the revision id from an add_environment_revision response."""
+    return (rev_resp.get("revision") or rev_resp).get("id", "")
+
+
+def _build_id_from_resp(rev_resp: dict) -> str:
+    """Try to extract the build id from an add_environment_revision response.
+
+    Domino may embed it as buildId, or under a 'build' sub-object."""
+    rev = rev_resp.get("revision") or rev_resp
+    return (
+        rev.get("buildId")
+        or (rev.get("build") or {}).get("id")
+        or rev_resp.get("buildId")
+        or ""
+    )
+
+
+def _build_id_from_env(env_data: dict) -> str:
+    """Try to pull a build ID out of a v4 environment object.
+
+    Domino may put the active build ID in various places — check them all."""
+    rev = env_data.get("latestRevision") or {}
+    details = env_data.get("latestRevisionDetails") or {}
+    return (
+        rev.get("buildId")
+        or (rev.get("build") or {}).get("id")
+        or details.get("buildId")
+        or (details.get("build") or {}).get("id")
+        or ""
+    )
+
+
+def wait_for_build_id(env_id: str, revision_id: str, max_wait_s: int = 45) -> str:
+    """Poll the v4 env endpoint until a build ID appears or max_wait_s expires.
+
+    Domino creates the build record asynchronously after the revision is queued,
+    so the initial add_environment_revision response often omits it.  We see it
+    appear in GET /v4/environments/{envId} within a few seconds.
+
+    Returns the build ID string, or "" if it never shows up.
+    """
+    import time as _time
+    deadline = _time.monotonic() + max_wait_s
+    interval = 3
+    while _time.monotonic() < deadline:
+        _time.sleep(interval)
+        try:
+            env_data = _get(f"/v4/environments/{env_id}")
+        except Exception:
+            continue
+
+        # Confirm it's for the right revision before trusting the build ID.
+        rev = env_data.get("latestRevision") or {}
+        if revision_id and rev.get("id") != revision_id:
+            continue  # Domino hasn't caught up yet
+
+        build_id = _build_id_from_env(env_data)
+        if build_id:
+            return build_id
+    return ""
+
+
+def get_environment(env_id: str) -> dict:
+    """Full environment object from the v4 API.
+
+    Returns richer data than /v1/environments:  latestRevisionDetails
+    (dockerImage, compressedImageSize, number, summary…), owner, visibility,
+    lastUpdated, projectsCount.  Returns {} on any error.
+    """
+    try:
+        return _get(f"/v4/environments/{env_id}")
+    except Exception:
+        return {}
+
+
+def environment_latest_revision(env_id: str) -> dict:
+    """Return the latestRevision dict for the given env id, or {} if not found."""
+    for e in list_environments():
+        if isinstance(e, dict) and e.get("id") == env_id:
+            return e.get("latestRevision") or {}
+    return {}
+
+
+# Regex to extract (nanotime, log_line) from the fetchBuildLogsSince HTML response.
+_BUILD_LOG_ROW_RE = re.compile(
+    r'<tr[^>]*\bdata-timeNano="(\d+)"[^>]*>.*?<td[^>]*\bclass="line"[^>]*>(.*?)</td>',
+    re.DOTALL,
+)
+
+
+def fetch_build_logs(
+    env_id: str, revision_id: str, build_id: str, since_nano: int = 0
+) -> tuple[list[str], int]:
+    """Fetch Docker build log lines since `since_nano` (nanosecond timestamp).
+
+    URL pattern discovered from the Domino UI:
+      GET /environments/{envId}/revisions/{revId}/build/{buildId}/fetchBuildLogsSince
+      ?since=<nanotime>   (0 = fetch all)
+
+    Returns (log_lines, last_nanotime_seen).  Returns ([], since_nano) on any error
+    so the caller can fall back gracefully.
+    """
+    path = (
+        f"/environments/{env_id}/revisions/{revision_id}"
+        f"/build/{build_id}/fetchBuildLogsSince"
+    )
+    params = {"since": since_nano}
+    try:
+        r = _session().request("GET", f"{PROXY_URL}{path}", params=params, timeout=30)
+        if r.status_code >= 400:
+            return [], since_nano
+        content = r.text
+    except Exception:
+        return [], since_nano
+
+    lines: list[str] = []
+    last_nano = since_nano
+    for m in _BUILD_LOG_ROW_RE.finditer(content):
+        nano = int(m.group(1))
+        if nano <= since_nano:
+            continue
+        text = _html.unescape(m.group(2)).strip()
+        lines.append(text)
+        if nano > last_nano:
+            last_nano = nano
+    return lines, last_nano
+
+
+def list_hardware_tiers(project_id: str = "") -> list[dict]:
+    return _unwrap_list(_get(f"/v4/projects/{project_id or PROJECT_ID}/hardwareTiers"))
 
 
 # --------------------------------------------------------------------------
 # Apps
 # --------------------------------------------------------------------------
-def list_apps(status: str | None = None) -> list[dict]:
-    """Use /v4/modelProducts which gives us status + runningAppUrl in one call.
-    (apps/beta/apps lists apps but doesn't include lifecycle status.)"""
-    data = _get("/v4/modelProducts", params={"projectId": PROJECT_ID})
+def list_apps(status: str | None = None, project_id: str = "") -> list[dict]:
+    """Use /v4/modelProducts which gives us status + runningAppUrl in one call."""
+    data = _get("/v4/modelProducts", params={"projectId": project_id or PROJECT_ID})
     apps = data if isinstance(data, list) else _unwrap_list(data)
     if status:
         apps = [a for a in apps if str(a.get("status", "")).lower() == status.lower()]
@@ -128,18 +322,24 @@ def create_app(
     environment_id: str,
     hardware_tier_id: str,
     visibility: str = "GRANT_BASED",
+    entry_point: str = "/opt/dd/app.sh",
+    project_id: str | None = None,
 ) -> dict:
     """Create the App and bind it to the chosen environment.
 
-    The `version` sub-object on this Domino instance IS respected on initial
-    create — the auto-created currentVersion inherits the env+hw we set
-    here. Call start_app(id) afterward to launch the container.
+    entry_point="/opt/dd/app.sh" is the script baked into every dd-*-app
+    environment image, making DB apps project-independent — they carry
+    their full runtime in the image and need nothing from the project repo.
+
+    project_id overrides the wizard's own project so DB apps can be created
+    in any project the caller has access to.
     """
     return _post("/api/apps/beta/apps", json={
-        "projectId": PROJECT_ID,
+        "projectId": project_id or PROJECT_ID,
         "name": name,
         "description": description,
         "visibility": visibility,
+        "entryPoint": entry_point,
         "version": {
             "hardwareTierId": hardware_tier_id,
             "environmentId": environment_id,
@@ -151,6 +351,7 @@ def start_app(
     app_id: str,
     environment_id: str | None = None,
     hardware_tier_id: str | None = None,
+    environment_variables: dict | None = None,
 ) -> dict:
     """Launch the app instance.
 
@@ -162,6 +363,11 @@ def start_app(
     Confirmed empirically against cloud-dogfood; the bare `{}` form silently
     starts with the DSE.
 
+    environment_variables are merged into the container environment.  We use
+    this to pass DD_CONFIG_JSON — the DB app's full config as a JSON blob —
+    so the app is self-contained and needs no config file in the project
+    dataset.  Confirmed the v4 start endpoint accepts this field.
+
     The v4 path is used (not /api/apps/beta/.../start) because the latter
     is feature-flag-gated on this Domino build.
     """
@@ -170,6 +376,8 @@ def start_app(
         body["environmentId"] = environment_id
     if hardware_tier_id:
         body["hardwareTierId"] = hardware_tier_id
+    if environment_variables:
+        body["environmentVariables"] = environment_variables
     return _post(f"/v4/modelProducts/{app_id}/start", json=body)
 
 

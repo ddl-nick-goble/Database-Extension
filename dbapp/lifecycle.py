@@ -41,23 +41,37 @@ DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR")) if os.environ.get("DD_DBAPPS_
 
 
 def find_config() -> dict:
-    """Locate this App's config file. Resolution order:
+    """Locate this App's config. Resolution order:
 
-      1. $DD_CONFIG explicit path                  (test / manual override)
-      2. $DOMINO_APP_NAME.json                     (not present on Domino Apps)
-      3. Domino API lookup by $DOMINO_RUN_ID       (the reliable path)
-      4. Most recent .json filtered by $DD_ENGINE  (defensive last resort)
+      1. $DD_CONFIG_JSON inline JSON blob          (self-contained apps — primary path
+                                                    for apps created in any project)
+      2. $DD_CONFIG explicit file path             (test / manual override)
+      3. $DOMINO_APP_NAME.json                     (not present on Domino Apps)
+      4. Domino API lookup by $DOMINO_RUN_ID       (same-project fallback)
+      5. Most recent .json filtered by $DD_ENGINE  (defensive last resort)
 
-    Why (3): Domino's App containers don't receive DOMINO_APP_NAME, but they
-    DO get DOMINO_RUN_ID (the instance id) and DOMINO_USER_API_KEY. We list
-    project Apps, find the one whose currentVersion.currentInstance.id ==
-    DOMINO_RUN_ID, and use its `name` to pick the right config file.
+    Why (1) first: DB apps are now created with entryPoint=/opt/dd/app.sh and
+    their config passed as DD_CONFIG_JSON in environmentVariables at start
+    time.  This makes them fully project-independent — no file needs to exist
+    in the project dataset.  The wizard still writes a .json file as a
+    belt-and-suspenders fallback for (4)/(5).
 
-    Why (4) is filtered by engine: previously this fell back to the newest
-    .json regardless of engine, which silently loaded (say) a Mongo config
-    into a Postgres container and crashed on engine-specific paths. The
-    env image bakes DD_ENGINE so that's the safest disambiguator.
+    Why (4): Domino App containers don't receive DOMINO_APP_NAME, but they
+    DO get DOMINO_RUN_ID (the instance id) and DOMINO_USER_API_KEY.
+
+    Why (5) is filtered by engine: silently loading a Mongo config into a
+    Postgres container crashes on engine-specific paths.  DD_ENGINE is baked
+    into every env image so it's the safest disambiguator.
     """
+    inline = os.environ.get("DD_CONFIG_JSON", "").strip()
+    if inline:
+        try:
+            cfg = json.loads(inline)
+            sys.stderr.write("[lifecycle] config from DD_CONFIG_JSON env var\n")
+            return cfg
+        except json.JSONDecodeError as e:
+            sys.stderr.write(f"[lifecycle] DD_CONFIG_JSON is set but invalid JSON ({e}) — falling through\n")
+
     explicit = os.environ.get("DD_CONFIG")
     if explicit:
         p = Path(explicit)

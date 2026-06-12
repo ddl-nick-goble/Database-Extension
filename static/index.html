@@ -12,6 +12,7 @@
 <header class="topbar">
     <div class="topbar-inner">
         <h1 class="title">Domino Databases</h1>
+        <div id="project-scope-badge" class="project-scope-badge hidden"></div>
         <div class="actions">
             <button class="btn btn-primary" id="btn-new-db">+ New Database</button>
         </div>
@@ -26,25 +27,11 @@
         <button class="tab active" data-tab="databases">Databases</button>
         <button class="tab" data-tab="snapshots">Snapshots</button>
         <button class="tab" data-tab="usage">Usage</button>
+        <button class="tab" data-tab="environments">Environments</button>
     </nav>
 
-    <!-- Stats row — engine-specific stats are rendered from the registry
-         by app.js (see populateStatsRow). -->
-    <section class="stats-row" id="stats-row">
-        <div class="stat">
-            <div class="stat-label">TOTAL DATABASES</div>
-            <div class="stat-value" id="stat-total">—</div>
-        </div>
-        <!-- Per-engine cards injected here -->
-        <div class="stat">
-            <div class="stat-label">RUNNING</div>
-            <div class="stat-value stat-running" id="stat-running">—</div>
-        </div>
-        <div class="stat">
-            <div class="stat-label">STOPPED</div>
-            <div class="stat-value stat-stopped" id="stat-stopped">—</div>
-        </div>
-    </section>
+    <!-- ===== DATABASES PANEL ===== -->
+    <div id="panel-databases">
 
     <!-- Filter bar -->
     <section class="filters">
@@ -80,6 +67,26 @@
             </tbody>
         </table>
     </section>
+
+    </div><!-- /panel-databases -->
+
+    <!-- ===== ENVIRONMENTS PANEL ===== -->
+    <div id="panel-environments" class="hidden">
+        <div class="env-panel-header">
+            <div>
+                <h2 class="env-panel-title">Compute Environments</h2>
+                <p class="env-panel-sub">
+                    Each engine requires a Domino compute environment named
+                    <code>dd-&lt;engine&gt;-app</code>. Build or rebuild them here —
+                    the live log streams Domino's build progress in real time.
+                </p>
+            </div>
+            <button class="btn btn-secondary" id="btn-refresh-envs">Refresh</button>
+        </div>
+        <div id="env-cards">
+            <p class="muted">Loading environments…</p>
+        </div>
+    </div><!-- /panel-environments -->
 
 </main>
 

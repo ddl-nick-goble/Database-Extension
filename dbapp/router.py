@@ -57,23 +57,6 @@ ADMIN_PORT = int(CFG.get("admin_port", 8978))
 HAS_ADMIN = ADAPTER.admin_ui_spec(CFG) is not None
 
 
-def _all_databases_url() -> str | None:
-    """Project's Apps tab, filtered to DB-namespaced apps. Built from the
-    Domino env vars Domino injects into every App container. Returns None
-    if any required piece is missing — template hides the link in that case.
-    """
-    host = (os.environ.get("DOMINO_USER_HOST") or "").rstrip("/")
-    owner = os.environ.get("DOMINO_PROJECT_OWNER") or ""
-    project = os.environ.get("DOMINO_PROJECT_NAME") or ""
-    if not (host and owner and project):
-        return None
-    return (
-        f"{host}/u/{owner}/{project}/apps"
-        f"?filter_name=db&sort_columnKey=lastUpdated&sort_order=desc"
-    )
-
-
-ALL_DATABASES_URL = _all_databases_url()
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -109,13 +92,8 @@ STATUS_HTML = """<!doctype html>
                   font-size: 12px; overflow-x: auto; line-height: 1.6; }
     .label { font-size: 12px; color: #6b7280; margin-top: 14px; }
     .note  { font-size: 12px; color: #9ca3af; margin-top: 6px; font-style: italic; }
-    .backlink { display: inline-block; font-size: 13px; color: #6366f1; margin-bottom: 12px; }
-    .backlink:hover { text-decoration: underline; }
   </style>
 </head><body>
-  {% if all_databases_url %}
-  <a class="backlink" href="{{ all_databases_url }}">← View all databases</a>
-  {% endif %}
   <h1>{{ cfg.db_id }}</h1>
   <div class="subtitle">{{ adapter.docs_label }} • Domino Databases</div>
 
@@ -180,7 +158,7 @@ def index():
         STATUS_HTML,
         cfg=CFG, adapter=ADAPTER, engine=ENGINE,
         engine_port=ENGINE_PORT, has_admin=HAS_ADMIN,
-        snippets=snippets, all_databases_url=ALL_DATABASES_URL,
+        snippets=snippets,
     )
 
 

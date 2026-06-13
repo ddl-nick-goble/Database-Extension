@@ -140,9 +140,13 @@ def api_config():
             **res,
         })
     project_id = _req_project_id()
+    # When used as a cross-project extension the frontend passes ownerName/
+    # projectName parsed from the URL path (/u/{owner}/{project}/extension).
+    owner = (request.args.get("ownerName") or "").strip() or dapi.PROJECT_OWNER
+    project = (request.args.get("projectName") or "").strip() or dapi.PROJECT_NAME
     return jsonify({
-        "owner": dapi.PROJECT_OWNER,
-        "project": dapi.PROJECT_NAME,
+        "owner": owner,
+        "project": project,
         "projectId": project_id,
         "publicHost": dapi.PUBLIC_HOST,
         "engines": engine_catalog,
@@ -191,8 +195,12 @@ def _config_url(a: dict) -> str:
     """Domino app details/overview page for configuration."""
     app_id = a.get("id", "")
     host = (dapi.PUBLIC_HOST or "").rstrip("/")
-    owner = dapi.PROJECT_OWNER
-    project = dapi.PROJECT_NAME
+    # Derive owner/project from the app's own projectUrl (/u/{owner}/{project}/...)
+    # so cross-project extension use gets the right URL, not the deployment project.
+    project_url = a.get("projectUrl", "")
+    parts = project_url.strip("/").split("/")
+    owner = parts[1] if len(parts) >= 3 and parts[0] == "u" else dapi.PROJECT_OWNER
+    project = parts[2] if len(parts) >= 3 and parts[0] == "u" else dapi.PROJECT_NAME
     if app_id and host and owner and project:
         return f"{host}/u/{owner}/{project}/apps/{app_id}/latest/details/overview"
     return _browser_url(a)

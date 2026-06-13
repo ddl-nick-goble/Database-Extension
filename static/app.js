@@ -11,6 +11,14 @@ const API = "./api";
 const _urlParams = new URLSearchParams(location.search);
 const _scopedProjectId = _urlParams.get("projectId") || "";
 
+// When loaded as a Domino extension the URL path contains the project context:
+//   /u/{owner}/{project}/extension  or  /u/{owner}/{project}/notebookSession/...
+// Parse it so /api/config gets the correct owner/project display name instead
+// of the deployment project (Database-Extension).
+const _pathMatch = location.pathname.match(/^\/u\/([^/]+)\/([^/]+)\//);
+const _pathOwner   = _pathMatch ? _pathMatch[1] : "";
+const _pathProject = _pathMatch ? _pathMatch[2] : "";
+
 const state = {
     config: {},
     databases: [],
@@ -68,7 +76,14 @@ async function boot() {
         }
     }
     try {
-        state.config = await api("/config");
+        const configParams = new URLSearchParams();
+        if (_scopedProjectId) configParams.set("projectId", _scopedProjectId);
+        if (_pathOwner)       configParams.set("ownerName", _pathOwner);
+        if (_pathProject)     configParams.set("projectName", _pathProject);
+        const configQs = configParams.toString();
+        state.config = await fetch(`${API}/config${configQs ? "?" + configQs : ""}`, {
+            headers: { "Content-Type": "application/json" },
+        }).then(r => r.json());
         if (_scopedProjectId) {
             const badge = document.getElementById("project-scope-badge");
             if (badge && state.config.project) {

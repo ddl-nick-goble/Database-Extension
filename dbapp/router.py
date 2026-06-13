@@ -379,7 +379,7 @@ STATUS_HTML = """<!doctype html>
       fetch('api/backup/snapshot', {method: 'POST'})
         .then(r => r.json())
         .then(function(d) {
-          setMsg(d.error ? 'Error: ' + d.error : 'Snapshot done: ' + (d.detail || 'ok'), d.error ? '#dc2626' : '#16a34a');
+          setMsg(d.error ? 'Error: ' + d.error + (d.detail ? ' — ' + d.detail.trim().split('\n').pop() : '') : 'Snapshot done: ' + (d.detail || 'ok'), d.error ? '#dc2626' : '#16a34a');
           loadStatus();
         })
         .catch(function(e) { setMsg('Request failed: ' + e, '#dc2626'); });

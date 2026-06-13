@@ -803,24 +803,29 @@ def api_build_environment(engine: str):
                     new_lines, since_nano = dapi.fetch_build_logs(
                         env_id, revision_id, build_id, since_nano
                     )
+                    emitted = 0
                     for line in new_lines:
-                        if line:  # skip blank lines
+                        if line:
                             yield sse("tick", msg=line, elapsed_s=elapsed_s)
+                            emitted += 1
+                    # Always emit a heartbeat so the UI knows we're still alive
+                    if emitted == 0:
+                        yield sse("tick", msg=f"status={final_status} ({elapsed_s}s)", elapsed_s=elapsed_s)
                 except Exception as e:
                     yield sse("warn", msg=f"build log fetch failed: {e}")
                     use_log_api = False  # fall back to status ticks
             else:
-                yield sse("tick", msg=f"status={final_status}", elapsed_s=elapsed_s)
+                yield sse("tick", msg=f"status={final_status} ({elapsed_s}s)", elapsed_s=elapsed_s)
 
-            if final_status == "Succeeded":
+            if final_status.lower() == "succeeded":
                 break
-            if final_status == "Failed":
+            if final_status.lower() == "failed":
                 yield sse("error", msg="Domino build FAILED — check the environment's revision log in the Domino UI",
                           detail=f"env_id={env_id}")
                 return
 
         total_ms = since(t_total)
-        if final_status == "Succeeded":
+        if final_status.lower() == "succeeded":
             yield sse("result", engine=engine, envId=env_id, status=final_status,
                       action=action, totalMs=total_ms)
         else:

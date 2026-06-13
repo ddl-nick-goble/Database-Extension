@@ -169,8 +169,75 @@ def create_environment(name: str, image: str, visibility: str = "Global") -> str
     return env_id
 
 
+DEFAULT_WORKSPACE_TOOLS = [
+    {
+        "id": "jupyter",
+        "name": "jupyter",
+        "title": "Jupyter (Python, R, Julia)",
+        "iconUrl": "/assets/images/workspace-logos/Jupyter.svg",
+        "start": ["/opt/domino/workspaces/jupyter/start"],
+        "supportedFileExtensions": [".ipynb"],
+        "proxyConfig": {
+            "internalPath": (
+                "/{{ownerUsername}}/{{projectName}}/{{sessionPathComponent}}"
+                "/{{runId}}/{{#if pathToOpen}}tree/{{pathToOpen}}{{/if}}"
+            ),
+            "port": 8888,
+            "rewrite": False,
+            "requireSubdomain": False,
+        },
+    },
+    {
+        "id": "jupyterlab",
+        "name": "jupyterlab",
+        "title": "JupyterLab",
+        "iconUrl": "/assets/images/workspace-logos/jupyterlab.svg",
+        "start": ["/opt/domino/workspaces/jupyterlab/start"],
+        "supportedFileExtensions": [],
+        "proxyConfig": {
+            "internalPath": (
+                "/{{ownerUsername}}/{{projectName}}/{{sessionPathComponent}}"
+                "/{{runId}}/{{#if pathToOpen}}tree/{{pathToOpen}}{{/if}}"
+            ),
+            "port": 8888,
+            "rewrite": False,
+            "requireSubdomain": False,
+        },
+    },
+    {
+        "id": "vscode",
+        "name": "vscode",
+        "title": "vscode",
+        "iconUrl": "/assets/images/workspace-logos/vscode.svg",
+        "start": ["/opt/domino/workspaces/vscode/start"],
+        "supportedFileExtensions": [],
+        "proxyConfig": {
+            "internalPath": "/",
+            "port": 8888,
+            "rewrite": False,
+            "requireSubdomain": False,
+        },
+    },
+    {
+        "id": "rstudio",
+        "name": "rstudio",
+        "title": "RStudio",
+        "iconUrl": "/assets/images/workspace-logos/Rstudio.svg",
+        "start": ["/opt/domino/workspaces/rstudio/start"],
+        "supportedFileExtensions": [],
+        "proxyConfig": {
+            "internalPath": "/",
+            "port": 8888,
+            "rewrite": False,
+            "requireSubdomain": False,
+        },
+    },
+]
+
+
 def add_environment_revision(env_id: str, dockerfile: str, image: str, summary: str = "",
-                              pre_run_script: str = "") -> dict:
+                              pre_run_script: str = "",
+                              workspace_tools: list | None = None) -> dict:
     """Add a new revision. Returns the full API response dict so callers can
     extract revision id, build id, etc."""
     body = {
@@ -186,7 +253,7 @@ def add_environment_revision(env_id: str, dockerfile: str, image: str, summary: 
         "supportedClusters": [],
         "tags": [],
         "useVpn": False,
-        "workspaceTools": [],
+        "workspaceTools": DEFAULT_WORKSPACE_TOOLS if workspace_tools is None else workspace_tools,
     }
     r = _post(f"/api/environments/beta/environments/{env_id}/revisions", json=body)
     return r if isinstance(r, dict) else {}
@@ -269,11 +336,13 @@ def get_environment(env_id: str) -> dict:
 
 
 def environment_latest_revision(env_id: str) -> dict:
-    """Return the latestRevision dict for the given env id, or {} if not found."""
-    for e in list_environments():
-        if isinstance(e, dict) and e.get("id") == env_id:
-            return e.get("latestRevision") or {}
-    return {}
+    """Return the latestRevision dict for the given env id, or {} if not found.
+
+    Uses the v4 per-env endpoint so the status field reflects the live build
+    state (Queued / Building / Succeeded / Failed), not the stale v1 list value.
+    """
+    env_data = get_environment(env_id)
+    return env_data.get("latestRevision") or {}
 
 
 # Regex to extract (nanotime, log_line) from the fetchBuildLogsSince HTML response.

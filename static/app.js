@@ -595,7 +595,7 @@ function renderEnvCards(envs) {
                 </div>
                 <div class="env-card-status">
                     ${badge}
-                    ${revNum ? `<span class="env-rev-chip">${escapeHtml(revNum)}</span>` : ""}
+                    ${revNum ? `<span class="env-rev-chip" id="env-rev-${escapeHtml(e.name)}">${escapeHtml(revNum)}</span>` : ""}
                     ${e.envUrl ? `<a class="btn btn-secondary btn-small env-open-btn" href="${escapeHtml(e.envUrl)}" target="_blank" rel="noopener">Open Environment</a>` : ""}
                 </div>
             </div>
@@ -642,6 +642,9 @@ async function buildEnv(engine) {
     logEl.innerHTML = "";
     btn.disabled = true;
 
+    const card = document.getElementById(`env-card-${engine}`);
+    if (card) { card.classList.remove("build-success", "build-failed"); card.classList.add("building"); }
+
     const append = (cls, marker, msg, extra) => {
         const tail = extra ? ` <span class="muted">(${escapeHtml(extra)})</span>` : "";
         const cleanCls = cls ? ` class="${cls}"` : "";
@@ -674,11 +677,35 @@ async function buildEnv(engine) {
     btn.disabled = false;
     btn.textContent = "Rebuild";
 
+    if (card) {
+        card.classList.remove("building");
+        const succeeded = terminal && terminal.kind === "result" &&
+            (terminal.data?.status || "").toLowerCase() === "succeeded";
+        card.classList.add(succeeded ? "build-success" : "build-failed");
+        setTimeout(() => card.classList.remove("build-success", "build-failed"), 2200);
+    }
+
     if (terminal && terminal.kind === "result") {
-        // Refresh just this card's status without blowing away the whole list.
         try {
+            // Snapshot current revision numbers before re-render
+            const oldRevs = {};
+            document.querySelectorAll("[id^='env-rev-']").forEach(el => {
+                oldRevs[el.id] = el.textContent;
+            });
+
             const envs = await api("/environments/status");
             renderEnvCards(envs);
+
+            // Pop any revision chip that changed
+            document.querySelectorAll("[id^='env-rev-']").forEach(el => {
+                if (oldRevs[el.id] !== undefined && oldRevs[el.id] !== el.textContent) {
+                    el.classList.remove("rev-pop");
+                    void el.offsetWidth; // force reflow to restart animation
+                    el.classList.add("rev-pop");
+                    el.addEventListener("animationend", () => el.classList.remove("rev-pop"), { once: true });
+                }
+            });
+
             // Re-reveal the log for the engine we just built.
             const newLog = document.getElementById(`env-log-${engine}`);
             if (newLog) {

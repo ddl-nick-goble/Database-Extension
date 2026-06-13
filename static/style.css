@@ -480,11 +480,37 @@ code {
     gap: 16px;
 }
 
+@keyframes env-build-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(99,102,241,0.0), 0 0 0   0 rgba(99,102,241,0.0); border-color: var(--border); }
+    30%  { box-shadow: 0 0 8px 2px rgba(99,102,241,0.35), 0 0 24px 6px rgba(99,102,241,0.12); border-color: #818cf8; }
+    70%  { box-shadow: 0 0 8px 2px rgba(99,102,241,0.35), 0 0 24px 6px rgba(99,102,241,0.12); border-color: #818cf8; }
+    100% { box-shadow: 0 0 0 0 rgba(99,102,241,0.0), 0 0 0   0 rgba(99,102,241,0.0); border-color: var(--border); }
+}
+@keyframes env-success-flash {
+    0%   { box-shadow: 0 0 0 0 rgba(22,163,74,0.0);  border-color: var(--border); }
+    20%  { box-shadow: 0 0 12px 4px rgba(22,163,74,0.4), 0 0 32px 8px rgba(22,163,74,0.15); border-color: #4ade80; }
+    100% { box-shadow: 0 0 0 0 rgba(22,163,74,0.0);  border-color: var(--border); }
+}
+@keyframes env-fail-flash {
+    0%   { box-shadow: 0 0 0 0 rgba(220,38,38,0.0);  border-color: var(--border); }
+    20%  { box-shadow: 0 0 12px 4px rgba(220,38,38,0.4), 0 0 32px 8px rgba(220,38,38,0.15); border-color: #f87171; }
+    100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.0);  border-color: var(--border); }
+}
 .env-card {
     background: var(--bg-card);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 20px 24px;
+    transition: border-color 0.3s, box-shadow 0.3s;
+}
+.env-card.building {
+    animation: env-build-pulse 2s ease-in-out infinite;
+}
+.env-card.build-success {
+    animation: env-success-flash 2s ease-out forwards;
+}
+.env-card.build-failed {
+    animation: env-fail-flash 2s ease-out forwards;
 }
 .env-card-header {
     display: flex;
@@ -568,6 +594,12 @@ code {
 
 /* Revision number chip */
 
+@keyframes rev-pop {
+    0%   { transform: scale(1);    background: #f3f4f6; color: #374151; }
+    25%  { transform: scale(2.2);  background: #6366f1; color: #ffffff; box-shadow: 0 0 12px 4px rgba(99,102,241,0.45); }
+    60%  { transform: scale(1.5);  background: #818cf8; color: #ffffff; }
+    100% { transform: scale(1);    background: #f3f4f6; color: #374151; box-shadow: none; }
+}
 .env-rev-chip {
     display: inline-block;
     font-size: 11px;
@@ -577,6 +609,10 @@ code {
     background: #f3f4f6;
     color: #374151;
     letter-spacing: 0.03em;
+    transform-origin: center;
+}
+.env-rev-chip.rev-pop {
+    animation: rev-pop 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
 }
 
 /* Base image tag — monospace, subtle tint */

@@ -117,5 +117,13 @@ class PostgresAdapter(EngineAdapter):
             ),
         ]
 
+    def snapshot_env(self, cfg: dict) -> dict[str, str]:
+        # snapshot_postgres.py reads DD_PG_* (short prefix), not DD_POSTGRES_*.
+        return {
+            "DD_PG_PORT":     str(cfg.get("port", self.default_port)),
+            "DD_PG_USER":     cfg.get("user", self.default_user),
+            "DD_PG_PASSWORD": cfg["password"],
+        }
+
 
 _register(PostgresAdapter())

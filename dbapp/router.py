@@ -201,11 +201,11 @@ STATUS_HTML = """<!doctype html>
     <div class="opt-block opt-recommended">
       <div class="opt-header">
         <span class="opt-num">1</span>
-        <span class="opt-title">DSC + DB environment</span>
+        <span class="opt-title">DSE + DB environment</span>
         <span class="badge-rec">RECOMMENDED</span>
       </div>
       <p class="opt-desc">
-        Start a Domino workspace with the <code>dd-dsc-db</code> environment.
+        Start a Domino workspace with the <code>dd-dse-db</code> environment.
         The pre-run script auto-connects all databases in this project — no tunnel command needed.
       </p>
       <div class="snippet-wrap">
@@ -305,11 +305,23 @@ STATUS_HTML = """<!doctype html>
   <script>
   function copySnippet(btn) {
     var pre = btn.previousElementSibling;
-    navigator.clipboard.writeText(pre.textContent.trim()).then(function() {
-      btn.textContent = 'Copied!';
-      btn.classList.add('copied');
+    var text = pre.textContent.trim();
+    function markCopied() {
+      btn.textContent = 'Copied!'; btn.classList.add('copied');
       setTimeout(function() { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1800);
-    });
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(markCopied).catch(function() { fallbackCopy(text, markCopied); });
+    } else {
+      fallbackCopy(text, markCopied);
+    }
+  }
+  function fallbackCopy(text, cb) {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); cb(); } catch(e) {}
+    document.body.removeChild(ta);
   }
   (function() {
     // Toggle path vs create inputs

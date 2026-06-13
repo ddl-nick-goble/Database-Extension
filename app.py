@@ -567,8 +567,8 @@ def api_environments_status():
             env_id_var=a.env_id_var,
         ))
     specs.append(dict(
-        name="dsc-db", label="DSC + DB",
-        canonical_name="dd-dsc-db",
+        name="dsc-db", label="DSE + DB",
+        canonical_name="dd-dse-db",
         icon="", icon_png="", env_id_var="",
     ))
 
@@ -654,12 +654,12 @@ def api_build_environment(engine: str):
     """SSE stream that builds (or rebuilds) a dd-* environment.
 
     Works for both engine environments (dd-<engine>-app) and the
-    DSC + DB workspace environment (engine="dsc-db" → dd-dsc-db).
+    DSE + DB workspace environment (engine="dsc-db" → dd-dse-db).
     """
     # Validate + read Dockerfile before entering the generator so we have no
     # request-context access inside the stream (same pattern as api_create_database).
     if engine == "dsc-db":
-        canonical_name = "dd-dsc-db"
+        canonical_name = "dd-dse-db"
         pre_run_script = "python3 /opt/dd/workspace-setup.py"
     else:
         try:

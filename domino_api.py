@@ -175,7 +175,7 @@ DEFAULT_WORKSPACE_TOOLS = [
         "name": "jupyter",
         "title": "Jupyter (Python, R, Julia)",
         "iconUrl": "/assets/images/workspace-logos/Jupyter.svg",
-        "start": ["/opt/domino/workspaces/jupyter/start"],
+        "startScripts": ["/opt/domino/workspaces/jupyter/start"],
         "supportedFileExtensions": [".ipynb"],
         "proxyConfig": {
             "internalPath": (
@@ -192,7 +192,7 @@ DEFAULT_WORKSPACE_TOOLS = [
         "name": "jupyterlab",
         "title": "JupyterLab",
         "iconUrl": "/assets/images/workspace-logos/jupyterlab.svg",
-        "start": ["/opt/domino/workspaces/jupyterlab/start"],
+        "startScripts": ["/opt/domino/workspaces/jupyterlab/start"],
         "supportedFileExtensions": [],
         "proxyConfig": {
             "internalPath": (
@@ -209,7 +209,7 @@ DEFAULT_WORKSPACE_TOOLS = [
         "name": "vscode",
         "title": "vscode",
         "iconUrl": "/assets/images/workspace-logos/vscode.svg",
-        "start": ["/opt/domino/workspaces/vscode/start"],
+        "startScripts": ["/opt/domino/workspaces/vscode/start"],
         "supportedFileExtensions": [],
         "proxyConfig": {
             "internalPath": "/",
@@ -223,7 +223,7 @@ DEFAULT_WORKSPACE_TOOLS = [
         "name": "rstudio",
         "title": "RStudio",
         "iconUrl": "/assets/images/workspace-logos/Rstudio.svg",
-        "start": ["/opt/domino/workspaces/rstudio/start"],
+        "startScripts": ["/opt/domino/workspaces/rstudio/start"],
         "supportedFileExtensions": [],
         "proxyConfig": {
             "internalPath": "/",

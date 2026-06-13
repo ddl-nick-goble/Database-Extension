@@ -169,7 +169,7 @@ def _start_tunnel(app_url: str, port: int, app_name: str) -> int | None:
 
 
 def _write_bashrc(apps: list[dict], port_map: dict[str, int]) -> None:
-    """Write/replace the dd-connect block in ~/.bashrc."""
+    """Write/replace the dd-connect block in ~/.bashrc and ensure login shells load it."""
     _MARKER_START = "# >>> domino-db-connect start >>>"
     _MARKER_END   = "# <<< domino-db-connect end <<<"
 
@@ -196,13 +196,17 @@ def _write_bashrc(apps: list[dict], port_map: dict[str, int]) -> None:
         lines.append(f'    "{name}") {cmd} ;;')
     lines += [
         "    *)",
-        '      echo "Available databases:"',
     ]
-    for app in apps:
-        name = app["name"]
-        port = port_map[name]
-        cmd  = app["_tpl"].format(port=port)
-        lines.append(f'      echo "  {name:<24} {cmd}"')
+    if apps:
+        lines.append('      echo "Available databases:"')
+        for app in apps:
+            name = app["name"]
+            port = port_map[name]
+            cmd  = app["_tpl"].format(port=port)
+            lines.append(f'      echo "  {name:<24} {cmd}"')
+    else:
+        lines.append('      echo "No databases are currently running in this project."')
+        lines.append('      echo "Start a DB app from the Domino Databases wizard, then restart this workspace."')
     lines += [
         "      ;;",
         "  esac",
@@ -216,7 +220,6 @@ def _write_bashrc(apps: list[dict], port_map: dict[str, int]) -> None:
     bashrc = Path.home() / ".bashrc"
     try:
         existing = bashrc.read_text() if bashrc.exists() else ""
-        # Replace old block if present
         if _MARKER_START in existing and _MARKER_END in existing:
             s = existing.index(_MARKER_START)
             e = existing.index(_MARKER_END) + len(_MARKER_END)
@@ -226,6 +229,19 @@ def _write_bashrc(apps: list[dict], port_map: dict[str, int]) -> None:
         bashrc.write_text(existing.rstrip("\n") + "\n" + block)
     except Exception as exc:
         _log(f"could not update ~/.bashrc: {exc}")
+        return
+
+    # Ensure login shells (bash_profile / profile) also source .bashrc so
+    # the db() function is available in all terminal types.
+    _SOURCE_SNIPPET = '[ -f ~/.bashrc ] && source ~/.bashrc'
+    for profile in (Path.home() / ".bash_profile", Path.home() / ".profile"):
+        try:
+            text = profile.read_text() if profile.exists() else ""
+            if _SOURCE_SNIPPET not in text:
+                with open(profile, "a") as f:
+                    f.write(f"\n{_SOURCE_SNIPPET}\n")
+        except Exception as exc:
+            _log(f"could not update {profile}: {exc}")
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -238,36 +254,32 @@ def main() -> None:
     _log("discovering running database apps...")
     apps = _find_running_db_apps()
 
-    if not apps:
-        _log("no running database apps found in project")
-        return
-
-    port_map = _assign_ports(apps)
+    port_map = _assign_ports(apps) if apps else {}
     connected: list[tuple[str, int]] = []
 
-    for app in apps:
-        name     = app["name"]
-        port     = port_map[name]
-        app_url  = _app_direct_url(app)
+    if not apps:
+        _log("no running database apps found in project — writing stub db() to ~/.bashrc")
+    else:
+        for app in apps:
+            name     = app["name"]
+            port     = port_map[name]
+            app_url  = _app_direct_url(app)
 
-        if not app_url:
-            _log(f"  {name}: no URL available, skipping")
-            continue
+            if not app_url:
+                _log(f"  {name}: no URL available, skipping")
+                continue
 
-        if _port_listening(port):
-            _log(f"  {name}: port {port} already in use — tunnel likely already running")
-            connected.append((name, port))
-            continue
+            if _port_listening(port):
+                _log(f"  {name}: port {port} already in use — tunnel likely already running")
+                connected.append((name, port))
+                continue
 
-        pid = _start_tunnel(app_url, port, name)
-        if pid:
-            _log(f"  {name} → 127.0.0.1:{port}  (pid {pid})")
-            connected.append((name, port))
-        else:
-            _log(f"  {name}: failed to start tunnel")
-
-    if not connected:
-        return
+            pid = _start_tunnel(app_url, port, name)
+            if pid:
+                _log(f"  {name} → 127.0.0.1:{port}  (pid {pid})")
+                connected.append((name, port))
+            else:
+                _log(f"  {name}: failed to start tunnel")
 
     _write_bashrc(apps, port_map)
 

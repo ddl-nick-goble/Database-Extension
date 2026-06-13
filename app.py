@@ -63,6 +63,11 @@ def serve_favicon():
     return send_from_directory(Path(app.static_folder) / "img", "favicon.ico")
 
 
+@app.route("/architecture.html")
+def serve_architecture():
+    return send_from_directory(app.static_folder, "architecture.html")
+
+
 
 @app.route("/img/<path:filename>")
 def serve_img(filename):

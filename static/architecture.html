@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Domino Databases — Architecture</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  background: #0d1117;
+  color: #e6edf3;
+  min-height: 100vh;
+  overflow-x: auto;
+}
+.page { padding: 32px 40px; min-width: 1560px; }
+h1.title {
+  text-align: center;
+  font-size: 26px;
+  font-weight: 700;
+  color: #f0f6fc;
+  letter-spacing: -0.01em;
+}
+.subtitle {
+  text-align: center;
+  color: #7d8590;
+  font-size: 13px;
+  margin-top: 6px;
+  margin-bottom: 40px;
+}
+.diagram {
+  position: relative;
+  width: 1480px;
+  height: 920px;
+  margin: 0 auto;
+}
+.svg-layer {
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+.layer-label {
+  position: absolute;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: #484f58;
+}
+.node {
+  position: absolute;
+  border-radius: 10px;
+  padding: 13px 15px 11px;
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+  border: 1.5px solid transparent;
+  user-select: none;
+}
+.node:hover { transform: translateY(-2px); z-index: 20; }
+.node-icon { font-size: 18px; margin-bottom: 4px; display: block; }
+.node-title { font-size: 12.5px; font-weight: 700; line-height: 1.3; }
+.node-sub { font-size: 10.5px; margin-top: 5px; line-height: 1.55; opacity: 0.75; }
+.tag {
+  display: inline-block;
+  font-size: 9px;
+  padding: 1px 7px;
+  border-radius: 99px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  margin-top: 6px;
+}
+
+/* Color themes */
+.n-blue  { background: rgba(59,130,246,.13); border-color: rgba(59,130,246,.4); color: #bfdbfe; }
+.n-blue:hover  { background: rgba(59,130,246,.22); box-shadow: 0 0 22px rgba(59,130,246,.25); border-color: rgba(59,130,246,.7); }
+.n-purple { background: rgba(139,92,246,.13); border-color: rgba(139,92,246,.4); color: #ddd6fe; }
+.n-purple:hover { background: rgba(139,92,246,.22); box-shadow: 0 0 22px rgba(139,92,246,.25); border-color: rgba(139,92,246,.7); }
+.n-indigo { background: rgba(99,102,241,.16); border-color: rgba(99,102,241,.5); color: #c7d2fe; }
+.n-indigo:hover { background: rgba(99,102,241,.26); box-shadow: 0 0 22px rgba(99,102,241,.3); border-color: rgba(99,102,241,.8); }
+.n-amber { background: rgba(245,158,11,.12); border-color: rgba(245,158,11,.4); color: #fde68a; }
+.n-amber:hover { background: rgba(245,158,11,.22); box-shadow: 0 0 22px rgba(245,158,11,.25); border-color: rgba(245,158,11,.7); }
+.n-amber-dash { background: rgba(245,158,11,.05); border: 1.5px dashed rgba(245,158,11,.3); color: #fde68a; }
+.n-teal { background: rgba(20,184,166,.12); border-color: rgba(20,184,166,.4); color: #99f6e4; }
+.n-teal:hover { background: rgba(20,184,166,.22); box-shadow: 0 0 22px rgba(20,184,166,.25); border-color: rgba(20,184,166,.7); }
+.n-green { background: rgba(34,197,94,.12); border-color: rgba(34,197,94,.4); color: #bbf7d0; }
+.n-green:hover { background: rgba(34,197,94,.22); box-shadow: 0 0 22px rgba(34,197,94,.25); border-color: rgba(34,197,94,.7); }
+.n-slate { background: rgba(100,116,139,.12); border-color: rgba(100,116,139,.4); color: #cbd5e1; }
+.n-slate:hover { background: rgba(100,116,139,.22); box-shadow: 0 0 22px rgba(100,116,139,.2); }
+
+.t-blue { background: rgba(59,130,246,.25); color: #93c5fd; }
+.t-purple { background: rgba(139,92,246,.25); color: #c4b5fd; }
+.t-indigo { background: rgba(99,102,241,.25); color: #a5b4fc; }
+.t-amber { background: rgba(245,158,11,.25); color: #fcd34d; }
+.t-teal { background: rgba(20,184,166,.25); color: #5eead4; }
+.t-green { background: rgba(34,197,94,.25); color: #86efac; }
+.t-slate { background: rgba(100,116,139,.25); color: #94a3b8; }
+
+/* DB Apps grouping box */
+.dbapps-group {
+  position: absolute;
+  border: 1.5px dashed rgba(245,158,11,.2);
+  border-radius: 12px;
+  background: rgba(245,158,11,.02);
+}
+.dbapps-group-label {
+  position: absolute;
+  top: -9px; left: 14px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(245,158,11,.5);
+  background: #0d1117;
+  padding: 0 6px;
+}
+
+/* Detail panel */
+#panel {
+  position: fixed;
+  right: 24px; top: 24px;
+  width: 340px;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 12px;
+  padding: 20px 22px;
+  display: none;
+  z-index: 200;
+  box-shadow: 0 12px 40px rgba(0,0,0,.6);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+#panel.open { display: block; }
+#panel-title { font-size: 15px; font-weight: 700; color: #f0f6fc; margin-bottom: 14px; padding-right: 24px; }
+#panel-close {
+  position: absolute; top: 14px; right: 16px;
+  width: 24px; height: 24px; border-radius: 50%;
+  background: rgba(255,255,255,.07); color: #7d8590;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 14px; transition: background .1s;
+}
+#panel-close:hover { background: rgba(255,255,255,.14); color: #e6edf3; }
+.ps-head {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+  color: #484f58; margin-bottom: 6px; margin-top: 14px;
+}
+.ps-head:first-child { margin-top: 0; }
+.ps-item {
+  font-size: 11.5px; color: #8b949e; padding: 4px 8px;
+  background: #1c2128; border-radius: 5px; margin-bottom: 3px;
+  font-family: ui-monospace, 'Cascadia Code', monospace;
+  line-height: 1.4;
+}
+
+/* Legend */
+.legend {
+  position: absolute; bottom: 10px; left: 0;
+  display: flex; gap: 18px; flex-wrap: wrap;
+}
+.li { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: #484f58; }
+.ld { width: 10px; height: 10px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="page">
+  <h1 class="title">Domino Databases — Architecture</h1>
+  <p class="subtitle">How the Extension, DB Apps, Environments, and TCP Tunnel fit together &nbsp;·&nbsp; Click any node for details</p>
+
+  <div class="diagram" id="diagram">
+
+    <!-- SVG connection layer (underneath nodes) -->
+    <svg class="svg-layer" id="svgl">
+      <defs>
+        <marker id="ah-blue"   markerWidth="7" markerHeight="7" refX="5.5" refY="2.5" orient="auto"><path d="M0,0 L0,5 L7,2.5z" fill="rgba(59,130,246,.65)"/></marker>
+        <marker id="ah-purple" markerWidth="7" markerHeight="7" refX="5.5" refY="2.5" orient="auto"><path d="M0,0 L0,5 L7,2.5z" fill="rgba(139,92,246,.65)"/></marker>
+        <marker id="ah-indigo" markerWidth="7" markerHeight="7" refX="5.5" refY="2.5" orient="auto"><path d="M0,0 L0,5 L7,2.5z" fill="rgba(99,102,241,.65)"/></marker>
+        <marker id="ah-amber"  markerWidth="7" markerHeight="7" refX="5.5" refY="2.5" orient="auto"><path d="M0,0 L0,5 L7,2.5z" fill="rgba(245,158,11,.65)"/></marker>
+        <marker id="ah-teal"   markerWidth="7" markerHeight="7" refX="5.5" refY="2.5" orient="auto"><path d="M0,0 L0,5 L7,2.5z" fill="rgba(20,184,166,.65)"/></marker>
+        <marker id="ah-green"  markerWidth="7" markerHeight="7" refX="5.5" refY="2.5" orient="auto"><path d="M0,0 L0,5 L7,2.5z" fill="rgba(34,197,94,.65)"/></marker>
+        <marker id="ah-slate"  markerWidth="7" markerHeight="7" refX="5.5" refY="2.5" orient="auto"><path d="M0,0 L0,5 L7,2.5z" fill="rgba(100,116,139,.65)"/></marker>
+      </defs>
+    </svg>
+
+    <!-- ══════════════════════════════════════════════════ -->
+    <!-- LAYER 1: CONSUMERS                                 -->
+    <!-- ══════════════════════════════════════════════════ -->
+    <div class="layer-label" style="left:0;top:12px;">Consumers</div>
+
+    <div class="node n-blue" id="n-laptop" data-key="laptop" style="left:80px;top:30px;width:210px;height:118px;">
+      <span class="node-icon">💻</span>
+      <div class="node-title">Developer Laptop</div>
+      <div class="node-sub">domino-db-tunnel.py<br>API Key · localhost:5432+</div>
+      <span class="tag t-blue">TCP client</span>
+    </div>
+
+    <div class="node n-blue" id="n-workspace" data-key="workspace" style="left:530px;top:30px;width:225px;height:118px;">
+      <span class="node-icon">🖥</span>
+      <div class="node-title">Domino Workspace</div>
+      <div class="node-sub">dd-dse-db environment<br>Auto-tunnel · <code style="font-size:10px">db &lt;name&gt;</code> alias</div>
+      <span class="tag t-blue">dd-dse-db env</span>
+    </div>
+
+    <div class="node n-blue" id="n-browser" data-key="browser" style="left:1010px;top:30px;width:215px;height:118px;">
+      <span class="node-icon">🌐</span>
+      <div class="node-title">Browser / DBeaver</div>
+      <div class="node-sub">DB Admin UIs via /admin/*<br>pgweb · Mongo Express · etc.</div>
+      <span class="tag t-blue">HTTP client</span>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════ -->
+    <!-- LAYER 2: APP PROXY                                 -->
+    <!-- ══════════════════════════════════════════════════ -->
+    <div class="layer-label" style="left:0;top:178px;">Domino App Proxy</div>
+
+    <div class="node n-purple" id="n-proxy" data-key="proxy"
+         style="left:40px;top:196px;width:1400px;height:68px;display:flex;align-items:center;gap:0;padding:0 28px;">
+      <div style="flex-shrink:0;margin-right:28px;">
+        <div class="node-title" style="font-size:13.5px;">🔒 DOMINO APP PROXY</div>
+      </div>
+      <div style="display:flex;gap:28px;flex-wrap:wrap;align-items:center;">
+        <span style="font-size:11px;opacity:.8;">🔑 Authenticates all requests</span>
+        <span style="font-size:11px;opacity:.8;">🪪 Injects identity headers</span>
+        <span style="font-size:11px;opacity:.8;">🔀 Routes across data planes</span>
+        <span style="font-size:11px;opacity:.8;">📍 DOMINO_RUN_HOST_PATH prefix</span>
+        <span style="font-size:11px;opacity:.8;">🔐 WSS (TCP-over-WebSocket)</span>
+      </div>
+      <span class="tag t-purple" style="margin-left:auto;flex-shrink:0;">auth layer</span>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════ -->
+    <!-- LAYER 3: APPLICATIONS                              -->
+    <!-- ══════════════════════════════════════════════════ -->
+    <div class="layer-label" style="left:0;top:289px;">Application Layer · Domino Apps</div>
+
+    <!-- Extension / Data Central -->
+    <div class="node n-indigo" id="n-central" data-key="central"
+         style="left:40px;top:308px;width:295px;height:230px;">
+      <span class="node-icon">🗄</span>
+      <div class="node-title" style="font-size:14px;">DATA CENTRAL</div>
+      <div class="node-sub">
+        Flask backend + SPA<br>
+        <strong style="color:#a5b4fc">Extension</strong> — project-scoped<br>
+        via <code style="font-size:10px">?projectId=</code> URL param<br><br>
+        ▸ Create / list / start / stop DB Apps<br>
+        ▸ Build &amp; rebuild engine environments<br>
+        ▸ Browse Dockerfiles from this repo
+      </div>
+      <span class="tag t-indigo">extension · wizard</span>
+    </div>
+
+    <!-- DB Apps grouping box -->
+    <div class="dbapps-group" style="left:360px;top:302px;width:1080px;height:242px;">
+      <span class="dbapps-group-label">DB App Instances (many per project, scoped to ?projectId=)</span>
+    </div>
+
+    <div class="node n-amber" id="n-pg" data-key="dbapp" style="left:385px;top:320px;width:190px;height:208px;">
+      <span class="node-icon">🐘</span>
+      <div class="node-title">pg-mydb</div>
+      <div class="node-sub">
+        Engine: <b>PostgreSQL</b><br>
+        Flask :8888 → router<br>
+        /wire → WS↔TCP relay<br>
+        /admin/* → pgweb<br>
+        /healthz → health probe<br>
+        Snapshotter (scheduled)
+      </div>
+      <span class="tag t-amber">DB App</span>
+    </div>
+
+    <div class="node n-amber" id="n-mongo" data-key="dbapp" style="left:590px;top:320px;width:190px;height:208px;">
+      <span class="node-icon">🍃</span>
+      <div class="node-title">mongo-users</div>
+      <div class="node-sub">
+        Engine: <b>MongoDB</b><br>
+        Flask :8888 → router<br>
+        /wire → WS↔TCP relay<br>
+        /admin/* → Mongo Express<br>
+        /healthz → health probe<br>
+        Snapshotter (scheduled)
+      </div>
+      <span class="tag t-amber">DB App</span>
+    </div>
+
+    <div class="node n-amber" id="n-mysql" data-key="dbapp" style="left:795px;top:320px;width:190px;height:208px;">
+      <span class="node-icon">🐬</span>
+      <div class="node-title">mysql-prod</div>
+      <div class="node-sub">
+        Engine: <b>MySQL</b><br>
+        Flask :8888 → router<br>
+        /wire → WS↔TCP relay<br>
+        /admin/* → phpMyAdmin<br>
+        /healthz → health probe<br>
+        Snapshotter (scheduled)
+      </div>
+      <span class="tag t-amber">DB App</span>
+    </div>
+
+    <div class="node n-amber" id="n-redis" data-key="dbapp" style="left:1000px;top:320px;width:190px;height:208px;">
+      <span class="node-icon">⚡</span>
+      <div class="node-title">redis-cache</div>
+      <div class="node-sub">
+        Engine: <b>Redis</b><br>
+        Flask :8888 → router<br>
+        /wire → WS↔TCP relay<br>
+        /admin/* → Redis Commander<br>
+        /healthz → health probe<br>
+        Snapshotter (scheduled)
+      </div>
+      <span class="tag t-amber">DB App</span>
+    </div>
+
+    <div class="node n-amber-dash" style="left:1210px;top:320px;width:200px;height:208px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;cursor:default;">
+      <div style="font-size:30px;opacity:.4;margin-bottom:8px;">+N</div>
+      <div style="font-size:11px;opacity:.5;line-height:1.6;">More DB Apps<br>any engine<br>any project</div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════ -->
+    <!-- LAYER 4: DOMINO PLATFORM                           -->
+    <!-- ══════════════════════════════════════════════════ -->
+    <div class="layer-label" style="left:0;top:573px;">Domino Platform Services</div>
+
+    <div class="node n-teal" id="n-apiproxy" data-key="apiproxy" style="left:40px;top:592px;width:215px;height:112px;">
+      <span class="node-icon">🔌</span>
+      <div class="node-title">Auth Proxy :8899</div>
+      <div class="node-sub">localhost:8899 (in-pod)<br>Auto-injects user identity<br>All API calls route through it</div>
+    </div>
+
+    <div class="node n-teal" id="n-appsapi" data-key="appsapi" style="left:275px;top:592px;width:205px;height:112px;">
+      <span class="node-icon">⚙️</span>
+      <div class="node-title">Apps API</div>
+      <div class="node-sub">create / start / stop_app<br>list_apps / get_app<br>delete_app</div>
+    </div>
+
+    <div class="node n-teal" id="n-envsapi" data-key="envsapi" style="left:500px;top:592px;width:215px;height:112px;">
+      <span class="node-icon">🏗</span>
+      <div class="node-title">Environments API</div>
+      <div class="node-sub">list / create / find envs<br>add_revision (Dockerfile)<br>Stream Docker build logs</div>
+    </div>
+
+    <div class="node n-teal" id="n-datasets" data-key="datasets" style="left:735px;top:592px;width:210px;height:112px;">
+      <span class="node-icon">💾</span>
+      <div class="node-title">Datasets</div>
+      <div class="node-sub">/mnt/data/&lt;project&gt;/<br>_dd_configs/ (fallback cfg)<br>DB snapshot / backup storage</div>
+    </div>
+
+    <div class="node n-teal" id="n-hwtiers" data-key="hwtiers" style="left:965px;top:592px;width:210px;height:112px;">
+      <span class="node-icon">🖥</span>
+      <div class="node-title">Hardware Tiers</div>
+      <div class="node-sub">CPU / RAM / GPU configs<br>Selected at DB App creation<br>Passed as hardwareTierId</div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════ -->
+    <!-- LAYER 5: ENVIRONMENTS / REPO                       -->
+    <!-- ══════════════════════════════════════════════════ -->
+    <div class="layer-label" style="left:0;top:737px;">Compute Environments (Docker Images) — Dockerfiles live in /envs/ of this repo</div>
+
+    <div class="node n-green" id="n-env-pg" data-key="env-pg" style="left:40px;top:756px;width:220px;height:110px;">
+      <span class="node-icon">🐘</span>
+      <div class="node-title">dd-postgres-app</div>
+      <div class="node-sub">DD_ROLE=postgres<br>PostgreSQL + Flask router + pgweb</div>
+      <span class="tag t-green">env image</span>
+    </div>
+
+    <div class="node n-green" id="n-env-mongo" data-key="env-mongo" style="left:280px;top:756px;width:220px;height:110px;">
+      <span class="node-icon">🍃</span>
+      <div class="node-title">dd-mongo-app</div>
+      <div class="node-sub">DD_ROLE=mongo<br>MongoDB + Flask router + Mongo Express</div>
+      <span class="tag t-green">env image</span>
+    </div>
+
+    <div class="node n-green" id="n-env-mysql" data-key="env-mysql" style="left:520px;top:756px;width:220px;height:110px;">
+      <span class="node-icon">🐬</span>
+      <div class="node-title">dd-mysql-app</div>
+      <div class="node-sub">DD_ROLE=mysql<br>MySQL + Flask router + phpMyAdmin</div>
+      <span class="tag t-green">env image</span>
+    </div>
+
+    <div class="node n-green" id="n-env-redis" data-key="env-redis" style="left:760px;top:756px;width:220px;height:110px;">
+      <span class="node-icon">⚡</span>
+      <div class="node-title">dd-redis-app</div>
+      <div class="node-sub">DD_ROLE=redis<br>Redis + Flask router + Redis Commander</div>
+      <span class="tag t-green">env image</span>
+    </div>
+
+    <div class="node n-green" id="n-env-dse" data-key="env-dse" style="left:1000px;top:756px;width:220px;height:110px;">
+      <span class="node-icon">🔧</span>
+      <div class="node-title">dd-dse-db</div>
+      <div class="node-sub">Workspace env for users<br>Client tooling + auto-tunnels</div>
+      <span class="tag t-green">workspace env</span>
+    </div>
+
+    <div class="node n-slate" id="n-repo" data-key="repo" style="left:1240px;top:756px;width:200px;height:110px;">
+      <span class="node-icon">📁</span>
+      <div class="node-title">This Repo /envs/</div>
+      <div class="node-sub">Dockerfiles for all envs<br>Wizard builds via Envs API</div>
+      <span class="tag t-slate">source of truth</span>
+    </div>
+
+    <!-- Legend -->
+    <div class="legend">
+      <div class="li"><div class="ld" style="background:#3b82f6"></div>Consumers</div>
+      <div class="li"><div class="ld" style="background:#8b5cf6"></div>App Proxy</div>
+      <div class="li"><div class="ld" style="background:#6366f1"></div>Extension</div>
+      <div class="li"><div class="ld" style="background:#f59e0b"></div>DB Apps</div>
+      <div class="li"><div class="ld" style="background:#14b8a6"></div>Platform</div>
+      <div class="li"><div class="ld" style="background:#22c55e"></div>Environments</div>
+    </div>
+
+  </div><!-- /diagram -->
+</div><!-- /page -->
+
+<!-- Detail Panel -->
+<div id="panel">
+  <div id="panel-close" onclick="closePanel()">✕</div>
+  <div id="panel-title"></div>
+  <div id="panel-body"></div>
+</div>
+
+<script>
+const DATA = {
+  laptop: {
+    title: "💻 Developer Laptop",
+    sections: [
+      { h: "How to connect", items: [
+        "python3 client/domino-db-tunnel.py \\",
+        "  --url https://apps.host/apps-internal/<appId>/ \\",
+        "  --api-key $DOMINO_API_KEY --port 5432",
+        "→ psql / DBeaver connects to localhost:5432"
+      ]},
+      { h: "Authentication", items: [
+        "DOMINO_USER_API_KEY (Account Settings → API Keys)",
+        "Bearer token in WebSocket Upgrade header",
+        "Validated by Domino App Proxy before relay opens"
+      ]},
+      { h: "Script", items: ["client/domino-db-tunnel.py"] }
+    ]
+  },
+  workspace: {
+    title: "🖥 Domino Workspace",
+    sections: [
+      { h: "dd-dse-db environment", items: [
+        "Pre-run script auto-configures tunnels for all DB Apps",
+        "`db <name>` alias — opens tunnel for any DB in project",
+        "DOMINO_API_KEY already in workspace env — no config needed"
+      ]},
+      { h: "Setup script", items: [
+        "client/dd-workspace-setup.py",
+        "envs/dd-dse-db/Dockerfile"
+      ]},
+      { h: "Why recommended", items: [
+        "Zero setup: start workspace → `db my-pg` → done",
+        "Auto-reconnects on tunnel drop",
+        "Lists all authorized DBs via `db` with no args"
+      ]}
+    ]
+  },
+  browser: {
+    title: "🌐 Browser / DBeaver",
+    sections: [
+      { h: "Admin UI access", items: [
+        "Click 'Open DB Admin ↗' on DB App status page",
+        "/admin/* reverse-proxies to engine's admin tool",
+        "Pre-authenticated — no separate DB login needed"
+      ]},
+      { h: "Admin UI by engine", items: [
+        "PostgreSQL  →  pgweb",
+        "MongoDB     →  Mongo Express",
+        "MySQL       →  phpMyAdmin",
+        "Redis       →  Redis Commander"
+      ]}
+    ]
+  },
+  proxy: {
+    title: "🔒 Domino App Proxy",
+    sections: [
+      { h: "What it does", items: [
+        "Single authenticated entry point for ALL app traffic",
+        "Enforces who can reach which app (RBAC via app sharing)",
+        "Routes requests to correct container across data planes",
+        "Injects DOMINO_RUN_HOST_PATH prefix into the container",
+        "Passes WebSocket upgrades → enables TCP-over-WS tunnel"
+      ]},
+      { h: "Key env vars injected", items: [
+        "DOMINO_RUN_HOST_PATH  — app's URL prefix",
+        "DOMINO_PROJECT_ID / OWNER / NAME",
+        "DOMINO_USER_API_KEY",
+        "DOMINO_API_PROXY=http://localhost:8899"
+      ]},
+      { h: "Security model", items: [
+        "Zero new ingress — no raw TCP ports opened",
+        "DB engine binds loopback only; only path in is WSS tunnel",
+        "All transport: HTTPS consumer→proxy, Istio mesh proxy→pod"
+      ]}
+    ]
+  },
+  central: {
+    title: "🗄 Data Central (Extension / Wizard)",
+    sections: [
+      { h: "Project scoping", items: [
+        "?projectId=<id> URL param scopes all operations",
+        "Falls back to wizard's own DOMINO_PROJECT_ID",
+        "Works as an extension for ANY Domino project you have access to"
+      ]},
+      { h: "Flask API routes", items: [
+        "GET  /api/config             — engine catalog + env IDs",
+        "GET  /api/databases          — list DB Apps in project",
+        "POST /api/databases          — create + start (SSE stream)",
+        "DELETE /api/databases/:id   — stop or delete",
+        "POST /api/databases/:id/start — resume stopped DB",
+        "GET  /api/environments/status — per-engine env status",
+        "POST /api/environments/:engine/build — build env (SSE)"
+      ]},
+      { h: "Environment management", items: [
+        "Reads Dockerfiles from /envs/<canonical-name>/ in this repo",
+        "Resolves envs: $DD_<ENGINE>_ENV_ID → canonical name match",
+        "Submits to Environments API + streams Docker build logs to UI"
+      ]},
+      { h: "Config delivery to DB Apps", items: [
+        "Wizard writes _dd_configs/<name>.json to project dataset",
+        "Primary: DD_CONFIG_JSON passed as env var at start_app call",
+        "DB Apps are fully self-contained — no project files needed"
+      ]}
+    ]
+  },
+  dbapp: {
+    title: "🟠 DB App Instance",
+    sections: [
+      { h: "Boot sequence (dbapp/lifecycle.py)", items: [
+        "1. Load config: DD_CONFIG_JSON env var (primary)",
+        "2. Fallback: _dd_configs/<name>.json in dataset",
+        "3. Restore DB from snapshot if one exists",
+        "4. Start engine bound to localhost:<port>",
+        "5. Launch admin UI on port 8978",
+        "6. Start Flask router on port 8888"
+      ]},
+      { h: "Flask router endpoints (dbapp/router.py)", items: [
+        "GET  /          — status page + connection snippets",
+        "WS   /wire      — byte-transparent TCP↔WebSocket relay",
+        "*    /admin/*   — reverse-proxy to engine admin UI",
+        "GET  /healthz   — engine health check (→ 503 if sick)",
+        "GET  /api/status — JSON status",
+        "POST /api/backup/configure — set backup location",
+        "POST /api/backup/snapshot  — trigger immediate snapshot"
+      ]},
+      { h: "TCP tunnel (/wire)", items: [
+        "flask-sock WebSocket endpoint",
+        "Byte-transparent — no protocol parsing",
+        "TCP_NODELAY + SO_KEEPALIVE on the engine socket",
+        "Two-goroutine relay: tcp→ws and ws→tcp"
+      ]},
+      { h: "Engines", items: [
+        "dbapp/engines/postgres.py — PostgreSQL adapter",
+        "dbapp/engines/mongo.py   — MongoDB adapter",
+        "dbapp/engines/mysql.py   — MySQL adapter",
+        "dbapp/engines/redis.py   — Redis adapter"
+      ]}
+    ]
+  },
+  apiproxy: {
+    title: "🔌 Auth Proxy :8899",
+    sections: [
+      { h: "What it is", items: [
+        "Domino-injected sidecar inside every execution pod",
+        "All API calls in domino_api.py route through it",
+        "Auto-injects calling user's identity — no extra auth config"
+      ]},
+      { h: "Used by wizard + DB apps for", items: [
+        "All Domino API calls (Apps, Environments, Datasets, etc.)",
+        "cliSiteConfig lookup → resolves DOMINO_PUBLIC_HOST",
+        "Token validation for WS tunnel auth (ws2tcp server)"
+      ]}
+    ]
+  },
+  appsapi: {
+    title: "⚙️ Domino Apps API",
+    sections: [
+      { h: "Called by wizard to manage DB Apps", items: [
+        "create_app(name, env_id, hw_id, project_id)",
+        "start_app(id, env_id, hw_id, environmentVariables)",
+        "  → passes DD_CONFIG_JSON as env var",
+        "stop_app(id) — stops container, preserves data",
+        "delete_app(id) — permanent removal",
+        "list_apps(project_id) — enumerate all apps",
+        "get_app(id) — status + currentVersion details"
+      ]},
+      { h: "Quirks handled", items: [
+        "start_app is racy — wizard retries up to 3×",
+        "environmentId must be re-passed on every start call",
+        "App name prefix identifies engine (pg- / mongo- / etc.)"
+      ]}
+    ]
+  },
+  envsapi: {
+    title: "🏗 Environments API",
+    sections: [
+      { h: "Called by wizard", items: [
+        "list_environments() — find all envs",
+        "find_environment_by_name(canonical_name)",
+        "create_environment(name, base_image, visibility)",
+        "add_environment_revision(env_id, dockerfile, base_image)",
+        "fetch_build_logs(env_id, rev_id, build_id, since_nano)"
+      ]},
+      { h: "Env resolution for DB Apps", items: [
+        "1. Explicit $DD_<ENGINE>_ENV_ID env var (admin override)",
+        "2. Env named 'dd-<engine>-app' (canonical name match)"
+      ]},
+      { h: "Build flow", items: [
+        "Dockerfile read from /envs/<canonical-name>/ in this repo",
+        "preRunScript bakes in /mnt/code/app.sh shim",
+        "Build logs streamed to wizard UI via SSE",
+        "~3–5 min typical build time"
+      ]}
+    ]
+  },
+  datasets: {
+    title: "💾 Domino Datasets",
+    sections: [
+      { h: "Used for", items: [
+        "Config fallback: _dd_configs/<app-name>.json",
+        "Primary config is DD_CONFIG_JSON (no dataset needed)",
+        "DB snapshot + backup storage (user-configured)",
+        "Snapshotter writes to /mnt/data/<project>/db-<id>/"
+      ]},
+      { h: "Mount paths", items: [
+        "DOMINO_DATASETS_DIR = /mnt/data",
+        "Per-project: /mnt/data/<project>/",
+        "DB Apps can create datasets via API if none exists"
+      ]}
+    ]
+  },
+  hwtiers: {
+    title: "🖥 Hardware Tiers",
+    sections: [
+      { h: "How used", items: [
+        "User selects tier in wizard when creating a DB App",
+        "Determines CPU / RAM available to the database engine",
+        "Passed as hardwareTierId at start_app call",
+        "Re-passed on every resume/restart (Domino requirement)"
+      ]}
+    ]
+  },
+  "env-pg": {
+    title: "🐘 dd-postgres-app",
+    sections: [
+      { h: "Dockerfile", items: ["envs/dd-postgres-app/Dockerfile"] },
+      { h: "Contains", items: [
+        "PostgreSQL database engine",
+        "Python + Flask + flask-sock + dependencies",
+        "dbapp/ router + lifecycle + snapshotter (in /opt/dd/)",
+        "pgweb admin UI binary",
+        "ENV DD_ROLE=postgres (baked into image)"
+      ]},
+      { h: "Pre-run script (injected at env build)", items: [
+        "Creates /mnt/code/app.sh shim if missing",
+        "Allows DB Apps to launch in ANY project repo"
+      ]}
+    ]
+  },
+  "env-mongo": {
+    title: "🍃 dd-mongo-app",
+    sections: [
+      { h: "Dockerfile", items: ["envs/dd-mongo-app/Dockerfile"] },
+      { h: "Contains", items: [
+        "MongoDB engine", "Flask + flask-sock",
+        "Mongo Express admin UI", "ENV DD_ROLE=mongo"
+      ]}
+    ]
+  },
+  "env-mysql": {
+    title: "🐬 dd-mysql-app",
+    sections: [
+      { h: "Dockerfile", items: ["envs/dd-mysql-app/Dockerfile"] },
+      { h: "Contains", items: [
+        "MySQL engine", "Flask + flask-sock",
+        "phpMyAdmin", "ENV DD_ROLE=mysql"
+      ]}
+    ]
+  },
+  "env-redis": {
+    title: "⚡ dd-redis-app",
+    sections: [
+      { h: "Dockerfile", items: ["envs/dd-redis-app/Dockerfile"] },
+      { h: "Contains", items: [
+        "Redis engine", "Flask + flask-sock",
+        "Redis Commander", "ENV DD_ROLE=redis"
+      ]}
+    ]
+  },
+  "env-dse": {
+    title: "🔧 dd-dse-db (Workspace Env)",
+    sections: [
+      { h: "Purpose", items: [
+        "Workspace environment for users connecting to DB Apps",
+        "Pre-run script auto-tunnels all DB Apps in the project",
+        "db <name> command connects to any authorized database"
+      ]},
+      { h: "Files", items: [
+        "envs/dd-dse-db/Dockerfile",
+        "client/dd-workspace-setup.py (pre-run script)"
+      ]},
+      { h: "Pre-run fetches from GitHub", items: [
+        "curl -fsSL .../client/dd-workspace-setup.py | python3 -"
+      ]}
+    ]
+  },
+  repo: {
+    title: "📁 This Repo (/envs/)",
+    sections: [
+      { h: "Directory structure", items: [
+        "app.py             — Wizard Flask backend",
+        "static/            — SPA (HTML/JS/CSS)",
+        "dbapp/             — DB App router + lifecycle + engines",
+        "envs/dd-*/         — Dockerfiles for all environments",
+        "client/            — Tunnel CLI + workspace setup",
+        "snapshotter/       — Per-engine backup scripts",
+        "ws2tcp/            — WebSocket↔TCP relay (legacy)"
+      ]},
+      { h: "Environment build flow", items: [
+        "Wizard reads Dockerfile from /envs/<canonical-name>/",
+        "Submits to Domino Environments API",
+        "Streams Docker build logs back to wizard UI via SSE"
+      ]}
+    ]
+  }
+};
+
+// Detail panel
+function openPanel(key) {
+  const d = DATA[key]; if (!d) return;
+  document.getElementById('panel-title').textContent = d.title;
+  const body = document.getElementById('panel-body');
+  body.innerHTML = d.sections.map(s =>
+    `<div class="ps-head">${s.h}</div>` +
+    s.items.map(i => `<div class="ps-item">${i}</div>`).join('')
+  ).join('');
+  document.getElementById('panel').classList.add('open');
+}
+function closePanel() { document.getElementById('panel').classList.remove('open'); }
+
+document.querySelectorAll('.node[data-key]').forEach(n =>
+  n.addEventListener('click', e => { openPanel(n.dataset.key); e.stopPropagation(); })
+);
+document.addEventListener('click', () => closePanel());
+
+// ─── SVG connections ──────────────────────────────────────────────────────────
+function rect(id) {
+  const el = document.getElementById(id);
+  const dg = document.getElementById('diagram');
+  if (!el) return null;
+  const er = el.getBoundingClientRect(), dr = dg.getBoundingClientRect();
+  return {
+    l: er.left - dr.left, r: er.right - dr.left,
+    t: er.top - dr.top,   b: er.bottom - dr.top,
+    cx: er.left - dr.left + er.width / 2,
+    cy: er.top - dr.top + er.height / 2,
+  };
+}
+function pt(id, edge) {
+  const r = rect(id); if (!r) return null;
+  if (edge === 'top')    return [r.cx, r.t];
+  if (edge === 'bottom') return [r.cx, r.b];
+  if (edge === 'left')   return [r.l, r.cy];
+  if (edge === 'right')  return [r.r, r.cy];
+  return [r.cx, r.cy];
+}
+
+function drawSVG() {
+  const svg = document.getElementById('svgl');
+  // Keep defs
+  const defs = svg.querySelector('defs');
+  while (svg.lastChild !== defs) svg.removeChild(svg.lastChild);
+
+  function addPath(x1, y1, x2, y2, color, marker, dash, label) {
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const my = (y1 + y2) / 2;
+    const mx = (x1 + x2) / 2;
+    const isH = Math.abs(y2 - y1) < 20; // horizontal
+    const d = isH
+      ? `M${x1},${y1} L${x2},${y2}`
+      : `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`;
+    path.setAttribute('d', d);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', color);
+    path.setAttribute('stroke-width', '1.5');
+    path.setAttribute('marker-end', `url(#${marker})`);
+    path.setAttribute('opacity', '0.55');
+    if (dash) path.setAttribute('stroke-dasharray', '5,4');
+    g.appendChild(path);
+    if (label) {
+      const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      t.setAttribute('x', mx); t.setAttribute('y', my - 5);
+      t.setAttribute('text-anchor', 'middle'); t.setAttribute('font-size', '9');
+      t.setAttribute('fill', color); t.setAttribute('opacity', '0.9');
+      t.setAttribute('font-family', 'system-ui'); t.setAttribute('font-weight', '700');
+      t.textContent = label;
+      g.appendChild(t);
+    }
+    svg.appendChild(g);
+  }
+
+  // Consumers → Proxy
+  for (const id of ['n-laptop','n-workspace','n-browser']) {
+    const a = pt(id, 'bottom'), b = pt('n-proxy', 'top');
+    if (a && b) addPath(a[0],a[1], b[0],b[1], 'rgba(59,130,246,.6)', 'ah-blue', false, null);
+  }
+
+  // Proxy → Extension
+  const pa = pt('n-proxy','bottom'), ca = pt('n-central','top');
+  if (pa && ca) addPath(pa[0],pa[1], ca[0],ca[1], 'rgba(139,92,246,.6)', 'ah-purple', false, null);
+
+  // Proxy → DB Apps
+  for (const id of ['n-pg','n-mongo','n-mysql','n-redis']) {
+    const a = pt('n-proxy','bottom'), b = pt(id,'top');
+    if (a && b) addPath(a[0],a[1], b[0],b[1], 'rgba(139,92,246,.5)', 'ah-purple', false, null);
+  }
+
+  // Extension → DB Apps group (horizontal "creates & manages" arrow)
+  const cr = pt('n-central','right');
+  const pgl = pt('n-pg','left');
+  if (cr && pgl) addPath(cr[0],cr[1], pgl[0],pgl[1], 'rgba(99,102,241,.8)', 'ah-indigo', false, 'creates & manages →');
+
+  // Extension → Platform
+  const cb = pt('n-central','bottom');
+  for (const id of ['n-apiproxy','n-appsapi','n-envsapi']) {
+    const b = pt(id,'top');
+    if (cb && b) addPath(cb[0],cb[1], b[0],b[1], 'rgba(99,102,241,.45)', 'ah-indigo', true, null);
+  }
+
+  // DB Apps → Datasets (config + backup)
+  for (const id of ['n-pg','n-mongo','n-mysql','n-redis']) {
+    const a = pt(id,'bottom'), b = pt('n-datasets','top');
+    if (a && b) addPath(a[0],a[1], b[0],b[1], 'rgba(245,158,11,.3)', 'ah-amber', true, null);
+  }
+
+  // Environments API → Environment images (builds)
+  for (const [eid, envid] of [['n-envsapi','n-env-pg'],['n-envsapi','n-env-mongo'],['n-envsapi','n-env-mysql'],['n-envsapi','n-env-redis'],['n-envsapi','n-env-dse']]) {
+    const a = pt(eid,'bottom'), b = pt(envid,'top');
+    if (a && b) addPath(a[0],a[1], b[0],b[1], 'rgba(20,184,166,.45)', 'ah-teal', true, null);
+  }
+
+  // Env images → DB Apps (powers / runtime image)
+  const pairs = [['n-env-pg','n-pg'],['n-env-mongo','n-mongo'],['n-env-mysql','n-mysql'],['n-env-redis','n-redis']];
+  for (const [envid, appid] of pairs) {
+    const a = pt(envid,'top'), b = pt(appid,'bottom');
+    if (a && b) addPath(a[0],a[1], b[0],b[1], 'rgba(34,197,94,.4)', 'ah-green', false, null);
+  }
+
+  // Repo → Environments API (Dockerfiles)
+  const ra = pt('n-repo','top'), ea = pt('n-envsapi','bottom');
+  if (ra && ea) addPath(ra[0],ra[1], ea[0],ea[1], 'rgba(100,116,139,.5)', 'ah-slate', true, 'Dockerfiles');
+}
+
+window.addEventListener('load', () => setTimeout(drawSVG, 80));
+window.addEventListener('resize', drawSVG);
+</script>
+</body>
+</html>

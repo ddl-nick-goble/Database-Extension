@@ -208,7 +208,7 @@ def _write_bashrc(apps: list[dict], port_map: dict[str, int]) -> None:
         name = app["name"]
         port = port_map[name]
         cmd  = app["_tpl"].format(port=port)
-        lines.append(f'    "{name}") {cmd} ;;')
+        lines.append(f'    "{name}") shift; {cmd} "$@" ;;')
     lines += [
         "    *)",
     ]

@@ -37,9 +37,24 @@ _API_KEY    = os.environ.get("DOMINO_USER_API_KEY", "")
 _PROJECT_ID = os.environ.get("DOMINO_PROJECT_ID", "")
 _PUBLIC_HOST = os.environ.get("DOMINO_PUBLIC_HOST", "")
 
-# Baked into dd-workspace-tools image at build time.
-_TUNNEL_SCRIPT = Path("/opt/dd/domino-db-tunnel.py")
-_LOG_DIR       = Path("/var/log/dd")
+# If DOMINO_PUBLIC_HOST isn't set, resolve it from the auth proxy's
+# cliSiteConfig endpoint (same method used by app.sh).
+if not _PUBLIC_HOST:
+    try:
+        _cfg_req = Request(f"{_API_PROXY}/cliSiteConfig",
+                           headers={"Accept": "application/json"})
+        with urlopen(_cfg_req, timeout=5) as _r:
+            _PUBLIC_HOST = json.loads(_r.read()).get("host", "").rstrip("/")
+    except Exception:
+        pass
+
+# Prefer the baked-in copy; fall back to alongside this script (dev workspace).
+_TUNNEL_SCRIPT = (
+    Path("/opt/dd/domino-db-tunnel.py")
+    if Path("/opt/dd/domino-db-tunnel.py").exists()
+    else Path(__file__).parent / "domino-db-tunnel.py"
+)
+_LOG_DIR = Path("/var/log/dd") if Path("/var/log/dd").exists() else Path.home() / ".dd" / "logs"
 
 # engine-name-prefix → (engine_label, base_local_port, connect_template)
 _ENGINE_MAP: dict[str, tuple[str, int, str]] = {

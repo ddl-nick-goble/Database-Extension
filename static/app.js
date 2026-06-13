@@ -177,7 +177,7 @@ function renderTable() {
             sLower === "never started"                          ? "badge-pending" :
                                                                   "badge-stopped";
         const conn = db.url
-            ? `<a href="${escapeHtml(db.url)}" target="_blank" rel="noopener">Open DB ↗</a>`
+            ? `<a href="${escapeHtml(db.browserUrl || db.url)}" target="_blank" rel="noopener">Open DB ↗</a>`
             : `<span class="muted">—</span>`;
         const configLink = db.configUrl
             ? `<a href="${escapeHtml(db.configUrl)}" target="_blank" rel="noopener">Open Setup ↗</a>`

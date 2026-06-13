@@ -65,10 +65,20 @@ code {
 .topbar-inner {
     max-width: 1320px;
     margin: 0 auto;
-    padding: 20px 32px;
+    padding: 16px 32px;
     display: flex;
     align-items: center;
     justify-content: space-between;
+}
+.topbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.topbar-logo {
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
 }
 .title {
     margin: 0;

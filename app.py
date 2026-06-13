@@ -544,36 +544,30 @@ def api_environments_status():
         for e in all_envs if isinstance(e, dict)
     }
     img_root = Path(app.static_folder) / "img"
-    result = []
-    for a in engines.all_engines():
-        canonical_name = f"dd-{a.name}-app"
-        res = _resolve_engine_env(
-            a,
-            {k: v.get("id", "") for k, v in envs_by_name.items()},
-        )
+    def _env_row(name: str, label: str, canonical_name: str,
+                 icon: str = "", icon_png: str = "", env_id_var: str = "") -> dict:
+        """Build one row for /api/environments/status."""
+        id_map = {k: v.get("id", "") for k, v in envs_by_name.items()}
+        env_id = os.environ.get(env_id_var, "").strip() if env_id_var else ""
+        source = "envvar" if env_id else ""
+        if not env_id:
+            env_id = id_map.get(canonical_name, "")
+            source = "byname" if env_id else "missing"
 
-        # Pull rich details from the v4 endpoint when we have an env id.
         env_v4: dict = {}
-        if res["envId"]:
+        if env_id:
             try:
-                env_v4 = dapi.get_environment(res["envId"]) or {}
+                env_v4 = dapi.get_environment(env_id) or {}
             except Exception as e:
-                log.warning("get_environment(%s) failed: %s", res["envId"], e)
+                log.warning("get_environment(%s) failed: %s", env_id, e)
 
         latest_rev = env_v4.get("latestRevision") or {}
         rev_details = env_v4.get("latestRevisionDetails") or {}
-
-        # Base Docker image — strip the registry prefix, keep repo:tag.
         docker_image = rev_details.get("dockerImage", "")
-        # e.g. "339712...ecr.../domino/domino-standard-environment:develop.d4421902"
-        # → show "domino-standard-environment:develop.d4421902"
         image_display = docker_image.split("/")[-1] if "/" in docker_image else docker_image
-
-        # Compressed image size in human-readable form.
         size_obj = rev_details.get("compressedImageSize") or {}
         size_bytes = size_obj.get("value")
         image_size = _fmt_bytes(int(size_bytes)) if size_bytes else ""
-
         owner_obj = env_v4.get("owner") or {}
 
         df_path = REPO_ROOT / "envs" / canonical_name / "Dockerfile"
@@ -585,48 +579,78 @@ def api_environments_status():
             except OSError:
                 pass
 
-        icon_path = img_root / f"{a.name}.png"
-        result.append({
-            "name": a.name,
-            "label": a.docs_label,
-            "icon": a.icon,
-            "iconUrl": f"img/{a.name}.png" if icon_path.exists() else "",
+        icon_path = img_root / icon_png if icon_png else None
+        return {
+            "name": name,
+            "label": label,
+            "icon": icon,
+            "iconUrl": icon_png if (icon_path and icon_path.exists()) else "",
             "expectedEnvName": canonical_name,
-            "envId": res["envId"],
-            "envIdVar": res["envIdVar"],
-            "envIdSource": res["envIdSource"],
-            # Latest revision
+            "envId": env_id,
+            "envIdVar": env_id_var,
+            "envIdSource": source,
             "latestRevision": latest_rev,
             "revisionNumber": latest_rev.get("number"),
             "revisionSummary": rev_details.get("summary", ""),
-            # Image info
             "dockerImage": docker_image,
             "imageDisplay": image_display,
             "imageSize": image_size,
-            # Environment metadata
             "visibility": env_v4.get("visibility", ""),
             "owner": owner_obj.get("username", ""),
             "lastUpdated": env_v4.get("lastUpdated", ""),
             "projectsCount": env_v4.get("projectsCount"),
-            "envUrl": f"{dapi.PUBLIC_HOST.rstrip('/')}/environment/{res['envId']}" if res["envId"] and dapi.PUBLIC_HOST else "",
-            # Dockerfile source
+            "envUrl": f"{dapi.PUBLIC_HOST.rstrip('/')}/environment/{env_id}" if env_id and dapi.PUBLIC_HOST else "",
             "dockerfile": dockerfile_text,
             "dockerfileExists": dockerfile_exists,
-        })
+        }
+
+    result = []
+    # DB app environments — one per engine
+    for a in engines.all_engines():
+        result.append(_env_row(
+            name=a.name,
+            label=a.docs_label,
+            canonical_name=f"dd-{a.name}-app",
+            icon=a.icon,
+            icon_png=f"{a.name}.png",
+            env_id_var=a.env_id_var,
+        ))
+    # Workspace / app / endpoint environment — DSC + DB
+    result.append(_env_row(
+        name="dsc-db",
+        label="DSC + DB",
+        canonical_name="dd-dsc-db",
+    ))
     return jsonify(result)
 
 
 @app.route("/api/environments/<engine>/build", methods=["POST"])
 def api_build_environment(engine: str):
-    """SSE stream that builds (or rebuilds) the dd-<engine>-app environment."""
+    """SSE stream that builds (or rebuilds) a dd-* environment.
+
+    Works for both engine environments (dd-<engine>-app) and the
+    DSC + DB workspace environment (engine="dsc-db" → dd-dsc-db).
+    """
     # Validate + read Dockerfile before entering the generator so we have no
     # request-context access inside the stream (same pattern as api_create_database).
-    try:
-        adapter = engines.get(engine)
-    except KeyError:
-        return jsonify({"error": f"unknown engine {engine!r}"}), 400
+    if engine == "dsc-db":
+        canonical_name = "dd-dsc-db"
+        pre_run_script = "python3 /opt/dd/workspace-setup.py"
+    else:
+        try:
+            adapter = engines.get(engine)
+        except KeyError:
+            return jsonify({"error": f"unknown engine {engine!r}"}), 400
+        canonical_name = f"dd-{adapter.name}-app"
+        # preRunScript writes /mnt/code/app.sh shim so the DB app works in any
+        # project without requiring a per-project file setup.
+        pre_run_script = (
+            "[ -f /mnt/code/app.sh ] || {"
+            " echo '#!/usr/bin/env bash' > /mnt/code/app.sh;"
+            " echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/app.sh;"
+            " chmod +x /mnt/code/app.sh; }"
+        )
 
-    canonical_name = f"dd-{adapter.name}-app"
     df_path = REPO_ROOT / "envs" / canonical_name / "Dockerfile"
     if not df_path.exists():
         return jsonify({"error": f"Dockerfile not found at {df_path}"}), 400
@@ -693,20 +717,11 @@ def api_build_environment(engine: str):
         # 3. Add the Dockerfile revision
         t3 = time.monotonic()
         yield sse("step", msg="Queuing Dockerfile revision build")
-        # preRunScript runs at app-start time (before the entryPoint check),
-        # so it can write /mnt/code/app.sh into whatever project the DB app
-        # lands in — no per-project setup required.
-        _shim_script = (
-            "[ -f /mnt/code/app.sh ] || {"
-            " echo '#!/usr/bin/env bash' > /mnt/code/app.sh;"
-            " echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/app.sh;"
-            " chmod +x /mnt/code/app.sh; }"
-        )
         try:
             rev_resp = dapi.add_environment_revision(
                 env_id, dockerfile, image,
-                summary=f"dd-{engine}-app baseline — built via Environments tab",
-                pre_run_script=_shim_script,
+                summary=f"{canonical_name} — built via Environments tab",
+                pre_run_script=pre_run_script,
             )
         except Exception as e:
             yield sse("error", msg="add_environment_revision failed", detail=str(e))

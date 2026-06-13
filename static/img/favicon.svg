@@ -1,12 +1,7 @@
-<svg width="512" height="512" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Domino Databases">
-  <!-- Domino Databases logo — Flatter Top, Deep Shade. Body #C24E1B, top #E8642A, mark white. -->
-  <!-- two-stack isometric database body (deep shade) -->
+<svg viewBox="24 27 72 72" xmlns="http://www.w3.org/2000/svg">
   <path d="M26,46 V80 a34,18 0 0 0 68,0 V46 a34,18 0 0 1 -68,0 z" fill="#C24E1B"/>
-  <!-- seam between the two stacks -->
   <path d="M26,63 a34,18 0 0 0 68,0" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
-  <!-- top face (brand orange) -->
   <ellipse cx="60" cy="46" rx="34" ry="18" fill="#E8642A"/>
-  <!-- real Domino pinwheel, flattened (scale 1 x 0.55) and tilted (-6deg) onto the top -->
   <g transform="translate(60 46) rotate(-6) scale(1 0.55) scale(0.0833333) translate(-300 -300)" fill="#ffffff">
     <path d="M280.19 142.036C282.913 150.121 288.605 156.721 296.196 160.516C300.733 162.743 305.6 163.898 310.468 163.898C313.851 163.898 317.315 163.321 320.616 162.248L470.852 112.17C487.599 106.642 496.592 88.4924 491.064 71.7447C485.536 54.997 467.303 46.0044 450.636 51.532L300.403 101.61C283.738 107.137 274.663 125.288 280.19 142.036Z"/>
     <path d="M318.056 481.439C321.851 473.769 322.511 465.186 319.788 457.017C314.261 440.354 296.111 431.278 279.363 436.806L129.129 486.883C121.043 489.608 114.443 495.299 110.648 502.89C106.853 510.481 106.193 519.144 108.916 527.308C113.371 540.674 125.828 549.173 139.194 549.173C142.576 549.173 145.959 548.68 149.259 547.525L299.493 497.446C307.578 494.721 314.178 489.03 317.973 481.439H318.056Z"/>

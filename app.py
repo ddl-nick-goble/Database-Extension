@@ -12,6 +12,7 @@ import logging
 import os
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -55,6 +56,17 @@ except OSError as e:
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/favicon.ico")
+def serve_favicon():
+    return send_from_directory(Path(app.static_folder) / "img", "favicon.ico")
+
+
+
+@app.route("/img/<path:filename>")
+def serve_img(filename):
+    return send_from_directory(Path(app.static_folder) / "img", filename)
 
 
 @app.route("/<path:_>")
@@ -539,28 +551,55 @@ def api_environments_status():
         log.warning("list_environments failed during /api/environments/status: %s", e)
         all_envs = []
 
-    envs_by_name = {
-        e.get("name", ""): e
+    id_map = {
+        e.get("name", ""): e.get("id", "")
         for e in all_envs if isinstance(e, dict)
     }
     img_root = Path(app.static_folder) / "img"
-    def _env_row(name: str, label: str, canonical_name: str,
-                 icon: str = "", icon_png: str = "", env_id_var: str = "") -> dict:
-        """Build one row for /api/environments/status."""
-        id_map = {k: v.get("id", "") for k, v in envs_by_name.items()}
-        env_id = os.environ.get(env_id_var, "").strip() if env_id_var else ""
+
+    # Build spec list — no API calls yet
+    specs = []
+    for a in engines.all_engines():
+        specs.append(dict(
+            name=a.name, label=a.docs_label,
+            canonical_name=f"dd-{a.name}-app",
+            icon=a.icon, icon_png=f"{a.name}.png",
+            env_id_var=a.env_id_var,
+        ))
+    specs.append(dict(
+        name="dsc-db", label="DSC + DB",
+        canonical_name="dd-dsc-db",
+        icon="", icon_png="", env_id_var="",
+    ))
+
+    # Resolve env_id for each spec from env-var or by canonical name
+    for s in specs:
+        env_id = os.environ.get(s["env_id_var"], "").strip() if s["env_id_var"] else ""
         source = "envvar" if env_id else ""
         if not env_id:
-            env_id = id_map.get(canonical_name, "")
+            env_id = id_map.get(s["canonical_name"], "")
             source = "byname" if env_id else "missing"
+        s["env_id"] = env_id
+        s["source"] = source
 
-        env_v4: dict = {}
-        if env_id:
-            try:
-                env_v4 = dapi.get_environment(env_id) or {}
-            except Exception as e:
-                log.warning("get_environment(%s) failed: %s", env_id, e)
+    # Fetch v4 details for all envs that have an id — in parallel
+    def _fetch_v4(env_id: str) -> dict:
+        try:
+            return dapi.get_environment(env_id) or {}
+        except Exception as exc:
+            log.warning("get_environment(%s) failed: %s", env_id, exc)
+            return {}
 
+    unique_ids = list({s["env_id"] for s in specs if s["env_id"]})
+    v4_by_id: dict[str, dict] = {}
+    if unique_ids:
+        with ThreadPoolExecutor(max_workers=min(len(unique_ids), 8)) as pool:
+            fut_map = {pool.submit(_fetch_v4, eid): eid for eid in unique_ids}
+            for fut in as_completed(fut_map):
+                v4_by_id[fut_map[fut]] = fut.result()
+
+    def _build_row(s: dict) -> dict:
+        env_v4 = v4_by_id.get(s["env_id"], {})
         latest_rev = env_v4.get("latestRevision") or {}
         rev_details = env_v4.get("latestRevisionDetails") or {}
         docker_image = rev_details.get("dockerImage", "")
@@ -570,6 +609,7 @@ def api_environments_status():
         image_size = _fmt_bytes(int(size_bytes)) if size_bytes else ""
         owner_obj = env_v4.get("owner") or {}
 
+        canonical_name = s["canonical_name"]
         df_path = REPO_ROOT / "envs" / canonical_name / "Dockerfile"
         dockerfile_text = ""
         dockerfile_exists = df_path.exists()
@@ -579,16 +619,18 @@ def api_environments_status():
             except OSError:
                 pass
 
+        icon_png = s["icon_png"]
         icon_path = img_root / icon_png if icon_png else None
+        env_id = s["env_id"]
         return {
-            "name": name,
-            "label": label,
-            "icon": icon,
-            "iconUrl": icon_png if (icon_path and icon_path.exists()) else "",
+            "name": s["name"],
+            "label": s["label"],
+            "icon": s["icon"],
+            "iconUrl": f"img/{icon_png}" if (icon_path and icon_path.exists()) else "",
             "expectedEnvName": canonical_name,
             "envId": env_id,
-            "envIdVar": env_id_var,
-            "envIdSource": source,
+            "envIdVar": s["env_id_var"],
+            "envIdSource": s["source"],
             "latestRevision": latest_rev,
             "revisionNumber": latest_rev.get("number"),
             "revisionSummary": rev_details.get("summary", ""),
@@ -604,24 +646,7 @@ def api_environments_status():
             "dockerfileExists": dockerfile_exists,
         }
 
-    result = []
-    # DB app environments — one per engine
-    for a in engines.all_engines():
-        result.append(_env_row(
-            name=a.name,
-            label=a.docs_label,
-            canonical_name=f"dd-{a.name}-app",
-            icon=a.icon,
-            icon_png=f"{a.name}.png",
-            env_id_var=a.env_id_var,
-        ))
-    # Workspace / app / endpoint environment — DSC + DB
-    result.append(_env_row(
-        name="dsc-db",
-        label="DSC + DB",
-        canonical_name="dd-dsc-db",
-    ))
-    return jsonify(result)
+    return jsonify([_build_row(s) for s in specs])
 
 
 @app.route("/api/environments/<engine>/build", methods=["POST"])
@@ -693,26 +718,12 @@ def api_build_environment(engine: str):
         else:
             yield sse("step", msg=f"Creating new environment '{canonical_name}'")
             try:
-                env_id = dapi.create_environment(canonical_name, image, visibility="Global")
+                env_id = dapi.create_environment(canonical_name, image, visibility="Private")
             except Exception as e:
                 yield sse("error", msg="create_environment failed", detail=str(e))
                 return
             action = "created"
             yield sse("ok", msg=f"Created env {env_id}", ms=since(t2))
-
-        # 2b. Ensure visibility is Organization (covers both new and pre-existing envs).
-        yield sse("step", msg="Setting visibility to Organization")
-        try:
-            env_meta = dapi.get_environment(env_id)
-            owner_id = (env_meta.get("owner") or {}).get("id", "")
-            if not owner_id:
-                yield sse("error", msg="Cannot set visibility — owner ID missing from env metadata")
-                return
-            dapi.set_environment_visibility(env_id, owner_id)
-            yield sse("ok", msg="Visibility set to Organization")
-        except Exception as e:
-            yield sse("error", msg="Failed to set visibility", detail=str(e))
-            return
 
         # 3. Add the Dockerfile revision
         t3 = time.monotonic()

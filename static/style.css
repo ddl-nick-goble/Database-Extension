@@ -76,8 +76,8 @@ code {
     gap: 10px;
 }
 .topbar-logo {
-    width: 28px;
-    height: 28px;
+    width: 64px;
+    height: 64px;
     flex-shrink: 0;
 }
 .title {

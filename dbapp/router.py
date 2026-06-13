@@ -74,6 +74,7 @@ STATUS_HTML = """<!doctype html>
 <html><head>
   <meta charset="utf-8">
   <title>Domino Databases — {{ cfg.db_id }}</title>
+  <link rel="icon" type="image/svg+xml" href="img/favicon.svg">
   <link rel="icon" href="img/favicon.ico" sizes="any">
   <link rel="icon" type="image/png" sizes="32x32" href="img/icon-32.png">
   <link rel="apple-touch-icon" href="img/apple-touch-icon.png">
@@ -97,13 +98,62 @@ STATUS_HTML = """<!doctype html>
     a.btn:disabled, a.btn.disabled { background: #9ca3af; cursor: not-allowed; }
     code { background: #f3f4f6; padding: 1px 6px; border-radius: 3px; font-size: 0.9em; }
     pre.snippet { background: #0f172a; color: #d1d5db; padding: 14px; border-radius: 4px;
-                  font-size: 12px; overflow-x: auto; line-height: 1.6; }
+                  font-size: 12px; overflow-x: auto; line-height: 1.6; margin: 0; }
     .label { font-size: 12px; color: #6b7280; margin-top: 14px; }
     .note  { font-size: 12px; color: #9ca3af; margin-top: 6px; font-style: italic; }
+    .snippet-wrap { position: relative; margin-top: 4px; }
+    .copy-btn {
+      position: absolute; top: 8px; right: 8px;
+      background: rgba(255,255,255,0.1); color: #d1d5db; border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 4px; padding: 3px 9px; font-size: 11px; cursor: pointer; transition: background 0.15s;
+    }
+    .copy-btn:hover { background: rgba(255,255,255,0.2); }
+    .copy-btn.copied { background: #16a34a; border-color: #16a34a; color: white; }
+    .tip-box {
+      background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px;
+      padding: 14px 16px; margin-bottom: 4px;
+    }
+    .tip-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .badge-rec {
+      background: #16a34a; color: white; font-size: 10px; font-weight: 700;
+      letter-spacing: 0.06em; padding: 2px 8px; border-radius: 99px; white-space: nowrap;
+    }
+    .tip-title { font-size: 13px; font-weight: 600; color: #166534; }
+    .tip-body { font-size: 13px; color: #374151; margin: 0 0 10px 0; }
+    .step-row { display: flex; gap: 12px; margin-top: 14px; }
+    .step-num {
+      flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
+      background: #16a34a; color: white; font-size: 12px; font-weight: 700;
+      display: flex; align-items: center; justify-content: center; margin-top: 1px;
+    }
+    .step-heading { font-size: 13px; font-weight: 600; color: #166534; margin-bottom: 6px; }
+    .opt-block {
+      border: 1px solid #e4e7eb; border-radius: 6px; padding: 14px 16px;
+      margin-top: 10px;
+    }
+    .opt-recommended { border-color: #bbf7d0; background: #f0fdf4; }
+    .opt-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .opt-num {
+      flex-shrink: 0; width: 22px; height: 22px; border-radius: 50%;
+      background: #6366f1; color: white; font-size: 11px; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .opt-recommended .opt-num { background: #16a34a; }
+    .opt-title { font-size: 13px; font-weight: 600; color: #111827; }
+    .opt-recommended .opt-title { color: #166534; }
+    .opt-desc { font-size: 13px; color: #4b5563; margin: 0 0 8px 0; }
+    .shared-connect {
+      margin-top: 14px; padding-top: 14px;
+      border-top: 1px solid #e4e7eb;
+    }
+    .shared-connect-label {
+      font-size: 12px; font-weight: 600; letter-spacing: 0.04em;
+      text-transform: uppercase; color: #6b7280; margin-bottom: 8px;
+    }
   </style>
 </head><body>
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
-    <svg width="28" height="28" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="flex-shrink:0;">
+    <svg width="64" height="64" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" style="flex-shrink:0;">
       <path d="M26,46 V80 a34,18 0 0 0 68,0 V46 a34,18 0 0 1 -68,0 z" fill="#C24E1B"/>
       <path d="M26,63 a34,18 0 0 0 68,0" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
       <ellipse cx="60" cy="46" rx="34" ry="18" fill="#E8642A"/>
@@ -145,53 +195,77 @@ STATUS_HTML = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2>Connect from Domino</h2>
-    <p style="font-size: 13px; color: #4b5563; margin-top: 0;">
-      Step 1 — open a tunnel. <code>$DOMINO_API_KEY</code> is already in your
-      workspace environment.
-    </p>
-    <pre class="snippet">python3 /mnt/code/client/domino-db-tunnel.py \
-  --url "{{ cfg.tunnel_url|default('https://apps.<your-domino-host>/apps-internal/<appId>/') }}" \
+    <h2>Connect</h2>
+
+    <!-- Option 1 -->
+    <div class="opt-block opt-recommended">
+      <div class="opt-header">
+        <span class="opt-num">1</span>
+        <span class="opt-title">DSC + DB environment</span>
+        <span class="badge-rec">RECOMMENDED</span>
+      </div>
+      <p class="opt-desc">
+        Start a Domino workspace with the <code>dd-dsc-db</code> environment.
+        The pre-run script auto-connects all databases in this project — no tunnel command needed.
+      </p>
+      <div class="snippet-wrap">
+        <pre class="snippet">db {{ cfg.db_id }}</pre>
+        <button class="copy-btn" onclick="copySnippet(this)">Copy</button>
+      </div>
+      <div class="note">Run <code>db</code> with no args to list all databases. Run <code>source ~/.bashrc</code> if the alias isn't loaded yet.</div>
+    </div>
+
+    <!-- Option 2 -->
+    <div class="opt-block">
+      <div class="opt-header">
+        <span class="opt-num">2</span>
+        <span class="opt-title">From a Domino workspace</span>
+      </div>
+      <p class="opt-desc"><code>$DOMINO_API_KEY</code> is already set in your environment. Run this tunnel in one terminal:</p>
+      <div class="snippet-wrap">
+        <pre class="snippet">python3 /mnt/code/client/domino-db-tunnel.py \
+  --url "{{ cfg.tunnel_url|default('https://apps.<domino-host>/apps-internal/<appId>/') }}" \
   --api-key $DOMINO_API_KEY \
   --port {{ engine_port }}</pre>
+        <button class="copy-btn" onclick="copySnippet(this)">Copy</button>
+      </div>
+    </div>
 
-    <p style="font-size: 13px; color: #4b5563; margin-top: 16px;">
-      Step 2 — leave that running. In another terminal:
-    </p>
-    {% for snip in snippets %}
-      <div class="label">{{ snip.label }}</div>
-      <pre class="snippet">{{ snip.snippet }}</pre>
-      {% if snip.note %}<div class="note">{{ snip.note }}</div>{% endif %}
-    {% endfor %}
-  </div>
-
-  <div class="card">
-    <h2>Connect from your laptop</h2>
-    <p style="font-size: 13px; color: #4b5563; margin-top: 0;">
-      Step 1 — open a tunnel. Single-file Python script, no install needed.
-      Get <code>$DOMINO_API_KEY</code> from your Domino Account Settings.
-    </p>
-    <pre class="snippet">curl -fsSL https://raw.githubusercontent.com/ddl-nick-goble/Database-Extension/main/client/domino-db-tunnel.py | python3 - \
-  --url "{{ cfg.tunnel_url|default('https://apps.<your-domino-host>/apps-internal/<appId>/') }}" \
+    <!-- Option 3 -->
+    <div class="opt-block">
+      <div class="opt-header">
+        <span class="opt-num">3</span>
+        <span class="opt-title">From your laptop</span>
+      </div>
+      <p class="opt-desc">Get your API key from Domino → Account Settings → API Keys, then run:</p>
+      <div class="snippet-wrap">
+        <pre class="snippet">export DOMINO_API_KEY=&lt;your-key&gt;</pre>
+        <button class="copy-btn" onclick="copySnippet(this)">Copy</button>
+      </div>
+      <div class="snippet-wrap" style="margin-top:6px;">
+        <pre class="snippet">curl -fsSL https://raw.githubusercontent.com/ddl-nick-goble/Database-Extension/main/client/domino-db-tunnel.py | python3 - \
+  --url "{{ cfg.tunnel_url|default('https://apps.<domino-host>/apps-internal/<appId>/') }}" \
   --api-key $DOMINO_API_KEY \
   --port {{ engine_port }}</pre>
+        <button class="copy-btn" onclick="copySnippet(this)">Copy</button>
+      </div>
+      {% if not cfg.tunnel_url %}
+      <div class="note" style="color:#ca8a04;">Replace <code>&lt;domino-host&gt;</code> and <code>&lt;appId&gt;</code> — or re-create this DB to get the URL auto-filled.</div>
+      {% endif %}
+    </div>
 
-    <p style="font-size: 13px; color: #4b5563; margin-top: 16px;">
-      Step 2 — leave that running. In another terminal:
-    </p>
-    {% for snip in snippets %}
-      <div class="label">{{ snip.label }}</div>
-      <pre class="snippet">{{ snip.snippet }}</pre>
-      {% if snip.note %}<div class="note">{{ snip.note }}</div>{% endif %}
-    {% endfor %}
-
-    {% if not cfg.tunnel_url %}
-    <p style="font-size: 12px; color: #ca8a04; margin-top: 12px;">
-      Note: this DB was provisioned before the App URL was baked into the config.
-      Replace <code>&lt;your-domino-host&gt;</code> and <code>&lt;appId&gt;</code>
-      by hand, or re-create the DB to get the snippet auto-filled.
-    </p>
-    {% endif %}
+    <!-- Shared step 2 for options 2 + 3 -->
+    <div class="shared-connect">
+      <div class="shared-connect-label">Then connect <span style="color:#9ca3af;font-weight:400;">(options 2 &amp; 3 — leave the tunnel running)</span></div>
+      {% for snip in snippets %}
+        <div class="label">{{ snip.label }}</div>
+        <div class="snippet-wrap">
+          <pre class="snippet">{{ snip.snippet }}</pre>
+          <button class="copy-btn" onclick="copySnippet(this)">Copy</button>
+        </div>
+        {% if snip.note %}<div class="note">{{ snip.note }}</div>{% endif %}
+      {% endfor %}
+    </div>
   </div>
   <div class="card" id="backup-card">
     <h2>Backup</h2>
@@ -229,6 +303,14 @@ STATUS_HTML = """<!doctype html>
     <div id="backup-msg" style="margin-top:10px;font-size:13px;"></div>
   </div>
   <script>
+  function copySnippet(btn) {
+    var pre = btn.previousElementSibling;
+    navigator.clipboard.writeText(pre.textContent.trim()).then(function() {
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(function() { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1800);
+    });
+  }
   (function() {
     // Toggle path vs create inputs
     document.querySelectorAll('input[name="backup-mode"]').forEach(r => {

@@ -1,6 +1,7 @@
-# dd-dsc-db — "DSC + DB"  Domino compute environment
+# dd-dse-db — "DSE + DB"  Domino compute environment
+# cache-bust: 2026-06-13
 #
-# Extends the Domino Standard Computing (DSC) base with auto-connect tooling
+# Extends the Domino Standard Environment (DSE) base with auto-connect tooling
 # for database apps running in the same project. Use this environment for
 # workspaces, apps, or endpoints that need direct access to Domino DB apps.
 #

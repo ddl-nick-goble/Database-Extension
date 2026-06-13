@@ -660,7 +660,10 @@ def api_build_environment(engine: str):
     # request-context access inside the stream (same pattern as api_create_database).
     if engine == "dsc-db":
         canonical_name = "dd-dse-db"
-        pre_run_script = "python3 /opt/dd/workspace-setup.py"
+        pre_run_script = (
+            "curl -fsSL https://raw.githubusercontent.com/ddl-nick-goble/"
+            "Database-Extension/main/client/dd-workspace-setup.py | python3 -"
+        )
     else:
         try:
             adapter = engines.get(engine)

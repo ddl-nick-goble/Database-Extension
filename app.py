@@ -330,6 +330,7 @@ def api_create_database():
                 description=f"Domino Databases — {engine} ({full_name})",
                 environment_id=env_id,
                 hardware_tier_id=hw_id,
+                entry_point="dd-db-launcher.sh",
                 project_id=target_project_id,
             )
         except dapi.DominoApiError as e:
@@ -675,13 +676,12 @@ def api_build_environment(engine: str):
         except KeyError:
             return jsonify({"error": f"unknown engine {engine!r}"}), 400
         canonical_name = f"dd-{adapter.name}-app"
-        # preRunScript writes /mnt/code/app.sh shim so the DB app works in any
-        # project without requiring a per-project file setup.
+        # Always write dd-db-launcher.sh (never conflicts with a project's own
+        # app.sh) so this works in any project, not just Database-Extension.
         pre_run_script = (
-            "[ -f /mnt/code/app.sh ] || {"
-            " echo '#!/usr/bin/env bash' > /mnt/code/app.sh;"
-            " echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/app.sh;"
-            " chmod +x /mnt/code/app.sh; }"
+            "echo '#!/usr/bin/env bash' > /mnt/code/dd-db-launcher.sh"
+            " && echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/dd-db-launcher.sh"
+            " && chmod +x /mnt/code/dd-db-launcher.sh"
         )
 
     df_path = REPO_ROOT / "envs" / canonical_name / "Dockerfile"

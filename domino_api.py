@@ -415,15 +415,14 @@ def create_app(
     environment_id: str,
     hardware_tier_id: str,
     visibility: str = "GRANT_BASED",
-    entry_point: str = "app.sh",
+    entry_point: str = "dd-db-launcher.sh",
     project_id: str | None = None,
 ) -> dict:
     """Create the App and bind it to the chosen environment.
 
-    entry_point defaults to "app.sh" — Domino resolves this relative to
-    /mnt/code (the project root).  For the Database-Extension project the
-    real app.sh dispatcher is already there.  For other projects, the
-    wizard uploads a one-liner shim before calling create_app.
+    entry_point defaults to "dd-db-launcher.sh" — a unique name that won't
+    collide with any project's own app.sh. The preRunScript always writes
+    this file as a one-liner shim: exec /opt/dd/app.sh "$@".
 
     project_id overrides the wizard's own project so DB apps can be created
     in any project the caller has access to.

@@ -140,8 +140,8 @@ def api_config():
             **res,
         })
     project_id = _req_project_id()
-    # When used as a cross-project extension the frontend passes ownerName/
-    # projectName parsed from the URL path (/u/{owner}/{project}/extension).
+    # When used as a cross-project extension, Domino appends ?projectOwner=&projectName=
+    # query params; the frontend forwards them here as ownerName/projectName.
     owner = (request.args.get("ownerName") or "").strip() or dapi.PROJECT_OWNER
     project = (request.args.get("projectName") or "").strip() or dapi.PROJECT_NAME
     return jsonify({

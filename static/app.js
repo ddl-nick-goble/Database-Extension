@@ -6,18 +6,12 @@
 
 const API = "./api";
 
-// Project scoping — read from ?projectId= so the wizard can be opened
-// from any project and create databases there instead of its own project.
-const _urlParams = new URLSearchParams(location.search);
+// Project scoping — Domino appends these query params when loading the app
+// as a sidebar extension so it can scope itself to the active project.
+const _urlParams    = new URLSearchParams(location.search);
 const _scopedProjectId = _urlParams.get("projectId") || "";
-
-// When loaded as a Domino extension the URL path contains the project context:
-//   /u/{owner}/{project}/extension  or  /u/{owner}/{project}/notebookSession/...
-// Parse it so /api/config gets the correct owner/project display name instead
-// of the deployment project (Database-Extension).
-const _pathMatch = location.pathname.match(/^\/u\/([^/]+)\/([^/]+)\//);
-const _pathOwner   = _pathMatch ? _pathMatch[1] : "";
-const _pathProject = _pathMatch ? _pathMatch[2] : "";
+const _scopedOwner     = _urlParams.get("projectOwner") || _urlParams.get("ownerUsername") || "";
+const _scopedProject   = _urlParams.get("projectName") || "";
 
 const state = {
     config: {},
@@ -68,18 +62,18 @@ async function api(path, opts = {}) {
 // =====================================================================
 async function boot() {
     bindUi();
-    if (_scopedProjectId) {
+    if (_scopedProjectId || _scopedProject) {
         const badge = document.getElementById("project-scope-badge");
         if (badge) {
-            badge.textContent = `Project: ${_scopedProjectId}`;
+            badge.textContent = `Project: ${_scopedProject || _scopedProjectId}`;
             badge.classList.remove("hidden");
         }
     }
     try {
         const configParams = new URLSearchParams();
         if (_scopedProjectId) configParams.set("projectId", _scopedProjectId);
-        if (_pathOwner)       configParams.set("ownerName", _pathOwner);
-        if (_pathProject)     configParams.set("projectName", _pathProject);
+        if (_scopedOwner)     configParams.set("ownerName", _scopedOwner);
+        if (_scopedProject)   configParams.set("projectName", _scopedProject);
         const configQs = configParams.toString();
         state.config = await fetch(`${API}/config${configQs ? "?" + configQs : ""}`, {
             headers: { "Content-Type": "application/json" },

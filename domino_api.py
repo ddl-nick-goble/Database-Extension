@@ -372,31 +372,6 @@ def create_app(
     })
 
 
-def register_extension(app_id: str, app_version_id: str, name: str) -> dict:
-    """Register the app as a project-sidebar extension visible across all projects."""
-    return _post("/api/extensions/beta/extensions", json={
-        "name": name,
-        "appId": app_id,
-        "appVersionId": app_version_id,
-        "enabled": True,
-        "uiMountPointTypeConfigs": {
-            "projectSidebar": {
-                "allProjects": True,
-                "enabled": True,
-                "mountPoints": [],
-                "urlConfig": {
-                    "contextualQueryParams": ["projectId"],
-                },
-            },
-            "datasetFileContext":       {"enabled": False},
-            "netAppVolumeFileContext":  {"enabled": False},
-            "dataset":                 {"enabled": False},
-            "netAppVolume":            {"enabled": False},
-            "modelDetails":            {"enabled": False},
-            "adminPanel":              {"enabled": False},
-        },
-    })
-
 
 def start_app(
     app_id: str,

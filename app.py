@@ -333,21 +333,6 @@ def api_create_database():
         yield sse("ok", msg=f"App created (id={app_id_str})", ms=since(t3))
         log.info("created app id=%s version=%s — registering extension", app_id_str, app_version_id)
 
-        # 3b. Register as a project-sidebar extension so it acts on behalf of
-        #     the user and appears in the sidebar across all projects.
-        #     Non-fatal — log a warning and continue if the extensions API is
-        #     unavailable or the caller lacks the required privilege.
-        if app_id_str and app_version_id:
-            try:
-                ext = dapi.register_extension(app_id_str, app_version_id, full_name)
-                log.info("registered extension id=%s", ext.get("id", "?"))
-                yield sse("ok", msg=f"Extension registered (id={ext.get('id', '?')})")
-            except dapi.DominoApiError as e:
-                log.warning("extension registration failed (HTTP %s): %s", e.status, e.body[:400])
-                yield sse("warn", msg=f"Extension registration skipped (HTTP {e.status}) — app will work but won't appear as sidebar extension")
-            except Exception as e:
-                log.warning("extension registration failed: %s", e)
-                yield sse("warn", msg=f"Extension registration skipped: {e}")
 
         # 4. Pin tunnel URL into cfg, then finalise DD_CONFIG_JSON.
         #    The JSON blob is passed as an env var at start time so the

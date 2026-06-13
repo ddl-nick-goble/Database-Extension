@@ -393,6 +393,11 @@ def fetch_build_logs(
     return lines, last_nano
 
 
+def get_project(project_id: str) -> dict:
+    """Return project metadata (name, owner.username) for the given project ID."""
+    return _get(f"/v4/projects/{project_id}")
+
+
 def list_hardware_tiers(project_id: str = "") -> list[dict]:
     return _unwrap_list(_get(f"/v4/projects/{project_id or PROJECT_ID}/hardwareTiers"))
 

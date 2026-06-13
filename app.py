@@ -140,14 +140,21 @@ def api_config():
             **res,
         })
     project_id = _req_project_id()
-    # When used as a cross-project extension, Domino appends ?projectOwner=&projectName=
-    # query params; the frontend forwards them here as ownerName/projectName.
-    owner = (request.args.get("ownerName") or "").strip() or dapi.PROJECT_OWNER
-    project = (request.args.get("projectName") or "").strip() or dapi.PROJECT_NAME
+    scoped = project_id and project_id != dapi.PROJECT_ID
+    owner = (request.args.get("ownerName") or "").strip()
+    project = (request.args.get("projectName") or "").strip()
+    if scoped and (not owner or not project):
+        proj = dapi.get_project(project_id)
+        owner = owner or proj.get("owner", {}).get("username", "") or proj.get("ownerUsername", "")
+        project = project or proj.get("name", "")
+    if not scoped:
+        owner = owner or dapi.PROJECT_OWNER
+        project = project or dapi.PROJECT_NAME
     return jsonify({
         "owner": owner,
         "project": project,
         "projectId": project_id,
+        "deployProject": dapi.PROJECT_NAME,
         "publicHost": dapi.PUBLIC_HOST,
         "engines": engine_catalog,
         # Legacy fields — kept so an older static/app.js still works

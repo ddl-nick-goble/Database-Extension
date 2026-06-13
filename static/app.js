@@ -62,13 +62,6 @@ async function api(path, opts = {}) {
 // =====================================================================
 async function boot() {
     bindUi();
-    if (_scopedProjectId || _scopedProject) {
-        const badge = document.getElementById("project-scope-badge");
-        if (badge) {
-            badge.textContent = `Project: ${_scopedProject || _scopedProjectId}`;
-            badge.classList.remove("hidden");
-        }
-    }
     try {
         const configParams = new URLSearchParams();
         if (_scopedProjectId) configParams.set("projectId", _scopedProjectId);
@@ -78,10 +71,15 @@ async function boot() {
         state.config = await fetch(`${API}/config${configQs ? "?" + configQs : ""}`, {
             headers: { "Content-Type": "application/json" },
         }).then(r => r.json());
-        if (_scopedProjectId) {
-            const badge = document.getElementById("project-scope-badge");
-            if (badge && state.config.project) {
-                badge.textContent = `Project: ${state.config.project}`;
+        const badge = document.getElementById("project-scope-badge");
+        if (badge) {
+            const resolvedProject = state.config.project || "";
+            const isScoped = _scopedProjectId && resolvedProject && resolvedProject !== state.config.deployProject;
+            if (isScoped) {
+                badge.textContent = `Project: ${resolvedProject}`;
+                badge.classList.remove("hidden");
+            } else {
+                badge.classList.add("hidden");
             }
         }
         renderEngineDropdown();

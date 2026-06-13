@@ -304,11 +304,8 @@ def api_create_database():
         yield sse("ok", msg="Config ready", ms=since(t2))
 
         # 3. Create the Domino App.
-        #    entryPoint="/opt/dd/app.sh" is baked into every dd-*-app env
-        #    image — the app runs entirely from the image, no app.sh needed
-        #    in the project repo, so DB apps work in any project.
         t3 = time.monotonic()
-        yield sse("step", msg=f"Creating app (engine={engine}, entryPoint=/opt/dd/app.sh)", phase="create")
+        yield sse("step", msg=f"Creating app (engine={engine})", phase="create")
         log.info("provisioning %s engine=%s env=%s hw=%s", full_name, engine, env_id, hw_id)
         try:
             a = dapi.create_app(
@@ -316,7 +313,6 @@ def api_create_database():
                 description=f"Domino Databases — {engine} ({full_name})",
                 environment_id=env_id,
                 hardware_tier_id=hw_id,
-                entry_point="/opt/dd/app.sh",
                 project_id=target_project_id,
             )
         except dapi.DominoApiError as e:
@@ -712,10 +708,20 @@ def api_build_environment(engine: str):
         # 3. Add the Dockerfile revision
         t3 = time.monotonic()
         yield sse("step", msg="Queuing Dockerfile revision build")
+        # preRunScript runs at app-start time (before the entryPoint check),
+        # so it can write /mnt/code/app.sh into whatever project the DB app
+        # lands in — no per-project setup required.
+        _shim_script = (
+            "[ -f /mnt/code/app.sh ] || {"
+            " echo '#!/usr/bin/env bash' > /mnt/code/app.sh;"
+            " echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/app.sh;"
+            " chmod +x /mnt/code/app.sh; }"
+        )
         try:
             rev_resp = dapi.add_environment_revision(
                 env_id, dockerfile, image,
                 summary=f"dd-{engine}-app baseline — built via Environments tab",
+                pre_run_script=_shim_script,
             )
         except Exception as e:
             yield sse("error", msg="add_environment_revision failed", detail=str(e))

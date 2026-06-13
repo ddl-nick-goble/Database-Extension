@@ -112,23 +112,44 @@ STATUS_HTML = """<!doctype html>
   <div class="card">
     <h2>Open</h2>
     {% if has_admin %}
-    <a class="btn" href="admin/">Open DB Admin →</a>
+    <a class="btn" href="admin/">Open DB Admin ↗</a>
     {% else %}
     <a class="btn disabled">DB Admin n/a</a>
     {% endif %}
-    <a class="btn" href="api/status">JSON status →</a>
     {% if has_admin %}
     <p style="font-size: 13px; color: #4b5563; margin-top: 12px;">
       Admin UI is pre-connected to this DB — no extra login needed.
     </p>
     {% endif %}
+    <p style="margin-top: 12px;"><a href="api/status" style="font-size: 12px; color: #9ca3af;">JSON status</a></p>
+  </div>
+
+  <div class="card">
+    <h2>Connect from Domino</h2>
+    <p style="font-size: 13px; color: #4b5563; margin-top: 0;">
+      Step 1 — open a tunnel. <code>$DOMINO_API_KEY</code> is already in your
+      workspace environment.
+    </p>
+    <pre class="snippet">python3 /mnt/code/client/domino-db-tunnel.py \
+  --url "{{ cfg.tunnel_url|default('https://apps.<your-domino-host>/apps-internal/<appId>/') }}" \
+  --api-key $DOMINO_API_KEY \
+  --port {{ engine_port }}</pre>
+
+    <p style="font-size: 13px; color: #4b5563; margin-top: 16px;">
+      Step 2 — leave that running. In another terminal:
+    </p>
+    {% for snip in snippets %}
+      <div class="label">{{ snip.label }}</div>
+      <pre class="snippet">{{ snip.snippet }}</pre>
+      {% if snip.note %}<div class="note">{{ snip.note }}</div>{% endif %}
+    {% endfor %}
   </div>
 
   <div class="card">
     <h2>Connect from your laptop</h2>
     <p style="font-size: 13px; color: #4b5563; margin-top: 0;">
-      Step 1 — open a tunnel. Single-file Python script, zero install.
-      Replace <code>$DOMINO_API_KEY</code> with your key from Account Settings.
+      Step 1 — open a tunnel. Single-file Python script, no install needed.
+      Get <code>$DOMINO_API_KEY</code> from your Domino Account Settings.
     </p>
     <pre class="snippet">curl -fsSL https://raw.githubusercontent.com/ddl-nick-goble/Database-Extension/main/client/domino-db-tunnel.py | python3 - \
   --url "{{ cfg.tunnel_url|default('https://apps.<your-domino-host>/apps-internal/<appId>/') }}" \

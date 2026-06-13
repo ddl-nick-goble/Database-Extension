@@ -169,7 +169,8 @@ def create_environment(name: str, image: str, visibility: str = "Global") -> str
     return env_id
 
 
-def add_environment_revision(env_id: str, dockerfile: str, image: str, summary: str = "") -> dict:
+def add_environment_revision(env_id: str, dockerfile: str, image: str, summary: str = "",
+                              pre_run_script: str = "") -> dict:
     """Add a new revision. Returns the full API response dict so callers can
     extract revision id, build id, etc."""
     body = {
@@ -178,7 +179,7 @@ def add_environment_revision(env_id: str, dockerfile: str, image: str, summary: 
         "image": image,
         "postRunScript": "",
         "postSetupScript": "",
-        "preRunScript": "",
+        "preRunScript": pre_run_script,
         "preSetupScript": "",
         "skipCache": False,
         "summary": summary,
@@ -287,9 +288,10 @@ def fetch_build_logs(
 ) -> tuple[list[str], int]:
     """Fetch Docker build log lines since `since_nano` (nanosecond timestamp).
 
-    URL pattern discovered from the Domino UI:
+    URL pattern confirmed from Domino UI DevTools:
       GET /environments/{envId}/revisions/{revId}/build/{buildId}/fetchBuildLogsSince
-      ?since=<nanotime>   (0 = fetch all)
+      ?sinceTimeNano=<nanotime>&tail=true
+      204 = no new lines yet (keep polling), 200 = HTML with <tr data-timeNano="...">
 
     Returns (log_lines, last_nanotime_seen).  Returns ([], since_nano) on any error
     so the caller can fall back gracefully.
@@ -298,9 +300,11 @@ def fetch_build_logs(
         f"/environments/{env_id}/revisions/{revision_id}"
         f"/build/{build_id}/fetchBuildLogsSince"
     )
-    params = {"since": since_nano}
+    params = {"sinceTimeNano": since_nano, "tail": "true"}
     try:
         r = _session().request("GET", f"{PROXY_URL}{path}", params=params, timeout=30)
+        if r.status_code == 204:
+            return [], since_nano
         if r.status_code >= 400:
             return [], since_nano
         content = r.text
@@ -342,14 +346,15 @@ def create_app(
     environment_id: str,
     hardware_tier_id: str,
     visibility: str = "GRANT_BASED",
-    entry_point: str = "/opt/dd/app.sh",
+    entry_point: str = "app.sh",
     project_id: str | None = None,
 ) -> dict:
     """Create the App and bind it to the chosen environment.
 
-    entry_point="/opt/dd/app.sh" is the script baked into every dd-*-app
-    environment image, making DB apps project-independent — they carry
-    their full runtime in the image and need nothing from the project repo.
+    entry_point defaults to "app.sh" — Domino resolves this relative to
+    /mnt/code (the project root).  For the Database-Extension project the
+    real app.sh dispatcher is already there.  For other projects, the
+    wizard uploads a one-liner shim before calling create_app.
 
     project_id overrides the wizard's own project so DB apps can be created
     in any project the caller has access to.

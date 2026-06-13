@@ -177,7 +177,7 @@ function renderTable() {
             sLower === "never started"                          ? "badge-pending" :
                                                                   "badge-stopped";
         const conn = db.url
-            ? `<a href="${escapeHtml(db.browserUrl || db.url)}" target="_blank" rel="noopener">Open DB ↗</a>`
+            ? `<a href="${escapeHtml(db.url)}" target="_blank" rel="noopener">Open DB ↗</a>`
             : `<span class="muted">—</span>`;
         const configLink = db.configUrl
             ? `<a href="${escapeHtml(db.configUrl)}" target="_blank" rel="noopener">Open Setup ↗</a>`
@@ -611,7 +611,7 @@ function renderEnvCards(envs) {
                 </div>
                 <div class="env-meta-row">
                     <span class="env-meta-key">Resolved via</span>
-                    <code class="env-meta-val">${escapeHtml(e.envIdVar)}</code>
+                    <code class="env-meta-val">${e.envIdSource === "envvar" ? escapeHtml(e.envIdVar) : escapeHtml(e.expectedEnvName)}</code>
                 </div>
             </div>
             <div class="env-card-actions">

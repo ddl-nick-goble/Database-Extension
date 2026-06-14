@@ -428,26 +428,28 @@ def create_app(
     visibility: str = "GRANT_BASED",
     entry_point: str = "dd-db-launcher.sh",
     project_id: str | None = None,
+    pre_run_script: str = "",
 ) -> dict:
     """Create the App and bind it to the chosen environment.
 
-    entry_point defaults to "dd-db-launcher.sh" — a unique name that won't
-    collide with any project's own app.sh. The preRunScript always writes
-    this file as a one-liner shim: exec /opt/dd/app.sh "$@".
-
-    project_id overrides the wizard's own project so DB apps can be created
-    in any project the caller has access to.
+    pre_run_script is embedded in the version definition so it runs before
+    the entry script on every start — this is the only reliable cross-project
+    config delivery mechanism (start-time environmentVariables/preRunScript
+    are silently ignored by some Domino versions).
     """
+    version: dict = {
+        "hardwareTierId": hardware_tier_id,
+        "environmentId": environment_id,
+    }
+    if pre_run_script:
+        version["preRunScript"] = pre_run_script
     return _post("/api/apps/beta/apps", json={
         "projectId": project_id or PROJECT_ID,
         "name": name,
         "description": description,
         "visibility": visibility,
         "entryPoint": entry_point,
-        "version": {
-            "hardwareTierId": hardware_tier_id,
-            "environmentId": environment_id,
-        },
+        "version": version,
     })
 
 
@@ -456,39 +458,19 @@ def start_app(
     app_id: str,
     environment_id: str | None = None,
     hardware_tier_id: str | None = None,
-    environment_variables: dict | None = None,
-    pre_run_script: str = "",
 ) -> dict:
     """Launch the app instance.
 
-    Critical: /api/apps/beta/apps create() ignores the version.environmentId
-    we pass — the auto-created currentVersion uses the project's default
-    env (DSE). We MUST override at start time by passing environmentId +
-    hardwareTierId in the /v4/modelProducts/<id>/start body.
-
-    pre_run_script: if provided, passed as the version preRunScript so the
-    container writes the config to /mnt/code/dbapps/ before lifecycle starts.
-    This is the most reliable cross-project config delivery because it runs
-    unconditionally in every Domino version.
-
-    environment_variables: also sent as a belt-and-suspenders fallback for
-    DD_CONFIG_JSON in case the Domino instance supports it.
-
-    The v4 path is used (not /api/apps/beta/.../start) because the latter
-    is feature-flag-gated on this Domino build.
+    environmentId + hardwareTierId must be passed on the first start — the
+    version created by create_app() has them, but Domino silently overrides
+    to the project default DSE when starting. Passing them here forces the
+    right environment. Retries omit them to reuse the version already created.
     """
     body: dict = {}
     if environment_id:
         body["environmentId"] = environment_id
     if hardware_tier_id:
         body["hardwareTierId"] = hardware_tier_id
-    if environment_variables:
-        # Try list format — some Domino versions accept {name,value} pairs.
-        body["environmentVariables"] = [
-            {"name": k, "value": str(v)} for k, v in environment_variables.items()
-        ]
-    if pre_run_script:
-        body["preRunScript"] = pre_run_script
     return _post(f"/v4/modelProducts/{app_id}/start", json=body)
 
 

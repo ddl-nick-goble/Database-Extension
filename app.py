@@ -333,14 +333,13 @@ def api_create_database():
             return
         yield sse("ok", msg=f"Name '{full_name}' is available", ms=since(t1))
 
-        # 2. Build config. The snapshot_dir is stored explicitly so it's
-        #    per-app and points at the target project's dataset — not derived
-        #    from whatever project the container happens to run in.
+        # 2. Build config — all lifecycle-required fields are known before the
+        #    app exists. tunnel_url/app_id are NOT needed by the lifecycle at
+        #    boot; they're display-only in the router status page.
         t2 = time.monotonic()
         config_path = DBAPPS_DIR / f"{full_name}.json"
         yield sse("step", msg=f"Building config for {full_name}", phase="config")
 
-        # Resolve target project name → snapshot dir default.
         if target_project_id == dapi.PROJECT_ID:
             target_project_name = dapi.PROJECT_NAME
         else:
@@ -363,18 +362,16 @@ def api_create_database():
             "admin_port": 8978,
             "snapshot_interval_min": snapshot_interval_min,
         }
-        config_path.write_text(json.dumps(cfg, indent=2))
-        os.chmod(config_path, 0o600)
 
-        # Set snapshot path as a project-level env var so it's visible
-        # in the project settings and survives config re-delivery.
-        try:
-            dapi.set_project_env_var(target_project_id, snap_var, snapshot_dir)
-            yield sse("ok", msg=f"Set {snap_var}={snapshot_dir} on project", ms=since(t2))
-        except Exception as e:
-            yield sse("warn", msg=f"Could not set project var {snap_var}: {e} — snapshot_dir will use default")
+        # Embed config in the app-level pre-run script at CREATE time.
+        # This is the only delivery path that works reliably across all
+        # Domino versions — start-time environmentVariables/preRunScript
+        # fields are silently ignored by some instances.
+        config_script = _config_pre_run_script(full_name, json.dumps(cfg))
 
-        # 3. Create the Domino App.
+        yield sse("ok", msg="Config built", ms=since(t2))
+
+        # 3. Create the Domino App with the pre-run script baked in.
         t3 = time.monotonic()
         yield sse("step", msg=f"Creating app (engine={engine})", phase="create")
         log.info("provisioning %s engine=%s env=%s hw=%s", full_name, engine, env_id, hw_id)
@@ -386,57 +383,43 @@ def api_create_database():
                 hardware_tier_id=hw_id,
                 entry_point="dd-db-launcher.sh",
                 project_id=target_project_id,
+                pre_run_script=config_script,
             )
         except dapi.DominoApiError as e:
             log.warning("create failed: %s", e)
-            try: config_path.unlink()
-            except FileNotFoundError: pass
             yield sse("error", msg="create failed", detail=e.body[:1500], status=e.status, path=e.path)
             return
         except Exception as e:
             log.exception("unexpected create failure")
-            try: config_path.unlink()
-            except FileNotFoundError: pass
             yield sse("error", msg="create failed", detail=str(e), trace=traceback.format_exc()[-1500:])
             return
 
         app_id_str = a.get("id", "")
         app_version_id = (a.get("currentVersion") or {}).get("id", "")
         yield sse("ok", msg=f"App created (id={app_id_str})", ms=since(t3))
-        log.info("created app id=%s version=%s — registering extension", app_id_str, app_version_id)
 
-
-        # 4. Pin tunnel URL into cfg, then finalise DD_CONFIG_JSON.
-        #    The JSON blob is passed as an env var at start time so the
-        #    container carries its full config without needing any dataset file.
+        # 4. Now that we have the app ID, pin tunnel_url into the local
+        #    fallback config (wizard's own dataset only — for restart recovery).
         t4 = time.monotonic()
-        yield sse("step", msg="Finalising config + tunnel URL", phase="pin")
         if app_id_str:
             apps_host = dapi.PUBLIC_HOST.rstrip("/")
             if apps_host.startswith("https://") and not apps_host.startswith("https://apps."):
                 apps_host = "https://apps." + apps_host[len("https://"):]
             cfg["tunnel_url"] = f"{apps_host}/apps-internal/{app_id_str}/"
             cfg["app_id"] = app_id_str
-            config_path.write_text(json.dumps(cfg, indent=2))
-            os.chmod(config_path, 0o600)
+        config_path.write_text(json.dumps(cfg, indent=2))
+        os.chmod(config_path, 0o600)
+
+        # Set snapshot path as project env var (visible in project settings).
+        try:
+            dapi.set_project_env_var(target_project_id, snap_var, snapshot_dir)
+        except Exception as e:
+            yield sse("warn", msg=f"Could not set {snap_var} on project: {e}")
+
         yield sse("ok", msg="Config finalised", ms=since(t4))
 
-        # 5. Start it — create only makes the App object, doesn't launch the
-        #    container. Pass env+hw explicitly on the FIRST attempt only;
-        #    create's version.environmentId is silently dropped on this Domino
-        #    build, so without it the container would launch against the project's
-        #    default DSE.
-        #
-        #    Domino's Apps API is racy here: ~50% of the time the first
-        #    /start leaves the App stuck in Stopped indefinitely. A second
-        #    /start consistently recovers. We retry up to 3 attempts, and
-        #    break the 8s status-probe into 2s ticks so the user sees a
-        #    heartbeat at least every 2s.
-        #
-        #    Passing env+hw on each retry creates an unnecessary new app version.
-        #    Retries omit env+hw so Domino re-triggers the instance on the
-        #    version already created by attempt 1, avoiding extra versions.
-        config_script = _config_pre_run_script(full_name, json.dumps(cfg))
+        # 5. Start — env+hw must be passed explicitly (create's version fields
+        #    are silently dropped on some Domino builds). Retry up to 3×.
         start_ok = False
         for attempt in (1, 2, 3):
             yield sse("step", msg=f"/start attempt {attempt}", phase="start", attempt=attempt)
@@ -445,8 +428,6 @@ def api_create_database():
                     a["id"],
                     environment_id=env_id if attempt == 1 else None,
                     hardware_tier_id=hw_id if attempt == 1 else None,
-                    environment_variables={"DD_CONFIG_JSON": json.dumps(cfg)},
-                    pre_run_script=config_script if attempt == 1 else "",
                 )
                 a["status"] = "Starting"
             except dapi.DominoApiError as e:
@@ -529,29 +510,8 @@ def api_start_database(app_id: str):
             hw_id = hw_id or cv.get("hardwareTierId")
         except Exception:
             pass
-    # Re-inject DD_CONFIG_JSON from the fallback file so the resumed container
-    # still gets its config even if the original start env vars weren't persisted.
-    env_vars: dict | None = None
-    app_name = None
     try:
-        app_doc = app_doc if 'app_doc' in dir() else dapi.get_app(app_id)  # type: ignore[name-defined]
-        app_name = app_doc.get("name", "")
-    except Exception:
-        pass
-    config_script = ""
-    if app_name:
-        cfg_path = DBAPPS_DIR / f"{app_name}.json"
-        if cfg_path.exists():
-            try:
-                config_text = cfg_path.read_text()
-                env_vars = {"DD_CONFIG_JSON": config_text}
-                config_script = _config_pre_run_script(app_name, config_text)
-            except OSError:
-                pass
-    try:
-        result = dapi.start_app(app_id, environment_id=env_id, hardware_tier_id=hw_id,
-                                environment_variables=env_vars,
-                                pre_run_script=config_script)
+        result = dapi.start_app(app_id, environment_id=env_id, hardware_tier_id=hw_id)
     except dapi.DominoApiError as e:
         return jsonify({"error": "start failed", "status": e.status,
                         "dominoBody": e.body[:1500]}), 502

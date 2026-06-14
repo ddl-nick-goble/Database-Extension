@@ -50,6 +50,24 @@ except OSError as e:
     )
 
 
+def _config_pre_run_script(app_name: str, config_json: str) -> str:
+    """Build a shell pre-run script that writes the config to /mnt/code/dbapps/.
+
+    Uses base64 so the JSON is safe inside a here-doc regardless of quoting.
+    This is the most reliable cross-project config delivery — it runs
+    unconditionally in the container before the lifecycle starts.
+    """
+    import base64
+    encoded = base64.b64encode(config_json.encode()).decode()
+    return (
+        "mkdir -p /mnt/code/dbapps"
+        f" && printf '%s' '{encoded}' | base64 -d > /mnt/code/dbapps/{app_name}.json"
+        " && echo '#!/usr/bin/env bash' > /mnt/code/dd-db-launcher.sh"
+        " && echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/dd-db-launcher.sh"
+        " && chmod +x /mnt/code/dd-db-launcher.sh"
+    )
+
+
 # --------------------------------------------------------------------------
 # Static front-end
 # --------------------------------------------------------------------------
@@ -315,13 +333,27 @@ def api_create_database():
             return
         yield sse("ok", msg=f"Name '{full_name}' is available", ms=since(t1))
 
-        # 2. Build config. Written to the dataset as a fallback for the
-        #    API-lookup path, but the primary delivery is DD_CONFIG_JSON
-        #    passed as an env var at start time — making the DB app
-        #    fully project-independent (no file needed in any project).
+        # 2. Build config. The snapshot_dir is stored explicitly so it's
+        #    per-app and points at the target project's dataset — not derived
+        #    from whatever project the container happens to run in.
         t2 = time.monotonic()
         config_path = DBAPPS_DIR / f"{full_name}.json"
-        yield sse("step", msg=f"Writing dbapps/{full_name}.json (fallback config)", phase="config")
+        yield sse("step", msg=f"Building config for {full_name}", phase="config")
+
+        # Resolve target project name → snapshot dir default.
+        if target_project_id == dapi.PROJECT_ID:
+            target_project_name = dapi.PROJECT_NAME
+        else:
+            try:
+                proj = dapi.get_project(target_project_id)
+                target_project_name = proj.get("name") or dapi.PROJECT_NAME
+            except Exception:
+                target_project_name = dapi.PROJECT_NAME
+
+        datasets_base = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
+        snapshot_dir = f"{datasets_base}/{target_project_name}/db-{full_name}"
+        snap_var = f"DD_SNAPSHOT_{full_name.replace('-', '_').upper()}"
+
         cfg = {
             "engine": engine,
             "db_id": full_name,
@@ -333,7 +365,14 @@ def api_create_database():
         }
         config_path.write_text(json.dumps(cfg, indent=2))
         os.chmod(config_path, 0o600)
-        yield sse("ok", msg="Config ready", ms=since(t2))
+
+        # Set snapshot path as a project-level env var so it's visible
+        # in the project settings and survives config re-delivery.
+        try:
+            dapi.set_project_env_var(target_project_id, snap_var, snapshot_dir)
+            yield sse("ok", msg=f"Set {snap_var}={snapshot_dir} on project", ms=since(t2))
+        except Exception as e:
+            yield sse("warn", msg=f"Could not set project var {snap_var}: {e} — snapshot_dir will use default")
 
         # 3. Create the Domino App.
         t3 = time.monotonic()
@@ -397,6 +436,7 @@ def api_create_database():
         #    Passing env+hw on each retry creates an unnecessary new app version.
         #    Retries omit env+hw so Domino re-triggers the instance on the
         #    version already created by attempt 1, avoiding extra versions.
+        config_script = _config_pre_run_script(full_name, json.dumps(cfg))
         start_ok = False
         for attempt in (1, 2, 3):
             yield sse("step", msg=f"/start attempt {attempt}", phase="start", attempt=attempt)
@@ -406,6 +446,7 @@ def api_create_database():
                     environment_id=env_id if attempt == 1 else None,
                     hardware_tier_id=hw_id if attempt == 1 else None,
                     environment_variables={"DD_CONFIG_JSON": json.dumps(cfg)},
+                    pre_run_script=config_script if attempt == 1 else "",
                 )
                 a["status"] = "Starting"
             except dapi.DominoApiError as e:
@@ -497,16 +538,20 @@ def api_start_database(app_id: str):
         app_name = app_doc.get("name", "")
     except Exception:
         pass
+    config_script = ""
     if app_name:
         cfg_path = DBAPPS_DIR / f"{app_name}.json"
         if cfg_path.exists():
             try:
-                env_vars = {"DD_CONFIG_JSON": cfg_path.read_text()}
+                config_text = cfg_path.read_text()
+                env_vars = {"DD_CONFIG_JSON": config_text}
+                config_script = _config_pre_run_script(app_name, config_text)
             except OSError:
                 pass
     try:
         result = dapi.start_app(app_id, environment_id=env_id, hardware_tier_id=hw_id,
-                                environment_variables=env_vars)
+                                environment_variables=env_vars,
+                                pre_run_script=config_script)
     except dapi.DominoApiError as e:
         return jsonify({"error": "start failed", "status": e.status,
                         "dominoBody": e.body[:1500]}), 502

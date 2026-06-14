@@ -398,6 +398,12 @@ def get_project(project_id: str) -> dict:
     return _get(f"/v4/projects/{project_id}")
 
 
+def set_project_env_var(project_id: str, name: str, value: str) -> dict:
+    """Create or overwrite a project-level environment variable."""
+    return _post(f"/v4/projects/{project_id}/environmentVariables",
+                 json={"name": name, "value": value})
+
+
 def list_hardware_tiers(project_id: str = "") -> list[dict]:
     return _unwrap_list(_get(f"/v4/projects/{project_id or PROJECT_ID}/hardwareTiers"))
 
@@ -451,21 +457,22 @@ def start_app(
     environment_id: str | None = None,
     hardware_tier_id: str | None = None,
     environment_variables: dict | None = None,
+    pre_run_script: str = "",
 ) -> dict:
     """Launch the app instance.
 
     Critical: /api/apps/beta/apps create() ignores the version.environmentId
     we pass — the auto-created currentVersion uses the project's default
     env (DSE). We MUST override at start time by passing environmentId +
-    hardwareTierId in the /v4/modelProducts/<id>/start body; the start
-    endpoint then provisions a new currentInstance bound to the right env.
-    Confirmed empirically against cloud-dogfood; the bare `{}` form silently
-    starts with the DSE.
+    hardwareTierId in the /v4/modelProducts/<id>/start body.
 
-    environment_variables are merged into the container environment.  We use
-    this to pass DD_CONFIG_JSON — the DB app's full config as a JSON blob —
-    so the app is self-contained and needs no config file in the project
-    dataset.  Confirmed the v4 start endpoint accepts this field.
+    pre_run_script: if provided, passed as the version preRunScript so the
+    container writes the config to /mnt/code/dbapps/ before lifecycle starts.
+    This is the most reliable cross-project config delivery because it runs
+    unconditionally in every Domino version.
+
+    environment_variables: also sent as a belt-and-suspenders fallback for
+    DD_CONFIG_JSON in case the Domino instance supports it.
 
     The v4 path is used (not /api/apps/beta/.../start) because the latter
     is feature-flag-gated on this Domino build.
@@ -476,7 +483,12 @@ def start_app(
     if hardware_tier_id:
         body["hardwareTierId"] = hardware_tier_id
     if environment_variables:
-        body["environmentVariables"] = environment_variables
+        # Try list format — some Domino versions accept {name,value} pairs.
+        body["environmentVariables"] = [
+            {"name": k, "value": str(v)} for k, v in environment_variables.items()
+        ]
+    if pre_run_script:
+        body["preRunScript"] = pre_run_script
     return _post(f"/v4/modelProducts/{app_id}/start", json=body)
 
 

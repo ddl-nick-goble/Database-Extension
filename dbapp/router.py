@@ -659,10 +659,26 @@ def api_backup_snapshot():
 
 
 def _apply_backup_config(snap_dir: Path) -> None:
-    """Update the in-memory config and persist the backup location."""
+    """Update in-memory config, persist to disk, and update the project env var."""
     with _cfg_lock:
         CFG["snapshot_dir"] = str(snap_dir)
     lifecycle.save_backup_config(CFG, snap_dir)
+    # Push the new path to the Domino project env var so it survives restarts.
+    db_id = CFG.get("db_id", "")
+    project_id = os.environ.get("DOMINO_PROJECT_ID", "")
+    api_key = os.environ.get("DOMINO_USER_API_KEY", "")
+    api_proxy = os.environ.get("DOMINO_API_PROXY", "http://localhost:8899")
+    if db_id and project_id and api_key:
+        snap_var = f"DD_SNAPSHOT_{db_id.replace('-', '_').upper()}"
+        try:
+            requests.post(
+                f"{api_proxy}/v4/projects/{project_id}/environmentVariables",
+                json={"name": snap_var, "value": str(snap_dir)},
+                headers={"X-Domino-Api-Key": api_key},
+                timeout=10,
+            )
+        except Exception:
+            pass
 
 
 def _last_snapshot_info(snap_dir: str) -> tuple[str, str]:

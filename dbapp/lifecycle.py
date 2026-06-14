@@ -186,19 +186,23 @@ INITDB = "/usr/lib/postgresql/16/bin/initdb"
 
 
 def snapshot_path(cfg: dict) -> Path:
-    """Where this DB's snapshots live. Always a subdir of the project's default
-    dataset on this Domino instance (DOMINO_DATASETS_DIR=/mnt/data), keyed by
-    db_id so multiple DBs in one project don't collide.
+    """Where this DB's snapshots live.
 
-    Single source of truth — lifecycle.py uses it for restore, snapshotter
-    reads $DD_SNAPSHOT_DIR (which we set from this).
+    Reads DD_SNAPSHOT_<DB_ID_UPPER> from the project's environment variables
+    (set by the wizard at creation time via the Domino project env vars API).
+    Falls back to the project dataset path derived from DOMINO_PROJECT_NAME.
     """
-    explicit = cfg.get("snapshot_dir") or os.environ.get("DD_SNAPSHOT_DIR")
+    db_id = cfg["db_id"]
+    # cfg["snapshot_dir"] is set by load_backup_override (user edits via UI persist here).
+    if cfg.get("snapshot_dir"):
+        return Path(cfg["snapshot_dir"])
+    snap_var = f"DD_SNAPSHOT_{db_id.replace('-', '_').upper()}"
+    explicit = os.environ.get(snap_var) or os.environ.get("DD_SNAPSHOT_DIR")
     if explicit:
         return Path(explicit)
     base = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
     project = os.environ.get("DOMINO_PROJECT_NAME", "default")
-    return Path(base) / project / f"db-{cfg['db_id']}"
+    return Path(base) / project / f"db-{db_id}"
 
 
 _BACKUP_OVERRIDE = Path("/tmp/dd-backup-override.json")

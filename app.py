@@ -925,12 +925,27 @@ def api_build_environment(engine: str):
         else:
             yield sse("step", msg=f"Creating new environment '{canonical_name}'")
             try:
-                env_id = dapi.create_environment(canonical_name, image, visibility="Private")
+                env_id = dapi.create_environment(canonical_name, image, visibility="Global")
             except Exception as e:
                 yield sse("error", msg="create_environment failed", detail=str(e))
                 return
             action = "created"
             yield sse("ok", msg=f"Created env {env_id}", ms=since(t2))
+
+        # Make the env usable from OTHER projects. DB Apps are created in the
+        # user's TARGET project, not here — a Private env there is invisible, so
+        # Domino silently falls back to that project's default DSE (no /opt/dd)
+        # and boot dies with "/opt/dd/app.sh: No such file or directory". Global
+        # fixes that and is idempotent. We set it explicitly (not just at create
+        # time) so re-running Setup also repairs an env that was created Private
+        # by an earlier build.
+        try:
+            dapi.set_environment_visibility(env_id, visibility="Global")
+            yield sse("ok", msg="Visibility set to Global — usable from any project")
+        except Exception as e:
+            yield sse("warn", msg=f"Could not set visibility to Global: {e} — set it "
+                                  f"manually in the environment's Settings, or cross-project "
+                                  f"DBs will boot on the wrong image")
 
         # 3. Add the Dockerfile revision
         t3 = time.monotonic()

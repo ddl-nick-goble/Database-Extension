@@ -157,12 +157,18 @@ def find_environment_by_name(name: str) -> str | None:
     return None
 
 
-def set_environment_visibility(env_id: str, owner_id: str, visibility: str = "Organization") -> None:
-    """Set the visibility of an environment.  Raises DominoApiError on failure."""
-    _post(f"/v4/environments/{env_id}/visibility", json={
-        "visibility": visibility,
-        "ownerId": owner_id,
-    })
+def set_environment_visibility(env_id: str, owner_id: str | None = None,
+                               visibility: str = "Organization") -> None:
+    """Set the visibility of an environment.  Raises DominoApiError on failure.
+
+    ownerId is optional (the API marks it nullable) — it scopes Organization
+    visibility to a specific org. Omit it for Global/Private. Valid values:
+    "Global", "Organization", "Private".
+    """
+    body: dict = {"visibility": visibility}
+    if owner_id:
+        body["ownerId"] = owner_id
+    _post(f"/v4/environments/{env_id}/visibility", json=body)
 
 
 def create_environment(name: str, image: str, visibility: str = "Global") -> str:

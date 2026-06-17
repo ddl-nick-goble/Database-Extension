@@ -79,6 +79,44 @@ def _backup_dataset_paths(full_name: str) -> tuple[str, str]:
     return ds_name, f"{datasets_base}/{ds_name}"
 
 
+def _pin_dockerfile_to_commit(dockerfile: str) -> tuple[str, str]:
+    """Pin an env Dockerfile's code-pull to the wizard's CURRENT commit.
+
+    The baked Dockerfile pulls our code from codeload .../refs/heads/main with a
+    fixed RUN command. Docker caches that layer by command text, so it never
+    re-pulls when main advances — env "rebuilds" are silent cache hits that bake
+    stale code (the "still old lifecycle after rebuild" trap). Pinning the URL +
+    extracted dir to a specific commit SHA changes the layer hash whenever the
+    code changes, busting the cache, and guarantees the DB image runs the SAME
+    code as the wizard that built it.
+
+    Falls back to main + a one-shot cache-bust token if the SHA is unavailable.
+    Returns (patched_dockerfile, ref_label_for_display).
+    """
+    import subprocess
+    sha = ""
+    try:
+        sha = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        sha = ""
+    if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha.lower()):
+        df = dockerfile.replace("tar.gz/refs/heads/main", f"tar.gz/{sha}")
+        df = df.replace("Database-Extension-main", f"Database-Extension-{sha}")
+        return df, sha[:10]
+    # Couldn't resolve a SHA — keep main but force a fresh layer so the rebuild
+    # can't be a silent cache hit.
+    token = str(int(time.time()))
+    df = dockerfile.replace(
+        "RUN mkdir -p /opt/dd &&",
+        f"RUN echo dd-cachebust={token} && mkdir -p /opt/dd &&",
+        1,
+    )
+    return df, f"main (cachebust {token})"
+
+
 def _config_pre_run_script(app_name: str, config_json: str) -> str:
     """Build a shell pre-run script that lands this DB's config where the
     lifecycle will find it on FIRST boot — before any per-DB dataset we create
@@ -904,7 +942,9 @@ def api_build_environment(engine: str):
     df_path = REPO_ROOT / "envs" / canonical_name / "Dockerfile"
     if not df_path.exists():
         return jsonify({"error": f"Dockerfile not found at {df_path}"}), 400
-    dockerfile = df_path.read_text()
+    # Pin the code-pull to the wizard's current commit so the rebuild can't be a
+    # silent Docker cache hit that bakes stale lifecycle code into /opt/dd.
+    dockerfile, pinned_ref = _pin_dockerfile_to_commit(df_path.read_text())
 
     def stream():
         def sse(kind, **payload):
@@ -926,6 +966,8 @@ def api_build_environment(engine: str):
             yield sse("error", msg="Could not fetch default environment image", detail=str(e))
             return
         yield sse("ok", msg=f"Base image: {image}", ms=since(t_total))
+        yield sse("ok", msg=f"Baking code pinned to commit {pinned_ref} "
+                            f"(cache-busted — this rebuild will pull fresh code)")
 
         # 2. Find or create the environment
         t2 = time.monotonic()

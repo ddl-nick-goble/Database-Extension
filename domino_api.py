@@ -478,6 +478,23 @@ def get_app(app_id: str) -> dict:
     return _get(f"/api/apps/beta/apps/{app_id}")
 
 
+def fetch_app_logs(
+    app_id: str, version_id: str, instance_id: str, offset: int = 0, limit: int = 10000
+) -> dict:
+    """Real-time instance logs for a running/spinning-up app.
+
+    URL pattern confirmed from Domino UI DevTools:
+      GET /api/apps/beta/apps/{appId}/versions/{versionId}/instances/{instanceId}/realTimeLogs
+      ?limit=<n>&offset=<n>
+    Returns the raw payload: {logContent: [{timestamp, logType, log, size}], isComplete, pagination}.
+    """
+    path = (
+        f"/api/apps/beta/apps/{app_id}"
+        f"/versions/{version_id}/instances/{instance_id}/realTimeLogs"
+    )
+    return _get(path, params={"limit": limit, "offset": offset})
+
+
 def stop_app(app_id: str) -> dict:
     """Stop the running instance of an app via the v4 modelProducts API
     (same reasoning as start_app)."""

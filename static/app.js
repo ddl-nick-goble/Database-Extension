@@ -22,6 +22,10 @@ const state = {
     envCards: {},      // engine name -> latest row data (skeleton spec, then v4 detail)
     envPollers: {},    // engine name -> setTimeout id for in-progress build polling
     envLoadToken: 0,   // bumped each (re)load so stale in-flight fetches drop themselves
+    dbPollers: {},     // app id -> setTimeout id for spinning-up DB status/log polling
+    dbLogOffsets: {},  // app id -> realTimeLogs offset already fetched
+    dbLogSeen: {},     // app id -> latest log timestamp shown (dedupe guard)
+    dbLoadToken: 0,    // bumped on full DB (re)render so stale per-card work drops itself
     wizard: {
         step: 1,
         engine: null,
@@ -141,22 +145,50 @@ function renderEngineCards() {
 // =====================================================================
 // Dashboard
 // =====================================================================
+const DB_POLL_MS = 3500;  // status/log cadence for a DB that's still spinning up
+
+// Statuses that mean "still settling" — these cards poll status + stream logs
+// until they reach a terminal state (running / stopped / failed).
+const DB_TRANSITION_STATES = [
+    "pending", "starting", "preparing", "queued", "building", "pulling", "stopping",
+];
+function dbIsTransitioning(status) {
+    return DB_TRANSITION_STATES.includes(String(status).toLowerCase());
+}
+function dbStatusBadgeClass(status) {
+    const s = String(status).toLowerCase();
+    if (s === "running") return "badge-running";
+    if (dbIsTransitioning(s)) return "badge-starting";
+    if (["failed", "error"].includes(s)) return "badge-error";
+    if (s === "never started") return "badge-pending";
+    return "badge-stopped";
+}
+
 async function refreshDatabases() {
-    const tbody = document.getElementById("db-tbody");
-    tbody.innerHTML = `<tr><td colspan="8" class="muted">Loading…</td></tr>`;
+    const container = document.getElementById("db-cards");
+    stopAllDbPolling();
+    state.dbLoadToken++;
+    container.innerHTML = `<p class="muted">Loading…</p>`;
     try {
         const data = await api("/databases");
         state.databases = data.databases || [];
         state.summary   = data.summary   || {};
     } catch (e) {
-        tbody.innerHTML = `<tr><td colspan="8" class="muted">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
+        container.innerHTML = `<p class="muted">Failed to load: ${escapeHtml(e.message)}</p>`;
         return;
     }
-    renderTable();
+    renderDbCards();
 }
 
-function renderTable() {
-    const tbody = document.getElementById("db-tbody");
+// Full render of the DB grid (applies filters). Resets per-card log tracking,
+// then arms async status/log polling for every visible spinning-up card.
+function renderDbCards() {
+    const container = document.getElementById("db-cards");
+    if (!container) return;
+    stopAllDbPolling();
+    state.dbLogOffsets = {};
+    state.dbLogSeen = {};
+
     const engineFilter = document.getElementById("filter-engine").value;
     const statusFilter = document.getElementById("filter-status").value;
     const q = document.getElementById("filter-search").value.toLowerCase();
@@ -171,61 +203,202 @@ function renderTable() {
     });
 
     if (!rows.length) {
-        tbody.innerHTML = `<tr><td colspan="8" class="muted">No databases yet. Click <b>+ New Database</b> to create one.</td></tr>`;
+        container.innerHTML = `<p class="muted">No databases yet. Click <b>+ New Database</b> to create one.</p>`;
         return;
     }
 
-    tbody.innerHTML = rows.map(db => {
-        // Use a uniform `badge-<engine>` class — style.css has rules for
-        // each registered engine name (postgres / mongo / mysql / redis).
-        const eb = `badge-${db.engine}`;
-        const sLower = String(db.status).toLowerCase();
-        const sb =
-            sLower === "running"                                ? "badge-running" :
-            ["starting", "pending"].includes(sLower)            ? "badge-starting" :
-            ["failed", "error"].includes(sLower)                ? "badge-error" :
-            sLower === "never started"                          ? "badge-pending" :
-                                                                  "badge-stopped";
-        const conn = db.url
-            ? `<a href="${escapeHtml(db.browserUrl || db.url)}" target="_blank" rel="noopener">Open DB ↗</a>`
-            : `<span class="muted">—</span>`;
-        const configLink = db.configUrl
-            ? `<a href="${escapeHtml(db.configUrl)}" target="_blank" rel="noopener">Open Setup ↗</a>`
-            : `<span class="muted">—</span>`;
-        const created = db.createdAt ? formatDate(db.createdAt) : "<span class=\"muted\">—</span>";
-        const isRunning = db.isRunning;
-        const isTransitioning = ["pending", "starting", "preparing", "queued"].includes(sLower);
-        const actionBtns = isRunning
-            ? `<button class="btn btn-secondary btn-small" data-stop="${db.id}">Stop</button>`
-            : isTransitioning
-                ? `<button class="btn btn-secondary btn-small" disabled title="DB is ${escapeHtml(db.status)} — wait for it to settle">Start</button>`
-                : `<button class="btn btn-secondary btn-small" data-start="${db.id}">Start</button>`;
-        return `
-            <tr>
-                <td><b>${escapeHtml(db.name)}</b></td>
-                <td><span class="badge ${eb}">${escapeHtml(db.engine)}</span></td>
-                <td><span class="badge ${sb}">${escapeHtml(db.status)}</span></td>
-                <td>${escapeHtml(db.owner || "")}</td>
-                <td>${created}</td>
-                <td>${conn}</td>
-                <td>${configLink}</td>
-                <td class="td-actions">
-                    ${actionBtns}
-                    <button class="btn btn-secondary btn-small btn-danger" data-delete="${db.id}">Delete</button>
-                </td>
-            </tr>
-        `;
-    }).join("");
+    container.innerHTML = rows.map(dbCardShell).join("");
+    bindDbCardActions(container);
+    rows.forEach(db => maybePollDbCard(db.id));
+}
 
-    tbody.querySelectorAll("[data-stop]").forEach(btn => {
-        btn.onclick = () => stopDb(btn.getAttribute("data-stop"));
+// Stable card wrapper: a replaceable body plus a sibling <pre> for live logs
+// that survives body re-renders (mirrors the environment cards).
+function dbCardShell(db) {
+    const id = escapeHtml(db.id);
+    return `
+    <div class="db-card" id="db-card-${id}">
+        <div class="db-card-body" id="db-body-${id}">
+            ${dbCardBodyHtml(db)}
+        </div>
+        <pre class="provision-log hidden" id="db-log-${id}"></pre>
+    </div>`;
+}
+
+function dbCardBodyHtml(db) {
+    const id = escapeHtml(db.id);
+    const eb = `badge-${db.engine}`;
+    const sb = dbStatusBadgeClass(db.status);
+    const transitioning = dbIsTransitioning(db.status);
+    const statusInner = transitioning
+        ? `<span class="db-spin"></span>${escapeHtml(db.status)}`
+        : escapeHtml(db.status);
+
+    const conn = db.url
+        ? `<a class="btn btn-secondary btn-small" href="${escapeHtml(db.browserUrl || db.url)}" target="_blank" rel="noopener">Open DB ↗</a>`
+        : `<span class="muted">—</span>`;
+    const configLink = db.configUrl
+        ? `<a class="btn btn-secondary btn-small" href="${escapeHtml(db.configUrl)}" target="_blank" rel="noopener">Open Setup ↗</a>`
+        : `<span class="muted">—</span>`;
+    const created = db.createdAt ? formatDate(db.createdAt) : `<span class="muted">—</span>`;
+
+    const isRunning = String(db.status).toLowerCase() === "running" || db.isRunning;
+    const actionBtns = isRunning
+        ? `<button class="btn btn-secondary btn-small" data-stop="${id}">Stop</button>`
+        : transitioning
+            ? `<button class="btn btn-secondary btn-small" disabled title="DB is ${escapeHtml(db.status)} — wait for it to settle">Start</button>`
+            : `<button class="btn btn-secondary btn-small" data-start="${id}">Start</button>`;
+
+    return `
+        <div class="db-card-header">
+            <div class="db-card-identity">
+                <span class="db-card-name">${escapeHtml(db.name)}</span>
+                <span class="badge ${eb}">${escapeHtml(db.engine)}</span>
+            </div>
+            <span class="badge ${sb} db-status-badge">${statusInner}</span>
+        </div>
+        <div class="db-card-meta">
+            <div class="env-meta-row"><span class="env-meta-key">Owner</span><span class="env-meta-val">${escapeHtml(db.owner || "—")}</span></div>
+            <div class="env-meta-row"><span class="env-meta-key">Created</span><span class="env-meta-val">${created}</span></div>
+            <div class="env-meta-row"><span class="env-meta-key">Connection</span><span class="env-meta-val">${conn}</span></div>
+            <div class="env-meta-row"><span class="env-meta-key">Configuration</span><span class="env-meta-val">${configLink}</span></div>
+        </div>
+        <div class="db-card-actions">
+            ${actionBtns}
+            <button class="btn btn-secondary btn-small" data-logs="${id}">Logs</button>
+            <button class="btn btn-secondary btn-small btn-danger" data-delete="${id}">Delete</button>
+        </div>`;
+}
+
+// Re-render only one card's body, preserving its sibling log <pre>.
+function renderDbCardBody(id) {
+    const body = document.getElementById(`db-body-${id}`);
+    const db = state.databases.find(d => d.id === id);
+    if (!body || !db) return;
+    body.innerHTML = dbCardBodyHtml(db);
+    bindDbCardActions(body);
+}
+
+function bindDbCardActions(scope) {
+    scope.querySelectorAll("[data-stop]").forEach(b => b.onclick = () => stopDb(b.getAttribute("data-stop")));
+    scope.querySelectorAll("[data-start]").forEach(b => b.onclick = () => startDb(b.getAttribute("data-start")));
+    scope.querySelectorAll("[data-delete]").forEach(b => b.onclick = () => deleteDb(b.getAttribute("data-delete")));
+    scope.querySelectorAll("[data-logs]").forEach(b => b.onclick = () => toggleDbLogs(b.getAttribute("data-logs")));
+}
+
+// ---- per-card async status + live logs --------------------------------
+
+// Arm polling for a card only if it's mid-transition; reveals the live log
+// and kicks the first tick immediately.
+function maybePollDbCard(id, token = state.dbLoadToken) {
+    stopDbPolling(id);
+    if (!document.getElementById(`db-card-${id}`)) return;  // not currently rendered
+    const db = state.databases.find(d => d.id === id);
+    if (!db || !dbIsTransitioning(db.status)) return;
+    const logEl = document.getElementById(`db-log-${id}`);
+    if (logEl) logEl.classList.remove("hidden");
+    pollDbCardTick(id, token);
+}
+
+async function pollDbCardTick(id, token) {
+    if (token !== state.dbLoadToken) return;
+    await refreshDbCardStatus(id, token);
+    await fetchDbLogs(id, token);
+    if (token !== state.dbLoadToken) return;
+    const db = state.databases.find(d => d.id === id);
+    if (db && dbIsTransitioning(db.status)) {
+        state.dbPollers[id] = setTimeout(() => pollDbCardTick(id, token), DB_POLL_MS);
+    } else {
+        stopDbPolling(id);  // reached a terminal state — settle the card
+    }
+}
+
+// Fetch one DB's live status and merge the volatile fields into state, then
+// re-render just that card. Transient errors are swallowed — next tick retries.
+async function refreshDbCardStatus(id, token) {
+    let st;
+    try {
+        st = await api(`/databases/${encodeURIComponent(id)}/status`);
+    } catch (e) {
+        return;
+    }
+    if (token !== state.dbLoadToken || !st || st.error) return;
+    const db = state.databases.find(d => d.id === id);
+    if (!db) return;
+    if (st.status) db.status = st.status;
+    if (st.instanceStatus !== undefined) db.instanceStatus = st.instanceStatus;
+    db.isRunning = !!st.isRunning;
+    if (st.versionId) db.versionId = st.versionId;
+    if (st.instanceId) db.instanceId = st.instanceId;
+    if (st.url) db.url = st.url;
+    renderDbCardBody(id);
+}
+
+// Pull new real-time log lines (incremental by offset, deduped by timestamp)
+// and append them to the card's log panel.
+async function fetchDbLogs(id, token) {
+    const db = state.databases.find(d => d.id === id);
+    const logEl = document.getElementById(`db-log-${id}`);
+    if (!db || !logEl) return;
+    const offset = state.dbLogOffsets[id] || 0;
+    const params = new URLSearchParams({ offset: String(offset) });
+    if (db.versionId)  params.set("versionId", db.versionId);
+    if (db.instanceId) params.set("instanceId", db.instanceId);
+    let data;
+    try {
+        data = await api(`/databases/${encodeURIComponent(id)}/logs?${params.toString()}`);
+    } catch (e) {
+        return;
+    }
+    if (token !== state.dbLoadToken) return;
+    const lines = (data && data.logContent) || [];
+    const lastSeen = state.dbLogSeen[id] || 0;
+    const fresh = lines.filter(l => (l.timestamp || 0) > lastSeen);
+    if (fresh.length) {
+        appendDbLogLines(logEl, fresh);
+        state.dbLogSeen[id] = Math.max(lastSeen, ...fresh.map(l => l.timestamp || 0));
+        logEl.classList.remove("hidden");
+    }
+    state.dbLogOffsets[id] = offset + lines.length;
+}
+
+function appendDbLogLines(logEl, lines) {
+    lines.forEach(item => {
+        // Logs carry carriage returns / progress redraws — strip to one clean line.
+        const text = String(item.log || "").replace(/\r/g, "").replace(/\n+$/, "");
+        if (!text.trim()) return;
+        const span = document.createElement("span");
+        if (item.logType === "stderr") span.className = "err";
+        span.textContent = text;
+        logEl.appendChild(span);
+        logEl.appendChild(document.createTextNode("\n"));
     });
-    tbody.querySelectorAll("[data-start]").forEach(btn => {
-        btn.onclick = () => startDb(btn.getAttribute("data-start"));
-    });
-    tbody.querySelectorAll("[data-delete]").forEach(btn => {
-        btn.onclick = () => deleteDb(btn.getAttribute("data-delete"));
-    });
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+async function toggleDbLogs(id) {
+    const logEl = document.getElementById(`db-log-${id}`);
+    if (!logEl) return;
+    const willShow = logEl.classList.contains("hidden");
+    logEl.classList.toggle("hidden");
+    if (willShow && !logEl.childNodes.length) {
+        await fetchDbLogs(id, state.dbLoadToken);
+        if (!logEl.childNodes.length) logEl.textContent = "(no logs available yet)";
+    }
+}
+
+function stopDbPolling(id) {
+    if (state.dbPollers[id]) {
+        clearTimeout(state.dbPollers[id]);
+        delete state.dbPollers[id];
+    }
+}
+function stopAllDbPolling() {
+    Object.keys(state.dbPollers).forEach(stopDbPolling);
+}
+// Re-entering the databases tab: resume polling any still-spinning-up cards.
+function rearmDbPolling() {
+    state.databases.forEach(db => maybePollDbCard(db.id));
 }
 
 function formatDate(s) {
@@ -850,6 +1023,8 @@ function bindTabs() {
             } else {
                 stopAllEnvPolling();       // don't poll while the tab is hidden
             }
+            if (tab === "databases") rearmDbPolling();  // resume spinning-up cards
+            else stopAllDbPolling();                    // pause while hidden
         };
     });
 }
@@ -862,9 +1037,9 @@ function bindUi() {
     document.getElementById("btn-next").onclick      = submitWizard;
     document.getElementById("btn-refresh").onclick   = refreshDatabases;
     document.getElementById("btn-refresh-envs").onclick = loadEnvironments;
-    document.getElementById("filter-engine").onchange = renderTable;
-    document.getElementById("filter-status").onchange = renderTable;
-    document.getElementById("filter-search").oninput  = renderTable;
+    document.getElementById("filter-engine").onchange = renderDbCards;
+    document.getElementById("filter-status").onchange = renderDbCards;
+    document.getElementById("filter-search").oninput  = renderDbCards;
 
     // Live wiring — every form-field edit immediately flows into
     // state.wizard and is reflected in the Review pane.

@@ -487,6 +487,71 @@ code {
     max-width: 680px;
 }
 
+/* ============== DATABASE CARDS ============== */
+#db-cards {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+.db-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px 22px;
+}
+.db-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 14px;
+}
+.db-card-identity {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+.db-card-name {
+    font-size: 15px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.db-card-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 14px;
+}
+.db-card-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.db-status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.db-spin {
+    display: inline-block;
+    width: 9px; height: 9px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: env-spin 0.7s linear infinite;
+}
+.db-card .provision-log {
+    margin-top: 12px;
+    max-height: 240px;
+}
+@media (max-width: 720px) {
+    #db-cards { grid-template-columns: 1fr; }
+}
+
 #env-cards {
     display: grid;
     grid-template-columns: 1fr 1fr;

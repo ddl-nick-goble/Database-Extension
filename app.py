@@ -49,21 +49,68 @@ except OSError as e:
     )
 
 
-def _config_pre_run_script(app_name: str, config_json: str) -> str:
-    """Build a shell pre-run script that writes the config to /mnt/code/dbapps/.
+def _dataset_name(full_name: str) -> str:
+    """Domino-safe dataset name for a DB's dedicated backup dataset.
 
-    Uses base64 so the JSON is safe inside a here-doc regardless of quoting.
-    This is the most reliable cross-project config delivery — it runs
-    unconditionally in the container before the lifecycle starts.
+    One dataset per DB. Dataset names must be filesystem- and API-safe:
+    lowercase alphanumerics and hyphens, starting with an alphanumeric, and
+    length-capped. e.g. app 'pg-Market Data' -> dataset 'db-pg-market-data'.
+    """
+    import re
+    cleaned = re.sub(r"[^a-z0-9-]+", "-", f"db-{full_name}".lower())
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+    if not cleaned or not cleaned[0].isalnum():
+        cleaned = ("db-" + cleaned).strip("-") or "db"
+    return cleaned[:100]
+
+
+def _backup_dataset_paths(full_name: str) -> tuple[str, str]:
+    """Return (dataset_name, snapshot_dir) for a DB's dedicated backup dataset.
+
+    Local datasets mount at <DATASETS_DIR>/<dataset-name> (git-based projects
+    use /mnt/data; DFS projects use /domino/datasets/local — both surfaced via
+    DOMINO_DATASETS_DIR). The snapshot tree lives at the dataset *root* so that
+    lifecycle.load_backup_override()'s {DATASETS_DIR}/*/_dd_backup_config.json
+    scan finds the marker file one level down.
+    """
+    ds_name = _dataset_name(full_name)
+    datasets_base = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
+    return ds_name, f"{datasets_base}/{ds_name}"
+
+
+def _config_pre_run_script(app_name: str, config_json: str) -> str:
+    """Build a shell pre-run script that lands this DB's config where the
+    lifecycle will find it on FIRST boot — before any per-DB dataset we create
+    is mounted (a freshly-created dataset only mounts on the App's next start).
+
+    Writes the config to two locations that are always present in the target
+    project's container at boot:
+
+      1. /mnt/code/dbapps/<name>.json
+            repo-relative fallback dir (lifecycle searches it directly).
+      2. <DATASETS_DIR>/<PROJECT_NAME>/_dd_configs/<name>.json
+            the project's DEFAULT dataset, which is mounted on first boot and
+            is exactly the DBAPPS_DIR that lifecycle.find_config() searches.
+            This is the durable, cross-project-safe channel — the previous
+            single /mnt/code write could go missing and left boot with no
+            config at all.
+
+    It also (re)writes the entry launcher so the App boots into /opt/dd/app.sh.
+    base64 keeps the JSON intact inside the shell regardless of quoting; the
+    default-dataset write is best-effort so a read-only mount never blocks boot.
     """
     import base64
     encoded = base64.b64encode(config_json.encode()).decode()
     return (
-        "mkdir -p /mnt/code/dbapps"
-        f" && printf '%s' '{encoded}' | base64 -d > /mnt/code/dbapps/{app_name}.json"
-        " && echo '#!/usr/bin/env bash' > /mnt/code/dd-db-launcher.sh"
-        " && echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/dd-db-launcher.sh"
-        " && chmod +x /mnt/code/dd-db-launcher.sh"
+        f"ENC='{encoded}'\n"
+        "mkdir -p /mnt/code/dbapps\n"
+        f'printf %s "$ENC" | base64 -d > /mnt/code/dbapps/{app_name}.json\n'
+        'DD_CFG_DIR="${DOMINO_DATASETS_DIR:-/mnt/data}/${DOMINO_PROJECT_NAME:-default}/_dd_configs"\n'
+        'mkdir -p "$DD_CFG_DIR" 2>/dev/null || true\n'
+        f'printf %s "$ENC" | base64 -d > "$DD_CFG_DIR/{app_name}.json" 2>/dev/null || true\n'
+        "echo '#!/usr/bin/env bash' > /mnt/code/dd-db-launcher.sh\n"
+        "echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/dd-db-launcher.sh\n"
+        "chmod +x /mnt/code/dd-db-launcher.sh\n"
     )
 
 
@@ -231,12 +278,16 @@ def _config_url(a: dict) -> str:
 
 
 def _shape(a: dict) -> dict:
-    status = a.get("status") or "Unknown"
+    cv = a.get("currentVersion") or {}
+    ci = cv.get("currentInstance") or {}
+    inst_status = ci.get("status") or ""
+    status = a.get("status") or inst_status or "Unknown"
     return {
         "id": a.get("id"),
         "name": a.get("name"),
         "engine": _engine(a),
         "status": status,
+        "instanceStatus": inst_status,
         "createdAt": a.get("createdAt") or a.get("created"),
         "lastUpdated": a.get("lastUpdated"),
         "owner": (a.get("publisher") or {}).get("name") or dapi.PROJECT_OWNER,
@@ -244,9 +295,34 @@ def _shape(a: dict) -> dict:
         "url": dapi.app_url(a),
         "browserUrl": _browser_url(a),
         "configUrl": _config_url(a),
-        "environmentId": a.get("environmentId"),
-        "hardwareTierId": a.get("hardwareTierId"),
-        "isRunning": status.lower() == "running",
+        "environmentId": a.get("environmentId") or cv.get("environmentId"),
+        "hardwareTierId": a.get("hardwareTierId") or cv.get("hardwareTierId"),
+        # IDs the frontend needs to stream this instance's real-time logs.
+        "versionId": cv.get("id", ""),
+        "instanceId": ci.get("id", ""),
+        "isRunning": (inst_status or status).lower() == "running",
+    }
+
+
+def _shape_status(a: dict) -> dict:
+    """Lean live-status payload for one app, from the beta get_app object.
+
+    Only the volatile fields a card needs to update in place — status,
+    running-ness, the running URL once it appears, and the version/instance
+    IDs that unlock real-time logs.
+    """
+    cv = a.get("currentVersion") or {}
+    ci = cv.get("currentInstance") or {}
+    inst_status = ci.get("status") or ""
+    status = a.get("status") or inst_status or "Unknown"
+    return {
+        "id": a.get("id"),
+        "status": status,
+        "instanceStatus": inst_status,
+        "isRunning": (inst_status or status).lower() == "running",
+        "versionId": cv.get("id", ""),
+        "instanceId": ci.get("id", ""),
+        "url": dapi.app_url(a),
     }
 
 
@@ -332,25 +408,46 @@ def api_create_database():
             return
         yield sse("ok", msg=f"Name '{full_name}' is available", ms=since(t1))
 
-        # 2. Build config — all lifecycle-required fields are known before the
-        #    app exists. tunnel_url/app_id are NOT needed by the lifecycle at
-        #    boot; they're display-only in the router status page.
+        # 2. Create the dedicated backup dataset in the TARGET project.
+        #    One dataset per DB. It mounts on the App's NEXT start (a freshly
+        #    created dataset is not mounted on first boot), so the DB boots from
+        #    the inline config and backups become durable after one restart.
+        #    The dataset must live in the target project so the App — which runs
+        #    there — can mount it; creating it in the wizard's own project would
+        #    be invisible to the DB container (the bug this fixes).
+        t_ds = time.monotonic()
+        ds_name, snapshot_dir = _backup_dataset_paths(full_name)
+        snap_var = f"DD_SNAPSHOT_{full_name.replace('-', '_').upper()}"
+        yield sse("step", msg=f"Creating backup dataset '{ds_name}' in target project", phase="dataset")
+        try:
+            dapi.create_dataset(ds_name, project_id=target_project_id)
+            yield sse("ok",
+                      msg=f"Backup dataset '{ds_name}' ready — backups → {snapshot_dir} "
+                          f"(mounts on the App's next restart)",
+                      ms=since(t_ds))
+        except dapi.DominoApiError as e:
+            if e.status == 409 or "exist" in (e.body or "").lower():
+                yield sse("ok", msg=f"Backup dataset '{ds_name}' already exists — reusing", ms=since(t_ds))
+            else:
+                yield sse("warn",
+                          msg=f"Could not create backup dataset '{ds_name}' (HTTP {e.status}) — "
+                              f"the DB will boot, but backups won't persist until a dataset is "
+                              f"configured from the DB's Backup tab",
+                          detail=e.body[:600], status=e.status)
+        except Exception as e:
+            yield sse("warn",
+                      msg=f"Could not create backup dataset '{ds_name}': {e} — "
+                          f"the DB will boot; configure backups later from the Backup tab")
+
+        # 3. Build config — all lifecycle-required fields are known before the
+        #    app exists. snapshot_dir is baked in so it travels through every
+        #    config-delivery channel and lifecycle.snapshot_path() uses it
+        #    directly (no reliance on the project env var or path guessing).
+        #    tunnel_url/app_id are NOT needed by the lifecycle at boot; they're
+        #    display-only in the router status page.
         t2 = time.monotonic()
         config_path = DBAPPS_DIR / f"{full_name}.json"
         yield sse("step", msg=f"Building config for {full_name}", phase="config")
-
-        if target_project_id == dapi.PROJECT_ID:
-            target_project_name = dapi.PROJECT_NAME
-        else:
-            try:
-                proj = dapi.get_project(target_project_id)
-                target_project_name = proj.get("name") or dapi.PROJECT_NAME
-            except Exception:
-                target_project_name = dapi.PROJECT_NAME
-
-        datasets_base = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
-        snapshot_dir = f"{datasets_base}/{target_project_name}/db-{full_name}"
-        snap_var = f"DD_SNAPSHOT_{full_name.replace('-', '_').upper()}"
 
         cfg = {
             "engine": engine,
@@ -360,6 +457,7 @@ def api_create_database():
             "port": adapter.default_port,
             "admin_port": 8978,
             "snapshot_interval_min": snapshot_interval_min,
+            "snapshot_dir": snapshot_dir,
         }
 
         # Embed config in the app-level pre-run script at CREATE time.
@@ -370,7 +468,7 @@ def api_create_database():
 
         yield sse("ok", msg="Config built", ms=since(t2))
 
-        # 3. Create the Domino App with the pre-run script baked in.
+        # 4. Create the Domino App with the pre-run script baked in.
         t3 = time.monotonic()
         yield sse("step", msg=f"Creating app (engine={engine})", phase="create")
         log.info("provisioning %s engine=%s env=%s hw=%s", full_name, engine, env_id, hw_id)
@@ -397,7 +495,7 @@ def api_create_database():
         app_version_id = (a.get("currentVersion") or {}).get("id", "")
         yield sse("ok", msg=f"App created (id={app_id_str})", ms=since(t3))
 
-        # 4. Now that we have the app ID, pin tunnel_url into the local
+        # 5. Now that we have the app ID, pin tunnel_url into the local
         #    fallback config (wizard's own dataset only — for restart recovery).
         t4 = time.monotonic()
         if app_id_str:
@@ -417,7 +515,7 @@ def api_create_database():
 
         yield sse("ok", msg="Config finalised", ms=since(t4))
 
-        # 5. Start — env+hw must be passed explicitly (create's version fields
+        # 6. Start — env+hw must be passed explicitly (create's version fields
         #    are silently dropped on some Domino builds). Retry up to 3×.
         start_ok = False
         for attempt in (1, 2, 3):
@@ -517,6 +615,60 @@ def api_start_database(app_id: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     return jsonify({"ok": True, "result": result})
+
+
+@app.route("/api/databases/<app_id>/status")
+def api_database_status(app_id: str):
+    """Live status for one DB app — polled per-card while it spins up.
+
+    Errors are returned in-band (HTTP 200 with an ``error`` field) so a
+    transient blip only affects that one card's next tick, never the grid.
+    """
+    try:
+        a = dapi.get_app(app_id)
+    except dapi.DominoApiError as e:
+        return jsonify({"id": app_id, "error": e.body[:500], "status": e.status}), 200
+    except Exception as e:
+        return jsonify({"id": app_id, "error": str(e)}), 200
+    return jsonify(_shape_status(a or {}))
+
+
+@app.route("/api/databases/<app_id>/logs")
+def api_database_logs(app_id: str):
+    """Real-time instance logs for one DB app, for the live spin-up view.
+
+    versionId/instanceId come from the card (it learned them from /status);
+    we resolve them via get_app only if the caller didn't supply them. The
+    response is Domino's realTimeLogs payload verbatim ({logContent, ...}).
+    """
+    version_id = request.args.get("versionId", "")
+    instance_id = request.args.get("instanceId", "")
+    try:
+        offset = int(request.args.get("offset", "0") or 0)
+    except ValueError:
+        offset = 0
+
+    if not (version_id and instance_id):
+        try:
+            a = dapi.get_app(app_id) or {}
+            cv = a.get("currentVersion") or {}
+            ci = cv.get("currentInstance") or {}
+            version_id = version_id or cv.get("id", "")
+            instance_id = instance_id or ci.get("id", "")
+        except Exception as e:
+            return jsonify({"logContent": [], "isComplete": False, "error": str(e)}), 200
+
+    if not (version_id and instance_id):
+        # Instance not scheduled yet — nothing to stream, tell the card to retry.
+        return jsonify({"logContent": [], "isComplete": False}), 200
+
+    try:
+        data = dapi.fetch_app_logs(app_id, version_id, instance_id, offset=offset)
+    except dapi.DominoApiError as e:
+        return jsonify({"logContent": [], "isComplete": False, "error": e.body[:500]}), 200
+    except Exception as e:
+        return jsonify({"logContent": [], "isComplete": False, "error": str(e)}), 200
+    return jsonify(data)
 
 
 # --------------------------------------------------------------------------

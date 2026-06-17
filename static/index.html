@@ -56,25 +56,9 @@
         <button class="btn btn-secondary" id="btn-refresh">Refresh</button>
     </section>
 
-    <!-- Table -->
-    <section class="table-wrap">
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>NAME</th>
-                    <th>ENGINE</th>
-                    <th>STATUS</th>
-                    <th>OWNER</th>
-                    <th>CREATED</th>
-                    <th>CONNECTION</th>
-                    <th>CONFIGURATION</th>
-                    <th class="th-actions">ACTIONS</th>
-                </tr>
-            </thead>
-            <tbody id="db-tbody">
-                <tr><td colspan="8" class="muted">Loading…</td></tr>
-            </tbody>
-        </table>
+    <!-- Cards — one per database, each refreshes its own status/logs async. -->
+    <section id="db-cards">
+        <p class="muted">Loading…</p>
     </section>
 
     </div><!-- /panel-databases -->

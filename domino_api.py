@@ -110,20 +110,30 @@ def list_environments() -> list[dict]:
 
 
 def list_datasets(project_id: str = "") -> list[dict]:
-    """List datasets for a project. Returns the inner `dataset` dicts."""
-    r = _get("/api/datasetrw/v2/datasets",
-             params={"projectIdsToInclude": project_id or PROJECT_ID})
+    """List datasets for a project. Returns the inner dataset detail dicts.
+
+    Uses the v1 datasetrw API — the only datasets endpoint exposed through the
+    public auth proxy on this Domino (v2 returns 404 "endpoint not found").
+    The v1 GET returns {datasets: [DatasetRwDetailsV1...], metadata}.
+    """
+    r = _get("/api/datasetrw/v1/datasets",
+             params={"projectId": project_id or PROJECT_ID})
     return [w.get("dataset", w) for w in (r.get("datasets", []) if isinstance(r, dict) else [])]
 
 
 def create_dataset(name: str, project_id: str = "") -> dict:
     """Create a new Domino dataset in the project. Returns the dataset object.
-    Raises DominoApiError on failure."""
-    r = _post("/api/datasetrw/v2/datasets", json={
+    Raises DominoApiError on failure.
+
+    Uses the v1 datasetrw API (v2 is not exposed through the public proxy).
+    Body schema NewDatasetRwV1 = {name, projectId, description?}; the response
+    is the DatasetRwEnvelopeV1 wrapper {dataset: {...}, metadata: {...}}.
+    """
+    r = _post("/api/datasetrw/v1/datasets", json={
         "name": name,
         "projectId": project_id or PROJECT_ID,
     })
-    # API may return {"dataset": {...}} or the object directly
+    # Envelope {"dataset": {...}} on v1; tolerate a bare object defensively.
     if isinstance(r, dict) and "dataset" in r:
         return r["dataset"]
     return r if isinstance(r, dict) else {}

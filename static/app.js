@@ -243,11 +243,13 @@ function dbCardBodyHtml(db) {
     const created = db.createdAt ? formatDate(db.createdAt) : `<span class="muted">—</span>`;
 
     const isRunning = String(db.status).toLowerCase() === "running" || db.isRunning;
+    // Mirror the environment cards: the launch action is the primary (filled)
+    // button; Stop/Logs are secondary; Delete keeps the danger treatment.
     const actionBtns = isRunning
         ? `<button class="btn btn-secondary btn-small" data-stop="${id}">Stop</button>`
         : transitioning
-            ? `<button class="btn btn-secondary btn-small" disabled title="DB is ${escapeHtml(db.status)} — wait for it to settle">Start</button>`
-            : `<button class="btn btn-secondary btn-small" data-start="${id}">Start</button>`;
+            ? `<button class="btn btn-primary btn-small" disabled title="DB is ${escapeHtml(db.status)} — wait for it to settle">Start</button>`
+            : `<button class="btn btn-primary btn-small" data-start="${id}">Start</button>`;
 
     return `
         <div class="db-card-header">

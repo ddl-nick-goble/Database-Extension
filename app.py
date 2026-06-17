@@ -12,7 +12,6 @@ import logging
 import os
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -568,22 +567,23 @@ def _fmt_bytes(n: int) -> str:
     return str(n)
 
 
-@app.route("/api/environments/status")
-def api_environments_status():
-    """Per-engine environment status for the Environments admin tab."""
+def _env_specs() -> list[dict]:
+    """Per-engine specs with env_id + resolution source. One list call, no v4.
+
+    This is the fast part of the old batched endpoint: identity + env-id
+    resolution for every engine, with no per-environment v4 detail fetches.
+    """
     try:
         all_envs = dapi.list_environments()
     except Exception as e:
-        log.warning("list_environments failed during /api/environments/status: %s", e)
+        log.warning("list_environments failed during env specs: %s", e)
         all_envs = []
 
     id_map = {
         e.get("name", ""): e.get("id", "")
         for e in all_envs if isinstance(e, dict)
     }
-    img_root = Path(app.static_folder) / "img"
 
-    # Build spec list — no API calls yet
     specs = []
     for a in engines.all_engines():
         specs.append(dict(
@@ -607,72 +607,99 @@ def api_environments_status():
             source = "byname" if env_id else "missing"
         s["env_id"] = env_id
         s["source"] = source
+    return specs
 
-    # Fetch v4 details for all envs that have an id — in parallel
-    def _fetch_v4(env_id: str) -> dict:
+
+def _build_env_row(s: dict, env_v4: dict) -> dict:
+    """Combine a spec with (possibly empty) v4 detail into one card row.
+
+    Called with ``env_v4={}`` this produces a valid *skeleton* row — identity,
+    env id, dockerfile — with blank detail fields. So the same shape serves
+    both the fast specs endpoint and the per-card status endpoint, and the
+    frontend can render the skeleton then swap in detail without reshaping.
+    """
+    img_root = Path(app.static_folder) / "img"
+    latest_rev = env_v4.get("latestRevision") or {}
+    rev_details = env_v4.get("latestRevisionDetails") or {}
+    docker_image = rev_details.get("dockerImage", "")
+    image_display = docker_image.split("/")[-1] if "/" in docker_image else docker_image
+    size_obj = rev_details.get("compressedImageSize") or {}
+    size_bytes = size_obj.get("value")
+    image_size = _fmt_bytes(int(size_bytes)) if size_bytes else ""
+    owner_obj = env_v4.get("owner") or {}
+
+    canonical_name = s["canonical_name"]
+    df_path = REPO_ROOT / "envs" / canonical_name / "Dockerfile"
+    dockerfile_text = ""
+    dockerfile_exists = df_path.exists()
+    if dockerfile_exists:
         try:
-            return dapi.get_environment(env_id) or {}
+            dockerfile_text = df_path.read_text()
+        except OSError:
+            pass
+
+    icon_png = s["icon_png"]
+    icon_path = img_root / icon_png if icon_png else None
+    env_id = s["env_id"]
+    return {
+        "name": s["name"],
+        "label": s["label"],
+        "icon": s["icon"],
+        "iconUrl": f"img/{icon_png}" if (icon_path and icon_path.exists()) else "",
+        "expectedEnvName": canonical_name,
+        "envId": env_id,
+        "envIdVar": s["env_id_var"],
+        "envIdSource": s["source"],
+        "latestRevision": latest_rev,
+        "revisionNumber": latest_rev.get("number"),
+        "revisionSummary": rev_details.get("summary", ""),
+        "dockerImage": docker_image,
+        "imageDisplay": image_display,
+        "imageSize": image_size,
+        "visibility": env_v4.get("visibility", ""),
+        "owner": owner_obj.get("username", ""),
+        "lastUpdated": env_v4.get("lastUpdated", ""),
+        "projectsCount": env_v4.get("projectsCount"),
+        "envUrl": f"{dapi.PUBLIC_HOST.rstrip('/')}/environment/{env_id}" if env_id and dapi.PUBLIC_HOST else "",
+        "dockerfile": dockerfile_text,
+        "dockerfileExists": dockerfile_exists,
+    }
+
+
+@app.route("/api/environments/specs")
+def api_environments_specs():
+    """Fast skeleton rows for the Environments tab — no per-env v4 calls.
+
+    The frontend renders one card per row immediately, then fetches
+    /api/environments/<engine>/status for each card in parallel so every card
+    fills in (and fails) on its own timeline instead of all-at-once.
+    """
+    return jsonify([_build_env_row(s, {}) for s in _env_specs()])
+
+
+@app.route("/api/environments/<engine>/status")
+def api_environment_status(engine: str):
+    """v4 detail for one engine's environment — fault-isolated per card.
+
+    A failed or slow lookup affects only this engine's card; the error is
+    returned in-band (HTTP 200 with an ``error`` field) so the frontend can
+    show a per-card retry instead of failing the whole grid.
+    """
+    spec = next((s for s in _env_specs() if s["name"] == engine), None)
+    if spec is None:
+        return jsonify({"error": f"unknown engine '{engine}'"}), 404
+
+    env_v4: dict = {}
+    if spec["env_id"]:
+        try:
+            env_v4 = dapi.get_environment(spec["env_id"]) or {}
         except Exception as exc:
-            log.warning("get_environment(%s) failed: %s", env_id, exc)
-            return {}
+            log.warning("get_environment(%s) failed: %s", spec["env_id"], exc)
+            row = _build_env_row(spec, {})
+            row["error"] = str(exc)
+            return jsonify(row), 200
 
-    unique_ids = list({s["env_id"] for s in specs if s["env_id"]})
-    v4_by_id: dict[str, dict] = {}
-    if unique_ids:
-        with ThreadPoolExecutor(max_workers=min(len(unique_ids), 8)) as pool:
-            fut_map = {pool.submit(_fetch_v4, eid): eid for eid in unique_ids}
-            for fut in as_completed(fut_map):
-                v4_by_id[fut_map[fut]] = fut.result()
-
-    def _build_row(s: dict) -> dict:
-        env_v4 = v4_by_id.get(s["env_id"], {})
-        latest_rev = env_v4.get("latestRevision") or {}
-        rev_details = env_v4.get("latestRevisionDetails") or {}
-        docker_image = rev_details.get("dockerImage", "")
-        image_display = docker_image.split("/")[-1] if "/" in docker_image else docker_image
-        size_obj = rev_details.get("compressedImageSize") or {}
-        size_bytes = size_obj.get("value")
-        image_size = _fmt_bytes(int(size_bytes)) if size_bytes else ""
-        owner_obj = env_v4.get("owner") or {}
-
-        canonical_name = s["canonical_name"]
-        df_path = REPO_ROOT / "envs" / canonical_name / "Dockerfile"
-        dockerfile_text = ""
-        dockerfile_exists = df_path.exists()
-        if dockerfile_exists:
-            try:
-                dockerfile_text = df_path.read_text()
-            except OSError:
-                pass
-
-        icon_png = s["icon_png"]
-        icon_path = img_root / icon_png if icon_png else None
-        env_id = s["env_id"]
-        return {
-            "name": s["name"],
-            "label": s["label"],
-            "icon": s["icon"],
-            "iconUrl": f"img/{icon_png}" if (icon_path and icon_path.exists()) else "",
-            "expectedEnvName": canonical_name,
-            "envId": env_id,
-            "envIdVar": s["env_id_var"],
-            "envIdSource": s["source"],
-            "latestRevision": latest_rev,
-            "revisionNumber": latest_rev.get("number"),
-            "revisionSummary": rev_details.get("summary", ""),
-            "dockerImage": docker_image,
-            "imageDisplay": image_display,
-            "imageSize": image_size,
-            "visibility": env_v4.get("visibility", ""),
-            "owner": owner_obj.get("username", ""),
-            "lastUpdated": env_v4.get("lastUpdated", ""),
-            "projectsCount": env_v4.get("projectsCount"),
-            "envUrl": f"{dapi.PUBLIC_HOST.rstrip('/')}/environment/{env_id}" if env_id and dapi.PUBLIC_HOST else "",
-            "dockerfile": dockerfile_text,
-            "dockerfileExists": dockerfile_exists,
-        }
-
-    return jsonify([_build_row(s) for s in specs])
+    return jsonify(_build_env_row(spec, env_v4))
 
 
 @app.route("/api/environments/<engine>/build", methods=["POST"])

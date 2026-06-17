@@ -19,6 +19,9 @@ const state = {
     summary: {},
     tiers: [],
     envsLoaded: false,
+    envCards: {},      // engine name -> latest row data (skeleton spec, then v4 detail)
+    envPollers: {},    // engine name -> setTimeout id for in-progress build polling
+    envLoadToken: 0,   // bumped each (re)load so stale in-flight fetches drop themselves
     wizard: {
         step: 1,
         engine: null,
@@ -493,18 +496,92 @@ async function provision() {
 // =====================================================================
 // Environments tab
 // =====================================================================
+const ENV_POLL_MS = 4000;  // re-check cadence for cards with an in-progress build
+
+// Two-phase load: fetch the cheap spec list, render every card shell at once,
+// then fetch each card's v4 detail independently so cards fill in (and fail,
+// and poll) on their own timeline instead of all-at-once.
 async function loadEnvironments() {
     const container = document.getElementById("env-cards");
+    stopAllEnvPolling();                 // cancel pollers from a previous load
+    const token = ++state.envLoadToken;  // invalidate any in-flight per-card fetches
+
     container.innerHTML = `<p class="muted">Loading environments…</p>`;
-    let envs;
+    let specs;
     try {
-        envs = await api("/environments/status");
+        specs = await api("/environments/specs");
     } catch (e) {
         container.innerHTML = `<p class="muted">Failed to load: ${escapeHtml(e.message)}</p>`;
         return;
     }
+    if (token !== state.envLoadToken) return;  // a newer load superseded us
     state.envsLoaded = true;
-    renderEnvCards(envs);
+
+    if (!specs || !specs.length) {
+        container.innerHTML = `<p class="muted">No engines registered.</p>`;
+        return;
+    }
+
+    // Phase 1 — render every card shell immediately in a "loading" state.
+    state.envCards = {};
+    container.innerHTML = specs.map(s => {
+        state.envCards[s.name] = s;
+        return envCardShell(s);
+    }).join("");
+
+    // Phase 2 — fetch each card's detail in parallel; each updates on arrival.
+    specs.forEach(s => refreshEnvCard(s.name, token));
+}
+
+// Fetch one engine's v4 detail and update only that card. Fault-isolated:
+// a failure renders a per-card error+retry, never disturbing other cards.
+async function refreshEnvCard(engine, token = state.envLoadToken) {
+    let detail;
+    try {
+        detail = await api(`/environments/${encodeURIComponent(engine)}/status`);
+    } catch (e) {
+        if (token !== state.envLoadToken) return;
+        renderEnvCardBody(engine, { error: e.message });
+        return;
+    }
+    if (token !== state.envLoadToken) return;  // stale load — drop the result
+    state.envCards[engine] = detail;
+    if (detail.error) {
+        renderEnvCardBody(engine, { error: detail.error });
+        return;
+    }
+    renderEnvCardBody(engine, {});
+    maybePollEnvCard(engine, token);
+}
+
+// Arm a one-shot poll if this card's build is still queued/building. Each tick
+// re-fetches and re-arms via refreshEnvCard until the build reaches a terminal
+// state, so only in-progress cards poll and they stop on their own.
+function maybePollEnvCard(engine, token = state.envLoadToken) {
+    stopEnvPolling(engine);
+    const e = state.envCards[engine];
+    const st = ((e && e.latestRevision && e.latestRevision.status) || "").toLowerCase();
+    if (!["queued", "building"].includes(st)) return;
+    state.envPollers[engine] = setTimeout(() => {
+        if (token !== state.envLoadToken) return;
+        refreshEnvCard(engine, token);
+    }, ENV_POLL_MS);
+}
+
+function stopEnvPolling(engine) {
+    if (state.envPollers[engine]) {
+        clearTimeout(state.envPollers[engine]);
+        delete state.envPollers[engine];
+    }
+}
+
+function stopAllEnvPolling() {
+    Object.keys(state.envPollers).forEach(stopEnvPolling);
+}
+
+// Re-entering an already-loaded tab: resume polling for any in-progress cards.
+function rearmEnvPolling() {
+    Object.keys(state.envCards).forEach(engine => maybePollEnvCard(engine));
 }
 
 function envStatusBadge(envIdSource, latestRevision) {
@@ -535,39 +612,80 @@ function fmtEnvDate(ts) {
     } catch { return ts; }
 }
 
-function renderEnvCards(envs) {
-    const container = document.getElementById("env-cards");
-    if (!envs || !envs.length) {
-        container.innerHTML = `<p class="muted">No engines registered.</p>`;
-        return;
-    }
-    container.innerHTML = envs.map(e => {
-        const icon = e.iconUrl
-            ? `<img class="engine-icon-img" src="${escapeHtml(e.iconUrl)}" alt="${escapeHtml(e.label)}" style="width:36px;height:36px;">`
-            : e.icon
-                ? `<span class="engine-icon" style="font-size:32px;">${escapeHtml(e.icon)}</span>`
-                : "";
-        const badge = envStatusBadge(e.envIdSource, e.latestRevision);
-        const revNum = e.revisionNumber != null ? `v${e.revisionNumber}` : "";
-        const envIdLine = e.envId
-            ? `<span class="env-meta-val"><code>${escapeHtml(e.envId)}</code></span>`
-            : `<span class="muted">—</span>`;
-        const sourceLine = {
-            envvar: `<span class="env-source-chip env-source-envvar">env var</span>`,
-            byname: `<span class="env-source-chip env-source-byname">resolved by name</span>`,
-            missing: `<span class="env-source-chip env-source-missing">not found</span>`,
-        }[e.envIdSource] || "";
-        const dfBtn = e.dockerfileExists
-            ? `<button class="btn btn-secondary btn-small" onclick="toggleDockerfile('${escapeHtml(e.name)}')">View Dockerfile</button>`
-            : `<span class="muted" title="Dockerfile not present in repo">No Dockerfile</span>`;
-        const buildLabel = e.envIdSource === "missing" ? "Build" : "Rebuild";
-        const dfId = `df-${e.name}`;
-        const logId = `env-log-${e.name}`;
-        const dfEscaped = escapeHtml(e.dockerfile || "(no Dockerfile found)");
+// Full card shell: a stable wrapper holding the dynamic body plus the two
+// <pre> panels (dockerfile + build log). The body is rebuilt on every update,
+// but the <pre>s are siblings we never touch — so an open dockerfile view or a
+// streaming build log survives status refreshes untouched.
+function envCardShell(e) {
+    const dfId = `df-${e.name}`;
+    const logId = `env-log-${e.name}`;
+    const dfEscaped = escapeHtml(e.dockerfile || "(no Dockerfile found)");
+    return `
+    <div class="env-card" id="env-card-${escapeHtml(e.name)}">
+        <div class="env-card-body" id="env-body-${escapeHtml(e.name)}">
+            ${envBodyHtml(e, { loading: true })}
+        </div>
+        <pre class="provision-log dockerfile-view hidden" id="${dfId}">${dfEscaped}</pre>
+        <pre class="provision-log hidden" id="${logId}"></pre>
+    </div>`;
+}
 
-        // Rich v4 fields
+// Replace only one card's body — identity, status, meta, actions — leaving its
+// sibling <pre> panels (and every other card) alone.
+function renderEnvCardBody(engine, opts = {}) {
+    const body = document.getElementById(`env-body-${engine}`);
+    if (!body) return;
+    body.innerHTML = envBodyHtml(state.envCards[engine] || {}, opts);
+}
+
+// Renders the card body for one of three states:
+//   loading — skeleton fields known from the specs call, detail pending
+//   error   — detail fetch failed; show message + Retry
+//   ready   — full v4 detail present
+function envBodyHtml(e, opts = {}) {
+    const loading = !!opts.loading;
+    const error = opts.error || "";
+
+    const icon = e.iconUrl
+        ? `<img class="engine-icon-img" src="${escapeHtml(e.iconUrl)}" alt="${escapeHtml(e.label)}" style="width:36px;height:36px;">`
+        : e.icon
+            ? `<span class="engine-icon" style="font-size:32px;">${escapeHtml(e.icon)}</span>`
+            : "";
+
+    let statusEl;
+    if (error)        statusEl = `<span class="badge badge-error" title="${escapeHtml(error)}">Error</span>`;
+    else if (loading) statusEl = `<span class="badge badge-loading">Loading…</span>`;
+    else              statusEl = envStatusBadge(e.envIdSource, e.latestRevision);
+
+    const ready = !loading && !error;
+    const revNum = (ready && e.revisionNumber != null) ? `v${e.revisionNumber}` : "";
+    const buildLabel = e.envIdSource === "missing" ? "Build" : "Rebuild";
+
+    const envIdLine = e.envId
+        ? `<span class="env-meta-val"><code>${escapeHtml(e.envId)}</code></span>`
+        : `<span class="muted">—</span>`;
+    const sourceLine = {
+        envvar: `<span class="env-source-chip env-source-envvar">env var</span>`,
+        byname: `<span class="env-source-chip env-source-byname">resolved by name</span>`,
+        missing: `<span class="env-source-chip env-source-missing">not found</span>`,
+    }[e.envIdSource] || "";
+    const dfBtn = e.dockerfileExists
+        ? `<button class="btn btn-secondary btn-small" onclick="toggleDockerfile('${escapeHtml(e.name)}')">View Dockerfile</button>`
+        : `<span class="muted" title="Dockerfile not present in repo">No Dockerfile</span>`;
+
+    // Detail rows depend on v4 data — placeholder while loading, retry on error.
+    let detailRows;
+    if (error) {
+        detailRows = `
+            <div class="env-meta-row env-detail-error">
+                <span class="muted">Couldn't load details — ${escapeHtml(error)}</span>
+                <button class="btn btn-secondary btn-small env-retry-btn" onclick="refreshEnvCard('${escapeHtml(e.name)}')">Retry</button>
+            </div>`;
+    } else if (loading) {
+        detailRows = `<div class="env-meta-row env-detail-loading"><span class="env-shimmer"></span></div>`;
+    } else {
         const baseImageTag = e.imageDisplay
-            ? e.imageDisplay.includes(":") ? e.imageDisplay.split(":")[1] : e.imageDisplay
+            ? (e.imageDisplay.includes(":") ? e.imageDisplay.split(":")[1] : e.imageDisplay)
             : "";
         const baseImageRow = e.imageDisplay ? `
             <div class="env-meta-row">
@@ -589,48 +707,41 @@ function renderEnvCards(envs) {
                 <span class="env-meta-key">Last updated</span>
                 <span class="env-meta-val">${escapeHtml(fmtEnvDate(e.lastUpdated))}</span>
             </div>` : "";
+        detailRows = baseImageRow + sizeRow + ownerRow + updatedRow;
+    }
 
-        return `
-        <div class="env-card" id="env-card-${escapeHtml(e.name)}">
-            <div class="env-card-header">
-                <div class="env-card-identity">
-                    ${icon}
-                    <div>
-                        <div class="env-card-label">${escapeHtml(e.label)}</div>
-                        <code class="env-card-name">${escapeHtml(e.expectedEnvName)}</code>
-                    </div>
-                </div>
-                <div class="env-card-status">
-                    ${badge}
-                    ${revNum ? `<span class="env-rev-chip" id="env-rev-${escapeHtml(e.name)}">${escapeHtml(revNum)}</span>` : ""}
-                    ${e.envUrl ? `<a class="btn btn-secondary btn-small env-open-btn" href="${escapeHtml(e.envUrl)}" target="_blank" rel="noopener">Open Environment</a>` : ""}
+    return `
+        <div class="env-card-header">
+            <div class="env-card-identity">
+                ${icon}
+                <div>
+                    <div class="env-card-label">${escapeHtml(e.label)}</div>
+                    <code class="env-card-name">${escapeHtml(e.expectedEnvName)}</code>
                 </div>
             </div>
-            <div class="env-card-meta">
-                ${baseImageRow}
-                ${sizeRow}
-                ${ownerRow}
-                ${updatedRow}
-                <div class="env-meta-row">
-                    <span class="env-meta-key">Env ID</span>
-                    ${envIdLine}
-                    ${sourceLine}
-                </div>
-                <div class="env-meta-row">
-                    <span class="env-meta-key">Resolved via</span>
-                    <code class="env-meta-val">${e.envIdSource === "envvar" ? escapeHtml(e.envIdVar) : escapeHtml(e.expectedEnvName)}</code>
-                </div>
+            <div class="env-card-status">
+                ${statusEl}
+                ${revNum ? `<span class="env-rev-chip" id="env-rev-${escapeHtml(e.name)}">${escapeHtml(revNum)}</span>` : ""}
+                ${(ready && e.envUrl) ? `<a class="btn btn-secondary btn-small env-open-btn" href="${escapeHtml(e.envUrl)}" target="_blank" rel="noopener">Open Environment</a>` : ""}
             </div>
-            <div class="env-card-actions">
-                ${dfBtn}
-                <button class="btn btn-primary btn-small" id="btn-build-${escapeHtml(e.name)}"
-                    onclick="buildEnv('${escapeHtml(e.name)}')">${buildLabel}</button>
-            </div>
-            <pre class="provision-log dockerfile-view hidden" id="${dfId}">${dfEscaped}</pre>
-            <pre class="provision-log hidden" id="${logId}"></pre>
         </div>
-        `;
-    }).join("");
+        <div class="env-card-meta">
+            ${detailRows}
+            <div class="env-meta-row">
+                <span class="env-meta-key">Env ID</span>
+                ${envIdLine}
+                ${sourceLine}
+            </div>
+            <div class="env-meta-row">
+                <span class="env-meta-key">Resolved via</span>
+                <code class="env-meta-val">${e.envIdSource === "envvar" ? escapeHtml(e.envIdVar) : escapeHtml(e.expectedEnvName)}</code>
+            </div>
+        </div>
+        <div class="env-card-actions">
+            ${dfBtn}
+            <button class="btn btn-primary btn-small" id="btn-build-${escapeHtml(e.name)}"
+                onclick="buildEnv('${escapeHtml(e.name)}')">${buildLabel}</button>
+        </div>`;
 }
 
 function toggleDockerfile(engine) {
@@ -645,17 +756,28 @@ async function buildEnv(engine) {
     const btn = document.getElementById(`btn-build-${engine}`);
     if (!logEl || !btn) return;
 
+    stopEnvPolling(engine);  // don't let a status poll re-render the body mid-build
     logEl.classList.remove("hidden");
-    logEl.innerHTML = "";
+    logEl.textContent = "";
     btn.disabled = true;
 
     const card = document.getElementById(`env-card-${engine}`);
     if (card) { card.classList.remove("build-success", "build-failed"); card.classList.add("building"); }
 
+    // Append a log line via DOM nodes (textContent) rather than innerHTML += so
+    // each line is O(1) and we never re-parse the whole growing log.
     const append = (cls, marker, msg, extra) => {
-        const tail = extra ? ` <span class="muted">(${escapeHtml(extra)})</span>` : "";
-        const cleanCls = cls ? ` class="${cls}"` : "";
-        logEl.innerHTML += `<span${cleanCls}>${escapeHtml(marker)} ${escapeHtml(msg)}</span>${tail}\n`;
+        const line = document.createElement("span");
+        if (cls) line.className = cls;
+        line.textContent = `${marker} ${msg}`;
+        logEl.appendChild(line);
+        if (extra) {
+            const ex = document.createElement("span");
+            ex.className = "muted";
+            ex.textContent = ` (${extra})`;
+            logEl.appendChild(ex);
+        }
+        logEl.appendChild(document.createTextNode("\n"));
         logEl.scrollTop = logEl.scrollHeight;
     };
     const renderEvent = (kind, data) => {
@@ -682,7 +804,6 @@ async function buildEnv(engine) {
     );
 
     btn.disabled = false;
-    btn.textContent = "Rebuild";
 
     if (card) {
         card.classList.remove("building");
@@ -693,34 +814,21 @@ async function buildEnv(engine) {
     }
 
     if (terminal && terminal.kind === "result") {
-        try {
-            // Snapshot current revision numbers before re-render
-            const oldRevs = {};
-            document.querySelectorAll("[id^='env-rev-']").forEach(el => {
-                oldRevs[el.id] = el.textContent;
-            });
-
-            const envs = await api("/environments/status");
-            renderEnvCards(envs);
-
-            // Pop any revision chip that changed
-            document.querySelectorAll("[id^='env-rev-']").forEach(el => {
-                if (oldRevs[el.id] !== undefined && oldRevs[el.id] !== el.textContent) {
-                    el.classList.remove("rev-pop");
-                    void el.offsetWidth; // force reflow to restart animation
-                    el.classList.add("rev-pop");
-                    el.addEventListener("animationend", () => el.classList.remove("rev-pop"), { once: true });
-                }
-            });
-
-            // Re-reveal the log for the engine we just built.
-            const newLog = document.getElementById(`env-log-${engine}`);
-            if (newLog) {
-                newLog.classList.remove("hidden");
-                newLog.innerHTML = logEl.innerHTML;
-                newLog.scrollTop = newLog.scrollHeight;
+        // Refresh only this card — its sibling <pre> log stays visible, and
+        // every other card (and its open log / dockerfile view) is untouched.
+        const prev = state.envCards[engine];
+        const oldRev = prev ? prev.revisionNumber : null;
+        await refreshEnvCard(engine);
+        const newRev = state.envCards[engine] ? state.envCards[engine].revisionNumber : null;
+        if (newRev != null && newRev !== oldRev) {
+            const chip = document.getElementById(`env-rev-${engine}`);
+            if (chip) {
+                chip.classList.remove("rev-pop");
+                void chip.offsetWidth;  // force reflow to restart the animation
+                chip.classList.add("rev-pop");
+                chip.addEventListener("animationend", () => chip.classList.remove("rev-pop"), { once: true });
             }
-        } catch (_) {}
+        }
     }
 }
 
@@ -736,8 +844,11 @@ function bindTabs() {
             document.querySelectorAll("[id^='panel-']").forEach(p => p.classList.add("hidden"));
             const panel = document.getElementById(`panel-${tab}`);
             if (panel) panel.classList.remove("hidden");
-            if (tab === "environments" && !state.envsLoaded) {
-                loadEnvironments();
+            if (tab === "environments") {
+                if (!state.envsLoaded) loadEnvironments();
+                else rearmEnvPolling();   // resume polling any in-progress builds
+            } else {
+                stopAllEnvPolling();       // don't poll while the tab is hidden
             }
         };
     });

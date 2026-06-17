@@ -90,7 +90,7 @@ def test_find_config_falls_through_when_env_channel_empty(monkeypatch, tmp_path)
     monkeypatch.setattr(lc, "DBAPPS_DIR", empty)
     # /mnt/code/dbapps is the other hard-coded search dir; point find_config at
     # dirs with no matching json by ensuring neither has any.
-    with pytest.raises(RuntimeError, match="No config file found"):
+    with pytest.raises(RuntimeError, match="No config found"):
         lc.find_config()
 
 

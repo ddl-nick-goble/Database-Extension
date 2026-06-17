@@ -63,6 +63,16 @@ def find_config() -> dict:
     Postgres container crashes on engine-specific paths.  DD_ENGINE is baked
     into every env image so it's the safest disambiguator.
     """
+    # Build marker — grep the boot log for this to confirm WHICH lifecycle the
+    # /opt/dd image is running. The project-env channel only exists in builds
+    # that print this line; an old image won't, and will instead log the
+    # "cannot import domino_api" message. If you see neither, the env image
+    # predates this fix and needs a rebuild.
+    sys.stderr.write(
+        "[lifecycle] find_config build=projenv-v1 "
+        "channels=[inline, DD_CONFIG, project-env(DD_CFG_<app_id>), "
+        "DOMINO_APP_NAME, run-id-file, engine-mtime]\n"
+    )
     inline = os.environ.get("DD_CONFIG_JSON", "").strip()
     if inline:
         try:
@@ -134,17 +144,26 @@ def find_config() -> dict:
             except Exception:
                 continue
         if not filtered:
+            sys.stderr.write(_resolution_diagnostics(search_dirs, engine) + "\n")
             raise RuntimeError(
                 f"No config file with engine={engine!r} found in "
-                f"{[str(d) for d in search_dirs]}. Did the wizard fail to "
-                f"write one, or is the env image mismatched to the config?"
+                f"{[str(d) for d in search_dirs]}, and the project-env channel "
+                f"(DD_CFG_<app_id>) did not resolve. See the diagnostics above. "
+                f"Most likely: the env image predates the project-env fix "
+                f"(rebuild dd-{engine}-app), or the wizard couldn't set the "
+                f"config env var on this project."
             )
         candidates = filtered
     candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
+        sys.stderr.write(_resolution_diagnostics(search_dirs, engine) + "\n")
         raise RuntimeError(
-            f"No config file found in any of {[str(d) for d in search_dirs]}. "
-            f"Did the wizard fail to write one?"
+            f"No config found. The project-env channel (DD_CFG_<app_id>) did "
+            f"not resolve and no config file exists in "
+            f"{[str(d) for d in search_dirs]}. See the diagnostics above. Most "
+            f"likely: the env image predates the project-env fix (rebuild the "
+            f"dd-<engine>-app environment), or the wizard couldn't set the "
+            f"config env var on this project."
         )
     sys.stderr.write(
         f"[lifecycle] config from mtime fallback "
@@ -224,6 +243,56 @@ def _resolve_app_name_from_run_id(run_id: str) -> str | None:
     file-based config fallback. Self-contained (see _fetch_apps_via_api)."""
     app = _app_from_run_id(run_id)
     return app.get("name") if app else None
+
+
+def _resolution_diagnostics(search_dirs: list[Path], engine: str) -> str:
+    """Human-readable dump of every signal find_config used, written to the boot
+    log right before we give up. Tells you exactly which channel fell short
+    without needing to shell into a dead container.
+
+    Never prints secret VALUES — only presence/booleans and var NAMES.
+    """
+    run_id = os.environ.get("DOMINO_RUN_ID", "")
+    L = ["[lifecycle] ---- config resolution diagnostics ----"]
+    L.append(
+        f"  env: DD_ENGINE={engine or '<unset>'} "
+        f"DOMINO_PROJECT_NAME={os.environ.get('DOMINO_PROJECT_NAME', '<unset>')} "
+        f"DOMINO_DATASETS_DIR={os.environ.get('DOMINO_DATASETS_DIR', '<unset>')}"
+    )
+    L.append(
+        f"  ids: DOMINO_RUN_ID={run_id or '<unset>'} "
+        f"DOMINO_PROJECT_ID={'set' if os.environ.get('DOMINO_PROJECT_ID') else '<unset>'} "
+        f"DOMINO_USER_API_KEY={'set' if os.environ.get('DOMINO_USER_API_KEY') else '<unset>'} "
+        f"DOMINO_API_PROXY={os.environ.get('DOMINO_API_PROXY', '<unset>')}"
+    )
+    cfg_vars = sorted(k for k in os.environ if k.startswith("DD_CFG_"))
+    L.append(f"  project-env: DD_CFG_* vars present={cfg_vars or '<none>'}")
+    if run_id:
+        try:
+            apps = _fetch_apps_via_api()
+            match = _app_from_run_id(run_id)
+            L.append(
+                f"  project-env: API returned {len(apps)} app(s); "
+                f"run_id matched app_id={(match or {}).get('id', '<no match>')}"
+            )
+            if match:
+                want = f"DD_CFG_{(match.get('id') or '').upper()}"
+                L.append(
+                    f"  project-env: expected var {want} "
+                    f"{'PRESENT' if os.environ.get(want) else 'MISSING — wizard did not set it'}"
+                )
+        except Exception as e:  # diagnostics must never mask the real error
+            L.append(f"  project-env: API probe errored: {e}")
+    else:
+        L.append("  project-env: DOMINO_RUN_ID unset — cannot resolve app_id")
+    for d in search_dirs:
+        if d.exists():
+            jsons = [p.name for p in d.glob("*.json")]
+            L.append(f"  file: {d} exists, *.json={jsons or '<none>'}")
+        else:
+            L.append(f"  file: {d} MISSING")
+    L.append("[lifecycle] ---- end diagnostics ----")
+    return "\n".join(L)
 
 
 # --------------------------------------------------------------------------

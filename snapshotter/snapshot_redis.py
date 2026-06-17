@@ -6,7 +6,8 @@ One tick:
   3. Read the live dump.rdb path from CONFIG GET dir + dbfilename
   4. gzip the .rdb into staging, atomic-rename into snapshots/<ts>/
   5. Update snapshots/latest symlink
-  6. POST /v4/datasetrw/snapshot for the versioned Domino snapshot
+  6. Capture a versioned Domino dataset snapshot (see
+     _dataset_snapshot.trigger_domino_snapshot — engine-agnostic).
 
 The live AOF (appendfsync everysec) is what protects against in-memory
 loss between snapshots — the dataset snapshot exists for point-in-time
@@ -23,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-import httpx
+from _dataset_snapshot import trigger_domino_snapshot
 
 DB_ID = os.environ.get("DD_DB_ID") or os.environ.get("DOMINO_RUN_ID", "default")
 REDIS_PORT = os.environ.get("DD_REDIS_PORT", "6379")
@@ -38,8 +39,6 @@ SNAPSHOT_ROOT = Path(
     )
 )
 SNAPSHOTS_DIR = SNAPSHOT_ROOT / "snapshots"
-
-DATASET_RELPATH = f"db-{DB_ID}"
 
 API_HOST = os.environ.get("DOMINO_API_PROXY") or os.environ.get(
     "DOMINO_API_HOST", "http://localhost:8899",
@@ -129,46 +128,6 @@ def swap_into_place(staging: Path, ts: str) -> Path:
     return final
 
 
-def trigger_domino_snapshot() -> None:
-    if not (API_HOST and API_KEY and PROJECT_ID):
-        log("no API credentials / project id — skipping Domino snapshot")
-        return
-    try:
-        with httpx.Client(
-            base_url=API_HOST,
-            headers={"X-Domino-Api-Key": API_KEY},
-            timeout=30,
-        ) as c:
-            r = c.get(
-                "/api/datasetrw/v2/datasets",
-                params={"projectIdsToInclude": PROJECT_ID},
-            )
-            r.raise_for_status()
-            ds_id = None
-            for wrapped in r.json().get("datasets", []):
-                ds = wrapped.get("dataset", {})
-                if ds.get("projectId") == PROJECT_ID:
-                    ds_id = ds.get("id")
-                    break
-            if not ds_id:
-                log(f"no dataset found for project {PROJECT_ID}")
-                return
-            body = {"datasetId": ds_id, "relativeFilePaths": [DATASET_RELPATH]}
-            r = c.post("/v4/datasetrw/snapshot", json=body)
-            if r.status_code == 200:
-                snap = r.json()
-                log(
-                    f"Domino snapshot created id={snap.get('id')} "
-                    f"version={snap.get('version')}"
-                )
-            elif r.status_code == 400 and "already in progress" in r.text:
-                log("Domino snapshot already in progress — will catch the next tick")
-            else:
-                log(f"Domino snapshot API {r.status_code}: {r.text[:300]}")
-    except Exception as e:
-        log(f"Domino snapshot trigger failed: {e}")
-
-
 def main() -> int:
     # Pick up runtime backup path change without requiring container restart.
     _override = Path("/tmp/dd-backup-override.json")
@@ -177,10 +136,9 @@ def main() -> int:
             import json as _json
             _d = _json.loads(_override.read_text())
             if _d.get("db_id") == DB_ID and _d.get("snapshot_dir"):
-                global SNAPSHOT_ROOT, SNAPSHOTS_DIR, DATASET_RELPATH
+                global SNAPSHOT_ROOT, SNAPSHOTS_DIR
                 SNAPSHOT_ROOT = Path(_d["snapshot_dir"])
                 SNAPSHOTS_DIR = SNAPSHOT_ROOT / "snapshots"
-                DATASET_RELPATH = f"db-{DB_ID}"
         except Exception:
             pass
 
@@ -201,7 +159,10 @@ def main() -> int:
 
     final = swap_into_place(staging, ts)
     log(f"snapshot ready at {final}")
-    trigger_domino_snapshot()
+    trigger_domino_snapshot(
+        api_host=API_HOST, api_key=API_KEY, project_id=PROJECT_ID,
+        snapshot_root=SNAPSHOT_ROOT, datasets_dir=_DOMINO_DATASETS_DIR, log=log,
+    )
     log("done")
     return 0
 

@@ -1,9 +1,9 @@
 """Postgres snapshotter — versioning via Domino dataset snapshots.
 
 One tick:
-  1. pg_basebackup → /mnt/data/<project>/db-<id>/basebackup/  (live, overwritten)
-  2. POST /v4/datasetrw/snapshot to capture a versioned point-in-time copy
-     of the db-<id>/ subtree in the project's default dataset
+  1. pg_basebackup → <snapshot_dir>/basebackup/  (live, overwritten)
+  2. Capture a versioned Domino dataset snapshot of the backup (see
+     _dataset_snapshot.trigger_domino_snapshot — engine-agnostic).
 
 Version history lives in Domino (visible in the dataset UI under "Snapshots"),
 not in timestamped directories on disk. Restore reads from the live path on
@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import httpx
+from _dataset_snapshot import trigger_domino_snapshot
 
 # --------------------------------------------------------------------------
 # Config from env (set by lifecycle.schedule_snapshotter)
@@ -40,10 +40,6 @@ SNAPSHOT_ROOT = Path(
 )
 BASEBACKUP_DIR = SNAPSHOT_ROOT / "basebackup"
 WAL_DIR = SNAPSHOT_ROOT / "wal"
-
-# Path within the dataset (relative, no leading slash) — what we ask Domino
-# to snapshot. The dataset is mounted at $DOMINO_DATASETS_DIR/<project>/.
-DATASET_RELPATH = f"db-{DB_ID}"
 
 # Domino API
 API_HOST = os.environ.get("DOMINO_API_PROXY") or os.environ.get(
@@ -90,66 +86,6 @@ def basebackup() -> None:
 
 
 # --------------------------------------------------------------------------
-# Domino dataset snapshot — the actual versioning mechanism
-# --------------------------------------------------------------------------
-def _find_dataset_id(client: httpx.Client) -> str | None:
-    """Return the dataset ID of the project's default dataset.
-
-    /api/datasetrw/v2/datasets?projectId=... is IGNORED on this build —
-    use ?projectIdsToInclude=... (verified empirically). Some builds also
-    return cross-project results regardless, so we still filter by
-    projectId client-side.
-    """
-    r = client.get(
-        "/api/datasetrw/v2/datasets",
-        params={"projectIdsToInclude": PROJECT_ID},
-    )
-    r.raise_for_status()
-    for wrapped in r.json().get("datasets", []):
-        ds = wrapped.get("dataset", {})
-        if ds.get("projectId") == PROJECT_ID:
-            return ds.get("id")
-    return None
-
-
-def trigger_domino_snapshot() -> None:
-    """POST /v4/datasetrw/snapshot for the db-<id>/ subtree. Idempotent —
-    skips silently if another snapshot is in flight on the same dataset.
-    """
-    if not (API_HOST and API_KEY and PROJECT_ID):
-        log("no API credentials / project id — skipping Domino snapshot")
-        return
-    try:
-        with httpx.Client(
-            base_url=API_HOST,
-            headers={"X-Domino-Api-Key": API_KEY},
-            timeout=30,
-        ) as c:
-            ds_id = _find_dataset_id(c)
-            if not ds_id:
-                log(f"no dataset found for project {PROJECT_ID}")
-                return
-            body = {
-                "datasetId": ds_id,
-                "relativeFilePaths": [DATASET_RELPATH],
-            }
-            r = c.post("/v4/datasetrw/snapshot", json=body)
-            if r.status_code == 200:
-                snap = r.json()
-                log(
-                    f"Domino snapshot created "
-                    f"id={snap.get('id')} version={snap.get('version')} "
-                    f"status={snap.get('lifecycleStatus')}"
-                )
-            elif r.status_code == 400 and "already in progress" in r.text:
-                log("Domino snapshot already in progress — will catch the next tick")
-            else:
-                log(f"Domino snapshot API {r.status_code}: {r.text[:300]}")
-    except Exception as e:
-        log(f"Domino snapshot trigger failed: {e}")
-
-
-# --------------------------------------------------------------------------
 # Entry
 # --------------------------------------------------------------------------
 def main() -> int:
@@ -160,11 +96,10 @@ def main() -> int:
             import json as _json
             _d = _json.loads(_override.read_text())
             if _d.get("db_id") == DB_ID and _d.get("snapshot_dir"):
-                global SNAPSHOT_ROOT, BASEBACKUP_DIR, WAL_DIR, DATASET_RELPATH
+                global SNAPSHOT_ROOT, BASEBACKUP_DIR, WAL_DIR
                 SNAPSHOT_ROOT = Path(_d["snapshot_dir"])
                 BASEBACKUP_DIR = SNAPSHOT_ROOT / "basebackup"
                 WAL_DIR = SNAPSHOT_ROOT / "wal"
-                DATASET_RELPATH = f"db-{DB_ID}"
         except Exception:
             pass
 
@@ -181,7 +116,10 @@ def main() -> int:
         log(f"pg_basebackup failed (rc={e.returncode}): {e}")
         return 1
 
-    trigger_domino_snapshot()
+    trigger_domino_snapshot(
+        api_host=API_HOST, api_key=API_KEY, project_id=PROJECT_ID,
+        snapshot_root=SNAPSHOT_ROOT, datasets_dir=_DOMINO_DATASETS_DIR, log=log,
+    )
     log("done")
     return 0
 

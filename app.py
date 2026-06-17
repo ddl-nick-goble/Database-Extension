@@ -7,6 +7,7 @@ serves the static SPA at /, JSON APIs under /api/*.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -99,7 +100,6 @@ def _config_pre_run_script(app_name: str, config_json: str) -> str:
     base64 keeps the JSON intact inside the shell regardless of quoting; the
     default-dataset write is best-effort so a read-only mount never blocks boot.
     """
-    import base64
     encoded = base64.b64encode(config_json.encode()).decode()
     return (
         f"ENC='{encoded}'\n"
@@ -512,6 +512,24 @@ def api_create_database():
             dapi.set_project_env_var(target_project_id, snap_var, snapshot_dir)
         except Exception as e:
             yield sse("warn", msg=f"Could not set {snap_var} on project: {e}")
+
+        # Primary config-delivery channel: stash the full config (base64 JSON)
+        # as a project env var keyed by app_id. Project env vars are reliably
+        # injected into the App's container, so the lifecycle reads this back at
+        # boot (resolving its own app_id from DOMINO_RUN_ID) — no dependency on
+        # /mnt/code writes (wiped by the run container's git checkout) or on
+        # version preRunScript/env (silently dropped on some Domino builds).
+        if app_id_str:
+            cfg_var = f"DD_CFG_{app_id_str.upper()}"
+            try:
+                dapi.set_project_env_var(
+                    target_project_id, cfg_var,
+                    base64.b64encode(json.dumps(cfg).encode()).decode(),
+                )
+                yield sse("ok", msg=f"Config delivered via project env {cfg_var}")
+            except Exception as e:
+                yield sse("warn", msg=f"Could not set {cfg_var} on project: {e} — "
+                                      f"boot will fall back to the file channels")
 
         yield sse("ok", msg="Config finalised", ms=since(t4))
 

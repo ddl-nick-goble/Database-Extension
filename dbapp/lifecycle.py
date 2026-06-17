@@ -80,6 +80,19 @@ def find_config() -> dict:
         sys.stderr.write(f"[lifecycle] config from DD_CONFIG={p}\n")
         return json.loads(p.read_text())
 
+    # Project-env channel: the wizard stashes the config (base64 JSON) as a
+    # project env var DD_CFG_<app_id>. Project env vars are reliably injected
+    # into the App's container — unlike /mnt/code writes (wiped by the run
+    # container's fresh git checkout) or version preRunScript/env (silently
+    # dropped on some builds). We resolve our own app_id from DOMINO_RUN_ID via
+    # a direct proxy call (no domino_api import — that module isn't present in
+    # arbitrary projects, which is why the old API path failed).
+    run_id = os.environ.get("DOMINO_RUN_ID", "")
+    if run_id:
+        cfg = _config_from_project_env(run_id)
+        if cfg is not None:
+            return cfg
+
     app_name = os.environ.get("DOMINO_APP_NAME", "")
     if app_name:
         p = DBAPPS_DIR / f"{app_name}.json"
@@ -140,42 +153,77 @@ def find_config() -> dict:
     return json.loads(candidates[0].read_text())
 
 
-def _resolve_app_name_from_run_id(run_id: str) -> str | None:
-    """List the project's Apps and return the one whose current instance id
-    matches `run_id`. Returns None on any error — caller falls back to the
-    engine-filtered mtime path."""
+def _fetch_apps_via_api() -> list[dict]:
+    """List this project's Apps via a direct call to the in-pod auth proxy.
+
+    Self-contained on purpose: uses `requests` (baked into every DB image) and
+    the standard DOMINO_* env vars, NOT the project's domino_api.py — that
+    module only exists in the Database-Extension repo, so importing it failed
+    in every other project (the "No module named 'domino_api'" you saw).
+    """
+    proxy = os.environ.get("DOMINO_API_PROXY", "http://localhost:8899")
+    api_key = os.environ.get("DOMINO_USER_API_KEY", "")
+    project_id = os.environ.get("DOMINO_PROJECT_ID", "")
+    if not (api_key and project_id):
+        sys.stderr.write("[lifecycle] no API key / project id — skipping API lookup\n")
+        return []
     try:
-        # /mnt/code holds domino_api.py in live mode; in /opt/dd-baked mode
-        # it may not be there. Add /mnt/code to sys.path defensively so this
-        # works in both modes when the project ships its own boot logic.
-        if "/mnt/code" not in sys.path:
-            sys.path.insert(0, "/mnt/code")
-        import domino_api as _dapi  # type: ignore
+        import requests
+        r = requests.get(
+            f"{proxy}/v4/modelProducts",
+            params={"projectId": project_id},
+            headers={"X-Domino-Api-Key": api_key},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        sys.stderr.write(f"[lifecycle] cannot import domino_api ({e}) — skipping API lookup\n")
-        return None
-    try:
-        apps = _dapi.list_apps()
-    except Exception as e:
-        sys.stderr.write(f"[lifecycle] list_apps failed during config lookup: {e}\n")
-        return None
-    # /v4/modelProducts list entries may not include currentInstance, so probe
-    # each app's detail. Skip apps that obviously aren't running.
-    running_states = {"running", "starting", "preparing", "pending", "queued"}
-    for a in apps:
+        sys.stderr.write(f"[lifecycle] app list via API failed: {e}\n")
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("data", "items", "results"):
+            if isinstance(data.get(k), list):
+                return data[k]
+    return []
+
+
+def _app_from_run_id(run_id: str) -> dict | None:
+    """Return the App dict whose current instance id matches `run_id`, or None."""
+    for a in _fetch_apps_via_api():
         ci = (a.get("currentVersion") or {}).get("currentInstance") or {}
         if ci.get("id") == run_id:
-            return a.get("name")
-        if str(a.get("status", "")).lower() not in running_states:
-            continue
-        try:
-            detail = _dapi.get_app(a["id"]) or {}
-        except Exception:
-            continue
-        ci = (detail.get("currentVersion") or {}).get("currentInstance") or {}
-        if ci.get("id") == run_id:
-            return a.get("name")
+            return a
     return None
+
+
+def _config_from_project_env(run_id: str) -> dict | None:
+    """Resolve our app_id from `run_id`, then decode the base64 config the
+    wizard stashed as project env var DD_CFG_<app_id>. Returns None if the app
+    can't be resolved or no such var is set (caller falls through)."""
+    import base64
+    app = _app_from_run_id(run_id)
+    if not app:
+        return None
+    app_id = app.get("id", "")
+    raw = os.environ.get(f"DD_CFG_{app_id.upper()}", "") if app_id else ""
+    if not raw:
+        return None
+    try:
+        cfg = json.loads(base64.b64decode(raw).decode())
+        sys.stderr.write(f"[lifecycle] config from project env DD_CFG_{app_id}\n")
+        return cfg
+    except Exception as e:
+        sys.stderr.write(f"[lifecycle] DD_CFG_{app_id} present but undecodable: {e}\n")
+        return None
+
+
+def _resolve_app_name_from_run_id(run_id: str) -> str | None:
+    """Return the App *name* whose current instance id matches `run_id`, for the
+    file-based config fallback. Self-contained (see _fetch_apps_via_api)."""
+    app = _app_from_run_id(run_id)
+    return app.get("name") if app else None
 
 
 # --------------------------------------------------------------------------

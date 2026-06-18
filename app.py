@@ -1056,7 +1056,7 @@ def api_build_environment(engine: str):
 
         # 5. Stream real Docker build logs when we have the build_id; otherwise
         #    fall back to periodic status polling (10s ticks).
-        yield sse("step", msg="Streaming build log (this takes ~3–5 min)…")
+        yield sse("step", msg="Monitoring build log (this takes ~3–5 min)…")
         deadline = time.monotonic() + 20 * 60
         elapsed_s = 0
         poll_interval = 3    # seconds between log fetches when logs are streaming

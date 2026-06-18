@@ -221,7 +221,7 @@ function dbCardShell(db) {
         <div class="db-card-body" id="db-body-${id}">
             ${dbCardBodyHtml(db)}
         </div>
-        <pre class="provision-log hidden" id="db-log-${id}"></pre>
+        ${logPanelHtml(`db-log-${id}`, "Logs")}
     </div>`;
 }
 
@@ -297,8 +297,7 @@ function maybePollDbCard(id, token = state.dbLoadToken) {
     if (!document.getElementById(`db-card-${id}`)) return;  // not currently rendered
     const db = state.databases.find(d => d.id === id);
     if (!db || !dbIsTransitioning(db.status)) return;
-    const logEl = document.getElementById(`db-log-${id}`);
-    if (logEl) logEl.classList.remove("hidden");
+    showLog(`db-log-${id}`);
     pollDbCardTick(id, token);
 }
 
@@ -359,7 +358,7 @@ async function fetchDbLogs(id, token) {
     if (fresh.length) {
         appendDbLogLines(logEl, fresh);
         state.dbLogSeen[id] = Math.max(lastSeen, ...fresh.map(l => l.timestamp || 0));
-        logEl.classList.remove("hidden");
+        showLog(`db-log-${id}`);
     }
     state.dbLogOffsets[id] = offset + lines.length;
 }
@@ -379,10 +378,12 @@ function appendDbLogLines(logEl, lines) {
 }
 
 async function toggleDbLogs(id) {
-    const logEl = document.getElementById(`db-log-${id}`);
+    const preId = `db-log-${id}`;
+    const logEl = document.getElementById(preId);
     if (!logEl) return;
-    const willShow = logEl.classList.contains("hidden");
-    logEl.classList.toggle("hidden");
+    const willShow = isLogHidden(preId);
+    if (willShow) showLog(preId, { expand: true });
+    else hideLog(preId);
     if (willShow && !logEl.childNodes.length) {
         await fetchDbLogs(id, state.dbLoadToken);
         if (!logEl.childNodes.length) logEl.textContent = "(no logs available yet)";
@@ -801,7 +802,7 @@ function envCardShell(e) {
             ${envBodyHtml(e, { loading: true })}
         </div>
         <pre class="provision-log dockerfile-view hidden" id="${dfId}">${dfEscaped}</pre>
-        <pre class="provision-log hidden" id="${logId}"></pre>
+        ${logPanelHtml(logId, "Build log")}
     </div>`;
 }
 
@@ -932,7 +933,7 @@ async function buildEnv(engine) {
     if (!logEl || !btn) return;
 
     stopEnvPolling(engine);  // don't let a status poll re-render the body mid-build
-    logEl.classList.remove("hidden");
+    showLog(logId, { expand: true });
     logEl.textContent = "";
     btn.disabled = true;
 
@@ -980,13 +981,19 @@ async function buildEnv(engine) {
 
     btn.disabled = false;
 
+    const succeeded = terminal && terminal.kind === "result" &&
+        (terminal.data?.status || "").toLowerCase() === "succeeded";
+
     if (card) {
         card.classList.remove("building");
-        const succeeded = terminal && terminal.kind === "result" &&
-            (terminal.data?.status || "").toLowerCase() === "succeeded";
         card.classList.add(succeeded ? "build-success" : "build-failed");
         setTimeout(() => card.classList.remove("build-success", "build-failed"), 2200);
     }
+
+    // Build finished: collapse the log so the card snaps back to a tidy state.
+    // Keep it expanded on failure so the error stays visible; the collapse
+    // button (and re-running Build) can re-open it either way.
+    setLogCollapsed(logId, !!succeeded);
 
     if (terminal && terminal.kind === "result") {
         // Refresh only this card — its sibling <pre> log stays visible, and
@@ -1054,10 +1061,8 @@ function bindUi() {
     // once the catalog has been fetched — at boot time the grid is empty.)
 
     document.getElementById("btn-gen-pw").onclick = () => {
-        const r = new Uint8Array(16);
-        crypto.getRandomValues(r);
-        document.getElementById("db-pw").value =
-            btoa(String.fromCharCode(...r)).replace(/[+/=]/g, "").slice(0, 20);
+        // Demo: always emit a known, easy-to-type password.
+        document.getElementById("db-pw").value = "Passw0rd!";
         // Reflect generated password into state + Review pane immediately.
         readFormToWizard();
         renderWizard();
@@ -1068,4 +1073,58 @@ function escapeHtml(s) {
     return String(s || "")
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+}
+
+// =====================================================================
+// Collapsible log panels — shared by the Environments and Databases cards.
+// Markup: a .log-panel wrapper (visibility via .hidden) holding a header with
+// a collapse toggle, plus the original <pre id=...> (unchanged, so all the
+// append/fetch code keeps targeting it by id). Collapsing hides only the <pre>
+// (via .collapsed) so the header + toggle stay reachable.
+// =====================================================================
+function logPanelHtml(preId, title) {
+    return `
+    <div class="log-panel hidden" data-for="${preId}">
+        <div class="log-panel-head">
+            <span class="log-panel-title">${escapeHtml(title)}</span>
+            <button class="btn btn-secondary btn-small log-collapse-btn" type="button"
+                    onclick="toggleLogCollapse('${preId}')">Collapse ▾</button>
+        </div>
+        <pre class="provision-log" id="${preId}"></pre>
+    </div>`;
+}
+
+function logPanelEl(preId) {
+    const pre = document.getElementById(preId);
+    return pre ? pre.closest(".log-panel") : null;
+}
+
+function showLog(preId, { expand = false } = {}) {
+    const panel = logPanelEl(preId);
+    if (!panel) return;
+    panel.classList.remove("hidden");
+    if (expand) setLogCollapsed(preId, false);
+}
+
+function hideLog(preId) {
+    const panel = logPanelEl(preId);
+    if (panel) panel.classList.add("hidden");
+}
+
+function isLogHidden(preId) {
+    const panel = logPanelEl(preId);
+    return !panel || panel.classList.contains("hidden");
+}
+
+function setLogCollapsed(preId, collapsed) {
+    const panel = logPanelEl(preId);
+    if (!panel) return;
+    panel.classList.toggle("collapsed", collapsed);
+    const btn = panel.querySelector(".log-collapse-btn");
+    if (btn) btn.textContent = collapsed ? "Expand ▸" : "Collapse ▾";
+}
+
+function toggleLogCollapse(preId) {
+    const panel = logPanelEl(preId);
+    if (panel) setLogCollapsed(preId, !panel.classList.contains("collapsed"));
 }

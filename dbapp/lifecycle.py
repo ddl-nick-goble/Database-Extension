@@ -28,338 +28,50 @@ import sys
 import time
 from pathlib import Path
 
-def _default_dbapps_dir() -> Path:
-    """Where per-DB config files live. Default is a subdir of the project's
-    default dataset so any project using dd-postgres-app can read configs
-    without depending on /mnt/code being this repo."""
-    base = os.environ.get("DOMINO_DATASETS_DIR", "/mnt/data")
-    project = os.environ.get("DOMINO_PROJECT_NAME", "default")
-    return Path(base) / project / "_dd_configs"
-
-
-DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR")) if os.environ.get("DD_DBAPPS_DIR") else _default_dbapps_dir()
-
-
 def find_config() -> dict:
-    """Locate this App's config. Resolution order:
+    """Locate this App's config — happy path only.
 
-      1. $DD_CONFIG_JSON inline JSON blob          (self-contained apps — primary path
-                                                    for apps created in any project)
-      2. $DD_CONFIG explicit file path             (test / manual override)
-      3. $DOMINO_APP_NAME.json                     (not present on Domino Apps)
-      4. Domino API lookup by $DOMINO_RUN_ID       (same-project fallback)
-      5. Most recent .json filtered by $DD_ENGINE  (defensive last resort)
+    The wizard stashes the config as a base64-JSON project env var keyed by this
+    App instance's id: DD_CFG_<DOMINO_RUN_ID>. It is set right after start, so it
+    is already in the container's env by the time this runs. We read it directly
+    — no Domino API call, no file scan, no app-id matching, no fallbacks.
 
-    Why (1) first: DB apps are now created with entryPoint=/opt/dd/app.sh and
-    their config passed as DD_CONFIG_JSON in environmentVariables at start
-    time.  This makes them fully project-independent — no file needs to exist
-    in the project dataset.  The wizard still writes a .json file as a
-    belt-and-suspenders fallback for (4)/(5).
-
-    Why (4): Domino App containers don't receive DOMINO_APP_NAME, but they
-    DO get DOMINO_RUN_ID (the instance id) and DOMINO_USER_API_KEY.
-
-    Why (5) is filtered by engine: silently loading a Mongo config into a
-    Postgres container crashes on engine-specific paths.  DD_ENGINE is baked
-    into every env image so it's the safest disambiguator.
+    DD_CONFIG_JSON (inline) is honored first for manual / self-contained runs.
     """
-    # Build marker — grep the boot log for this to confirm WHICH lifecycle the
-    # /opt/dd image is running. The project-env channel only exists in builds
-    # that print this line; an old image won't, and will instead log the
-    # "cannot import domino_api" message. If you see neither, the env image
-    # predates this fix and needs a rebuild.
-    sys.stderr.write(
-        "[lifecycle] find_config build=projenv-v1 "
-        "channels=[inline, DD_CONFIG, project-env(DD_CFG_<app_id>), "
-        "DOMINO_APP_NAME, run-id-file, engine-mtime]\n"
-    )
+    sys.stderr.write("[lifecycle] find_config build=projenv-v2 (run-id env)\n")
+
     inline = os.environ.get("DD_CONFIG_JSON", "").strip()
     if inline:
-        try:
-            cfg = json.loads(inline)
-            sys.stderr.write("[lifecycle] config from DD_CONFIG_JSON env var\n")
-            return cfg
-        except json.JSONDecodeError as e:
-            sys.stderr.write(f"[lifecycle] DD_CONFIG_JSON is set but invalid JSON ({e}) — falling through\n")
-
-    explicit = os.environ.get("DD_CONFIG")
-    if explicit:
-        p = Path(explicit)
-        if not p.exists():
-            raise RuntimeError(f"DD_CONFIG={explicit} but file does not exist")
-        sys.stderr.write(f"[lifecycle] config from DD_CONFIG={p}\n")
-        return json.loads(p.read_text())
-
-    # Project-env channel: the wizard stashes the config (base64 JSON) as a
-    # project env var DD_CFG_<app_id>. Project env vars are reliably injected
-    # into the App's container — unlike /mnt/code writes (wiped by the run
-    # container's fresh git checkout) or version preRunScript/env (silently
-    # dropped on some builds). We resolve our own app_id from DOMINO_RUN_ID via
-    # a direct proxy call (no domino_api import — that module isn't present in
-    # arbitrary projects, which is why the old API path failed).
-    run_id = os.environ.get("DOMINO_RUN_ID", "")
-    if run_id:
-        cfg = _config_from_project_env(run_id)
-        if cfg is not None:
-            return cfg
-
-    app_name = os.environ.get("DOMINO_APP_NAME", "")
-    if app_name:
-        p = DBAPPS_DIR / f"{app_name}.json"
-        if p.exists():
-            sys.stderr.write(f"[lifecycle] config from DOMINO_APP_NAME={app_name}\n")
-            return json.loads(p.read_text())
-        sys.stderr.write(
-            f"[lifecycle] DOMINO_APP_NAME={app_name} but {p} missing — trying API lookup\n"
-        )
+        sys.stderr.write("[lifecycle] config from DD_CONFIG_JSON env var\n")
+        return json.loads(inline)
 
     run_id = os.environ.get("DOMINO_RUN_ID", "")
-    if run_id:
-        resolved = _resolve_app_name_from_run_id(run_id)
-        if resolved:
-            p = DBAPPS_DIR / f"{resolved}.json"
-            if p.exists():
-                sys.stderr.write(
-                    f"[lifecycle] config matched via DOMINO_RUN_ID={run_id} → {resolved}.json\n"
-                )
-                return json.loads(p.read_text())
-            sys.stderr.write(
-                f"[lifecycle] API resolved run_id={run_id} → name={resolved}, but {p} missing\n"
-            )
-
-    engine = os.environ.get("DD_ENGINE", "").strip()
-    search_dirs = [DBAPPS_DIR, Path("/mnt/code/dbapps")]
-    candidates: list[Path] = []
-    for d in search_dirs:
-        if d.exists():
-            candidates.extend(d.glob("*.json"))
-    if engine and candidates:
-        # Only consider configs that match this container's engine — silently
-        # booting a Mongo config in a Postgres container is the worst-case bug.
-        filtered: list[Path] = []
-        for c in candidates:
-            try:
-                if json.loads(c.read_text()).get("engine") == engine:
-                    filtered.append(c)
-            except Exception:
-                continue
-        if not filtered:
-            sys.stderr.write(_resolution_diagnostics(search_dirs, engine) + "\n")
-            raise RuntimeError(
-                f"No config file with engine={engine!r} found in "
-                f"{[str(d) for d in search_dirs]}, and the project-env channel "
-                f"(DD_CFG_<app_id>) did not resolve. See the diagnostics above. "
-                f"Most likely: the env image predates the project-env fix "
-                f"(rebuild dd-{engine}-app), or the wizard couldn't set the "
-                f"config env var on this project."
-            )
-        candidates = filtered
-    candidates = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
-        sys.stderr.write(_resolution_diagnostics(search_dirs, engine) + "\n")
-        raise RuntimeError(
-            f"No config found. The project-env channel (DD_CFG_<app_id>) did "
-            f"not resolve and no config file exists in "
-            f"{[str(d) for d in search_dirs]}. See the diagnostics above. Most "
-            f"likely: the env image predates the project-env fix (rebuild the "
-            f"dd-<engine>-app environment), or the wizard couldn't set the "
-            f"config env var on this project."
-        )
-    sys.stderr.write(
-        f"[lifecycle] config from mtime fallback "
-        f"(engine_filter={engine or '<none>'}): {candidates[0]}\n"
-    )
-    return json.loads(candidates[0].read_text())
-
-
-def _domino_api_bases() -> list[str]:
-    """API base URLs to try, in order. The in-pod auth proxy (localhost:8899)
-    is preferred, but it isn't always listening yet when an App's entry script
-    runs at boot — so we also fall back to the public nucleus host, reachable
-    over the network and authenticated by DOMINO_USER_API_KEY, independent of
-    the local sidecar's startup timing.
-    """
-    bases: list[str] = []
-    proxy = os.environ.get("DOMINO_API_PROXY", "http://localhost:8899")
-    if proxy:
-        bases.append(proxy.rstrip("/"))
-    host = (os.environ.get("DOMINO_API_HOST")
-            or os.environ.get("DOMINO_PUBLIC_HOST", "")).rstrip("/")
-    if host and host not in bases:
-        bases.append(host)
-    return bases
-
-
-def _fetch_apps_via_api() -> list[dict]:
-    """List this project's Apps via a direct Domino API call.
-
-    Self-contained on purpose: uses `requests` (baked into every DB image) and
-    the standard DOMINO_* env vars, NOT the project's domino_api.py — that
-    module only exists in the Database-Extension repo, so importing it failed
-    in every other project (the "No module named 'domino_api'" you saw).
-
-    Tries the in-pod proxy first, then the public host (see _domino_api_bases).
-    """
-    api_key = os.environ.get("DOMINO_USER_API_KEY", "")
-    project_id = os.environ.get("DOMINO_PROJECT_ID", "")
-    if not (api_key and project_id):
-        sys.stderr.write("[lifecycle] no API key / project id — skipping API lookup\n")
-        return []
-    import requests
-    for base in _domino_api_bases():
-        try:
-            r = requests.get(
-                f"{base}/v4/modelProducts",
-                params={"projectId": project_id},
-                headers={"X-Domino-Api-Key": api_key},
-                timeout=15,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            sys.stderr.write(f"[lifecycle] app list via API failed ({base}): {e}\n")
-            continue
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            for k in ("data", "items", "results"):
-                if isinstance(data.get(k), list):
-                    return data[k]
-        return []
-    return []
-
-
-def _app_from_run_id(run_id: str) -> dict | None:
-    """Return the App dict whose running instance matches `run_id`, or None.
-
-    DOMINO_RUN_ID is the App instance id. In the /v4/modelProducts response
-    (schema ModelProduct) that lives in `latestAppInstanceId` — there is NO
-    `currentVersion.currentInstance.id` field, which is why the original matcher
-    never matched cross-project. We check the correct field first and keep the
-    older shapes as defensive fallbacks across Domino builds.
-    """
-    for a in _fetch_apps_via_api():
-        if a.get("latestAppInstanceId") == run_id:
-            return a
-        ci = (a.get("currentVersion") or {}).get("currentInstance") or {}
-        if ci.get("id") == run_id:
-            return a
-        for key in ("runningInstanceId", "currentInstanceId", "appInstanceId"):
-            if a.get(key) == run_id:
-                return a
-    return None
-
-
-def _config_from_project_env(run_id: str, timeout_s: float = 45, poll_s: float = 3) -> dict | None:
-    """Resolve our app_id from `run_id`, then decode the base64 config the
-    wizard stashed as project env var DD_CFG_<app_id>.
-
-    The app_id lookup needs the Domino API, and the in-pod proxy may not be
-    listening yet when this runs at App boot (Connection refused) — so we retry
-    with a short backoff for up to `timeout_s` while it (or the public host)
-    comes up. Returns None if the app still can't be resolved or no var is set.
-    """
-    import base64
-    import time as _time
-
-    deadline = _time.monotonic() + timeout_s
-    attempt = 0
-    app = None
-    while True:
-        attempt += 1
-        app = _app_from_run_id(run_id)
-        if app is not None:
-            break
-        if _time.monotonic() >= deadline:
-            sys.stderr.write(
-                f"[lifecycle] could not resolve app_id from run_id={run_id} via API "
-                f"after {attempt} attempts (proxy/public host unreachable)\n"
-            )
-            return None
-        sys.stderr.write(
-            f"[lifecycle] API not ready (attempt {attempt}) — waiting for app_id resolution…\n"
-        )
-        _time.sleep(3)
-
-    app_id = app.get("id", "")
-    raw = os.environ.get(f"DD_CFG_{app_id.upper()}", "") if app_id else ""
-    if not raw:
-        sys.stderr.write(
-            f"[lifecycle] resolved app_id={app_id} but no DD_CFG_{app_id.upper()} env var set\n"
-        )
-        return None
-    try:
-        cfg = json.loads(base64.b64decode(raw).decode())
-        sys.stderr.write(f"[lifecycle] config from project env DD_CFG_{app_id}\n")
+    cfg = _decode_cfg_env(f"DD_CFG_{run_id.upper()}") if run_id else None
+    if cfg is not None:
+        sys.stderr.write(f"[lifecycle] config from project env DD_CFG_{run_id}\n")
         return cfg
-    except Exception as e:
-        sys.stderr.write(f"[lifecycle] DD_CFG_{app_id} present but undecodable: {e}\n")
+
+    present = sorted(k for k in os.environ if k.startswith("DD_CFG_"))
+    raise RuntimeError(
+        f"No config: DD_CFG_{run_id.upper()} is not set "
+        f"(DOMINO_RUN_ID={run_id or '<unset>'}). DD_CFG_* present={present or '<none>'}. "
+        f"The wizard sets DD_CFG_<instance_id> right after start — confirm the "
+        f"create flow reached the start step and set it on this project."
+    )
+
+
+def _decode_cfg_env(var_name: str) -> dict | None:
+    """Decode a base64-JSON config from project env var `var_name`, or None if
+    it is unset/invalid."""
+    raw = os.environ.get(var_name, "")
+    if not raw:
         return None
-
-
-def _resolve_app_name_from_run_id(run_id: str) -> str | None:
-    """Return the App *name* whose current instance id matches `run_id`, for the
-    file-based config fallback. Self-contained (see _fetch_apps_via_api)."""
-    app = _app_from_run_id(run_id)
-    return app.get("name") if app else None
-
-
-def _resolution_diagnostics(search_dirs: list[Path], engine: str) -> str:
-    """Human-readable dump of every signal find_config used, written to the boot
-    log right before we give up. Tells you exactly which channel fell short
-    without needing to shell into a dead container.
-
-    Never prints secret VALUES — only presence/booleans and var NAMES.
-    """
-    run_id = os.environ.get("DOMINO_RUN_ID", "")
-    L = ["[lifecycle] ---- config resolution diagnostics ----"]
-    L.append(
-        f"  env: DD_ENGINE={engine or '<unset>'} "
-        f"DOMINO_PROJECT_NAME={os.environ.get('DOMINO_PROJECT_NAME', '<unset>')} "
-        f"DOMINO_DATASETS_DIR={os.environ.get('DOMINO_DATASETS_DIR', '<unset>')}"
-    )
-    L.append(
-        f"  ids: DOMINO_RUN_ID={run_id or '<unset>'} "
-        f"DOMINO_PROJECT_ID={'set' if os.environ.get('DOMINO_PROJECT_ID') else '<unset>'} "
-        f"DOMINO_USER_API_KEY={'set' if os.environ.get('DOMINO_USER_API_KEY') else '<unset>'} "
-        f"DOMINO_API_PROXY={os.environ.get('DOMINO_API_PROXY', '<unset>')}"
-    )
-    cfg_vars = sorted(k for k in os.environ if k.startswith("DD_CFG_"))
-    L.append(f"  project-env: DD_CFG_* vars present={cfg_vars or '<none>'}")
-    if run_id:
-        try:
-            apps = _fetch_apps_via_api()
-            match = _app_from_run_id(run_id)
-            L.append(
-                f"  project-env: API returned {len(apps)} app(s); "
-                f"run_id matched app_id={(match or {}).get('id', '<no match>')}"
-            )
-            if not match:
-                L.append(f"  project-env: looking for run_id={run_id}; apps seen:")
-                for a in apps[:10]:
-                    L.append(
-                        f"      app id={a.get('id')} "
-                        f"latestAppInstanceId={a.get('latestAppInstanceId')} "
-                        f"status={a.get('status')}"
-                    )
-            if match:
-                want = f"DD_CFG_{(match.get('id') or '').upper()}"
-                L.append(
-                    f"  project-env: expected var {want} "
-                    f"{'PRESENT' if os.environ.get(want) else 'MISSING — wizard did not set it'}"
-                )
-        except Exception as e:  # diagnostics must never mask the real error
-            L.append(f"  project-env: API probe errored: {e}")
-    else:
-        L.append("  project-env: DOMINO_RUN_ID unset — cannot resolve app_id")
-    for d in search_dirs:
-        if d.exists():
-            jsons = [p.name for p in d.glob("*.json")]
-            L.append(f"  file: {d} exists, *.json={jsons or '<none>'}")
-        else:
-            L.append(f"  file: {d} MISSING")
-    L.append("[lifecycle] ---- end diagnostics ----")
-    return "\n".join(L)
+    import base64
+    try:
+        return json.loads(base64.b64decode(raw).decode())
+    except Exception as e:
+        sys.stderr.write(f"[lifecycle] {var_name} present but undecodable: {e}\n")
+        return None
 
 
 # --------------------------------------------------------------------------

@@ -253,9 +253,15 @@ DEFAULT_WORKSPACE_TOOLS = [
 
 def add_environment_revision(env_id: str, dockerfile: str, image: str, summary: str = "",
                               pre_run_script: str = "",
-                              workspace_tools: list | None = None) -> dict:
+                              workspace_tools: list | None = None,
+                              skip_cache: bool = False) -> dict:
     """Add a new revision. Returns the full API response dict so callers can
-    extract revision id, build id, etc."""
+    extract revision id, build id, etc.
+
+    skip_cache=True forces a no-cache build — essential for the dd-*-app envs
+    because their code-pull RUN line is identical every build, so Docker would
+    otherwise reuse a cached layer and bake STALE code from a previous `main`.
+    """
     body = {
         "dockerfileInstructions": dockerfile,
         "environmentVariables": [],
@@ -264,7 +270,7 @@ def add_environment_revision(env_id: str, dockerfile: str, image: str, summary: 
         "postSetupScript": "",
         "preRunScript": pre_run_script,
         "preSetupScript": "",
-        "skipCache": False,
+        "skipCache": skip_cache,
         "summary": summary,
         "supportedClusters": [],
         "tags": [],

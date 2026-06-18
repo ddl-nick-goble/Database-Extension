@@ -32,23 +32,6 @@ log = logging.getLogger("wizard")
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
 
-# Per-DB config files live in the project's default dataset so the DB
-# Apps (which boot in the same project) can read them without depending
-# on /mnt/code being THIS repo. Same default as dbapp.lifecycle.
-_DD_CONFIGS_DEFAULT = (
-    f"{os.environ.get('DOMINO_DATASETS_DIR', '/mnt/data')}/"
-    f"{os.environ.get('DOMINO_PROJECT_NAME', 'default')}/_dd_configs"
-)
-DBAPPS_DIR = Path(os.environ.get("DD_DBAPPS_DIR", _DD_CONFIGS_DEFAULT))
-try:
-    DBAPPS_DIR.mkdir(parents=True, exist_ok=True)
-except OSError as e:
-    log.warning(
-        "Could not create DBAPPS_DIR %s: %s — wizard will run without dataset-backed config storage "
-        "(DD_CONFIG_JSON is the primary delivery mechanism and does not require this path)",
-        DBAPPS_DIR, e,
-    )
-
 
 def _dataset_name(full_name: str) -> str:
     """Domino-safe dataset name for a DB's dedicated backup dataset.
@@ -117,35 +100,13 @@ def _pin_dockerfile_to_commit(dockerfile: str) -> tuple[str, str]:
     return df, f"main (cachebust {token})"
 
 
-def _config_pre_run_script(app_name: str, config_json: str) -> str:
-    """Build a shell pre-run script that lands this DB's config where the
-    lifecycle will find it on FIRST boot — before any per-DB dataset we create
-    is mounted (a freshly-created dataset only mounts on the App's next start).
-
-    Writes the config to two locations that are always present in the target
-    project's container at boot:
-
-      1. /mnt/code/dbapps/<name>.json
-            repo-relative fallback dir (lifecycle searches it directly).
-      2. <DATASETS_DIR>/<PROJECT_NAME>/_dd_configs/<name>.json
-            the project's DEFAULT dataset, which is mounted on first boot and
-            is exactly the DBAPPS_DIR that lifecycle.find_config() searches.
-            This is the durable, cross-project-safe channel — the previous
-            single /mnt/code write could go missing and left boot with no
-            config at all.
-
-    It also (re)writes the entry launcher so the App boots into /opt/dd/app.sh.
-    base64 keeps the JSON intact inside the shell regardless of quoting; the
-    default-dataset write is best-effort so a read-only mount never blocks boot.
+def _launcher_pre_run_script() -> str:
+    """Pre-run script for the DB App: write the entry launcher that boots into
+    /opt/dd/app.sh. Config is delivered out-of-band via the DD_CFG_<instance_id>
+    project env var (set in the create flow right after start), so nothing else
+    is written here.
     """
-    encoded = base64.b64encode(config_json.encode()).decode()
     return (
-        f"ENC='{encoded}'\n"
-        "mkdir -p /mnt/code/dbapps\n"
-        f'printf %s "$ENC" | base64 -d > /mnt/code/dbapps/{app_name}.json\n'
-        'DD_CFG_DIR="${DOMINO_DATASETS_DIR:-/mnt/data}/${DOMINO_PROJECT_NAME:-default}/_dd_configs"\n'
-        'mkdir -p "$DD_CFG_DIR" 2>/dev/null || true\n'
-        f'printf %s "$ENC" | base64 -d > "$DD_CFG_DIR/{app_name}.json" 2>/dev/null || true\n'
         "echo '#!/usr/bin/env bash' > /mnt/code/dd-db-launcher.sh\n"
         "echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/dd-db-launcher.sh\n"
         "chmod +x /mnt/code/dd-db-launcher.sh\n"
@@ -484,7 +445,6 @@ def api_create_database():
         #    tunnel_url/app_id are NOT needed by the lifecycle at boot; they're
         #    display-only in the router status page.
         t2 = time.monotonic()
-        config_path = DBAPPS_DIR / f"{full_name}.json"
         yield sse("step", msg=f"Building config for {full_name}", phase="config")
 
         cfg = {
@@ -498,11 +458,9 @@ def api_create_database():
             "snapshot_dir": snapshot_dir,
         }
 
-        # Embed config in the app-level pre-run script at CREATE time.
-        # This is the only delivery path that works reliably across all
-        # Domino versions — start-time environmentVariables/preRunScript
-        # fields are silently ignored by some instances.
-        config_script = _config_pre_run_script(full_name, json.dumps(cfg))
+        # The pre-run script only writes the entry launcher; the config is
+        # delivered via the DD_CFG_<instance_id> project env var after start.
+        config_script = _launcher_pre_run_script()
 
         yield sse("ok", msg="Config built", ms=since(t2))
 
@@ -533,8 +491,7 @@ def api_create_database():
         app_version_id = (a.get("currentVersion") or {}).get("id", "")
         yield sse("ok", msg=f"App created (id={app_id_str})", ms=since(t3))
 
-        # 5. Now that we have the app ID, pin tunnel_url into the local
-        #    fallback config (wizard's own dataset only — for restart recovery).
+        # 5. Pin display-only fields into cfg now that we have the app id.
         t4 = time.monotonic()
         if app_id_str:
             apps_host = dapi.PUBLIC_HOST.rstrip("/")
@@ -542,8 +499,6 @@ def api_create_database():
                 apps_host = "https://apps." + apps_host[len("https://"):]
             cfg["tunnel_url"] = f"{apps_host}/apps-internal/{app_id_str}/"
             cfg["app_id"] = app_id_str
-        config_path.write_text(json.dumps(cfg, indent=2))
-        os.chmod(config_path, 0o600)
 
         # Set snapshot path as project env var (visible in project settings).
         try:
@@ -551,29 +506,12 @@ def api_create_database():
         except Exception as e:
             yield sse("warn", msg=f"Could not set {snap_var} on project: {e}")
 
-        # Primary config-delivery channel: stash the full config (base64 JSON)
-        # as a project env var keyed by app_id. Project env vars are reliably
-        # injected into the App's container, so the lifecycle reads this back at
-        # boot (resolving its own app_id from DOMINO_RUN_ID) — no dependency on
-        # /mnt/code writes (wiped by the run container's git checkout) or on
-        # version preRunScript/env (silently dropped on some Domino builds).
-        if app_id_str:
-            cfg_var = f"DD_CFG_{app_id_str.upper()}"
-            try:
-                dapi.set_project_env_var(
-                    target_project_id, cfg_var,
-                    base64.b64encode(json.dumps(cfg).encode()).decode(),
-                )
-                yield sse("ok", msg=f"Config delivered via project env {cfg_var}")
-            except Exception as e:
-                yield sse("warn", msg=f"Could not set {cfg_var} on project: {e} — "
-                                      f"boot will fall back to the file channels")
-
         yield sse("ok", msg="Config finalised", ms=since(t4))
 
         # 6. Start — env+hw must be passed explicitly (create's version fields
         #    are silently dropped on some Domino builds). Retry up to 3×.
         start_ok = False
+        run_cfg_set = False  # have we stashed DD_CFG_<instance_id> yet?
         for attempt in (1, 2, 3):
             yield sse("step", msg=f"/start attempt {attempt}", phase="start", attempt=attempt)
             try:
@@ -604,7 +542,28 @@ def api_create_database():
             except Exception as e:
                 yield sse("warn", msg=f"attempt {attempt}: status probe failed: {e}")
                 continue
-            ci_status = (current.get("currentVersion", {}) or {}).get("currentInstance", {}).get("status", "")
+            current_ci = (current.get("currentVersion", {}) or {}).get("currentInstance", {}) or {}
+            ci_status = current_ci.get("status", "")
+
+            # Config delivery: the instant this instance has an id, stash the
+            # config keyed by it as a project env var. The container reads
+            # DD_CFG_<DOMINO_RUN_ID> directly at boot — no API, no listing, no
+            # matching. We set it now, while the container is still pulling its
+            # image / running setup (~30-60s), so it's in the env snapshot by the
+            # time the entry script runs.
+            ci_id = current_ci.get("id") or ""
+            if ci_id and not run_cfg_set:
+                rid_var = f"DD_CFG_{ci_id.upper()}"
+                try:
+                    dapi.set_project_env_var(
+                        target_project_id, rid_var,
+                        base64.b64encode(json.dumps(cfg).encode()).decode(),
+                    )
+                    run_cfg_set = True
+                    yield sse("ok", msg=f"Config bound to instance via {rid_var}")
+                except Exception as e:
+                    yield sse("error", msg=f"Could not set {rid_var}: {e} — DB will not boot")
+
             if ci_status.lower() in ("queued", "pending", "preparing", "running"):
                 log.info("attempt %d: instance reached %s", attempt, ci_status)
                 yield sse("ok", msg=f"attempt {attempt}: instance status={ci_status}", ms=0, attempt=attempt)
@@ -1015,6 +974,7 @@ def api_build_environment(engine: str):
                 env_id, dockerfile, image,
                 summary=f"{canonical_name} — built via Environments tab",
                 pre_run_script=pre_run_script,
+                skip_cache=True,  # never bake stale code from a cached layer
             )
         except Exception as e:
             yield sse("error", msg="add_environment_revision failed", detail=str(e))

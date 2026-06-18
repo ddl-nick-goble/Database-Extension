@@ -81,44 +81,20 @@ def test_backup_dataset_path_is_scannable_by_lifecycle(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _config_pre_run_script — robust dual-location config delivery
+# _launcher_pre_run_script — writes only the entry launcher (no config)
 # ---------------------------------------------------------------------------
-def _extract_cfg(script: str) -> dict:
-    enc = script.split("ENC='", 1)[1].split("'", 1)[0]
-    return json.loads(base64.b64decode(enc).decode())
-
-
-def test_pre_run_script_roundtrips_config():
-    cfg = {"engine": "postgres", "db_id": "pg-market",
-           "snapshot_dir": "/mnt/data/db-pg-market"}
-    script = app._config_pre_run_script("pg-market", json.dumps(cfg))
-    assert _extract_cfg(script) == cfg
-
-
-def test_pre_run_script_writes_both_locations():
-    script = app._config_pre_run_script("pg-market", json.dumps({"a": 1}))
-    # 1. repo-relative fallback dir
-    assert "/mnt/code/dbapps/pg-market.json" in script
-    # 2. default-dataset _dd_configs dir (the durable, cross-project channel
-    #    that lifecycle.find_config() searches as DBAPPS_DIR) — this is the
-    #    one whose absence caused the "No config file found" boot failure.
-    assert "_dd_configs" in script
-    assert "${DOMINO_DATASETS_DIR:-/mnt/data}" in script
-    assert "${DOMINO_PROJECT_NAME:-default}" in script
-    assert 'DD_CFG_DIR/pg-market.json' in script
-
-
-def test_pre_run_script_rewrites_launcher():
-    script = app._config_pre_run_script("pg-market", json.dumps({"a": 1}))
+def test_launcher_pre_run_script_writes_launcher():
+    script = app._launcher_pre_run_script()
     assert "dd-db-launcher.sh" in script
     assert "exec /opt/dd/app.sh" in script
 
 
-def test_pre_run_script_default_dataset_write_is_best_effort():
-    # A read-only default dataset must not abort boot — write is guarded.
-    script = app._config_pre_run_script("pg-market", json.dumps({"a": 1}))
-    cfg_write = [ln for ln in script.splitlines() if "DD_CFG_DIR/" in ln][0]
-    assert "|| true" in cfg_write
+def test_launcher_pre_run_script_carries_no_config():
+    # Config is delivered via DD_CFG_<instance_id>, never baked into the script.
+    script = app._launcher_pre_run_script()
+    assert "DD_CFG" not in script
+    assert "_dd_configs" not in script
+    assert "base64" not in script
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +148,8 @@ def fake_domino(monkeypatch):
         return {}
 
     def _get_app(app_id):
-        return {"currentVersion": {"currentInstance": {"status": "Running"}}}
+        # Includes the instance id so the create flow can stash DD_CFG_<run_id>.
+        return {"currentVersion": {"currentInstance": {"id": "inst-9", "status": "Running"}}}
 
     def _set_env(project_id, name, value):
         calls["set_project_env_var"].append({"project_id": project_id, "name": name, "value": value})
@@ -183,9 +160,6 @@ def fake_domino(monkeypatch):
     monkeypatch.setattr(dapi, "start_app", _start_app)
     monkeypatch.setattr(dapi, "get_app", _get_app)
     monkeypatch.setattr(dapi, "set_project_env_var", _set_env)
-    # Don't actually write the wizard-local fallback config to a real dataset.
-    monkeypatch.setattr(app, "DBAPPS_DIR", Path("/tmp/dd-test-dbapps"))
-    Path("/tmp/dd-test-dbapps").mkdir(parents=True, exist_ok=True)
     # Skip the 8s-per-attempt start wait.
     monkeypatch.setattr(app.time, "sleep", lambda *_a, **_k: None)
     return calls
@@ -212,20 +186,29 @@ def test_create_makes_dataset_in_target_project(wizard_client, fake_domino):
     assert "error" not in kinds
 
 
-def test_create_bakes_snapshot_dir_into_config(wizard_client, fake_domino):
+def test_create_delivers_config_via_instance_env_var(wizard_client, fake_domino):
     resp = wizard_client.post("/api/databases", json={
         "engine": "postgres", "name": "market",
         "environmentId": "env-1", "hardwareTierId": "hw-1",
         "password": "secret", "projectId": "target-proj",
     })
     _collect_sse(resp)  # consume the stream so the generator runs
-    # The app is created with a pre-run script carrying the config; the config
-    # must include snapshot_dir pointing at the dedicated dataset's mount.
-    create_kwargs = fake_domino["create_app"][0]
-    cfg = _extract_cfg(create_kwargs["pre_run_script"])
+
+    # Config is delivered as DD_CFG_<instance_id> (uppercased), in the target
+    # project, carrying snapshot_dir + db_id.
+    cfg_sets = [c for c in fake_domino["set_project_env_var"]
+                if c["name"].startswith("DD_CFG_")]
+    assert len(cfg_sets) == 1
+    var = cfg_sets[0]
+    assert var["name"] == "DD_CFG_INST-9"  # instance id "inst-9" uppercased
+    assert var["project_id"] == "target-proj"
+    cfg = json.loads(base64.b64decode(var["value"]).decode())
     assert cfg["snapshot_dir"] == "/mnt/data/db-pg-market"
     assert cfg["db_id"] == "pg-market"
-    # App is created in the target project too.
+
+    # The app's pre-run script is launcher-only — no config baked in.
+    create_kwargs = fake_domino["create_app"][0]
+    assert "DD_CFG" not in create_kwargs["pre_run_script"]
     assert create_kwargs["project_id"] == "target-proj"
 
 

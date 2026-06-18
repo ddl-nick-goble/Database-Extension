@@ -230,11 +230,23 @@ def _fetch_apps_via_api() -> list[dict]:
 
 
 def _app_from_run_id(run_id: str) -> dict | None:
-    """Return the App dict whose current instance id matches `run_id`, or None."""
+    """Return the App dict whose running instance matches `run_id`, or None.
+
+    DOMINO_RUN_ID is the App instance id. In the /v4/modelProducts response
+    (schema ModelProduct) that lives in `latestAppInstanceId` — there is NO
+    `currentVersion.currentInstance.id` field, which is why the original matcher
+    never matched cross-project. We check the correct field first and keep the
+    older shapes as defensive fallbacks across Domino builds.
+    """
     for a in _fetch_apps_via_api():
+        if a.get("latestAppInstanceId") == run_id:
+            return a
         ci = (a.get("currentVersion") or {}).get("currentInstance") or {}
         if ci.get("id") == run_id:
             return a
+        for key in ("runningInstanceId", "currentInstanceId", "appInstanceId"):
+            if a.get(key) == run_id:
+                return a
     return None
 
 
@@ -322,6 +334,14 @@ def _resolution_diagnostics(search_dirs: list[Path], engine: str) -> str:
                 f"  project-env: API returned {len(apps)} app(s); "
                 f"run_id matched app_id={(match or {}).get('id', '<no match>')}"
             )
+            if not match:
+                L.append(f"  project-env: looking for run_id={run_id}; apps seen:")
+                for a in apps[:10]:
+                    L.append(
+                        f"      app id={a.get('id')} "
+                        f"latestAppInstanceId={a.get('latestAppInstanceId')} "
+                        f"status={a.get('status')}"
+                    )
             if match:
                 want = f"DD_CFG_{(match.get('id') or '').upper()}"
                 L.append(

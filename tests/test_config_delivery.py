@@ -25,14 +25,26 @@ def _b64(d):
 # ---------------------------------------------------------------------------
 # _app_from_run_id — match the App by current instance id
 # ---------------------------------------------------------------------------
-def test_app_from_run_id_matches(monkeypatch):
+def test_app_from_run_id_matches_latest_instance_id(monkeypatch):
+    # The real /v4/modelProducts field is latestAppInstanceId (== DOMINO_RUN_ID).
     apps = [
-        {"id": "app-A", "currentVersion": {"currentInstance": {"id": "run-1"}}},
-        {"id": "app-B", "currentVersion": {"currentInstance": {"id": "run-2"}}},
+        {"id": "app-A", "latestAppInstanceId": "run-1"},
+        {"id": "app-B", "latestAppInstanceId": "run-2"},
     ]
     monkeypatch.setattr(lc, "_fetch_apps_via_api", lambda: apps)
     assert lc._app_from_run_id("run-2")["id"] == "app-B"
     assert lc._app_from_run_id("run-x") is None
+
+
+def test_app_from_run_id_fallback_shapes(monkeypatch):
+    # Defensive fallbacks for other Domino API shapes still work.
+    apps = [
+        {"id": "app-A", "currentVersion": {"currentInstance": {"id": "run-1"}}},
+        {"id": "app-B", "runningInstanceId": "run-2"},
+    ]
+    monkeypatch.setattr(lc, "_fetch_apps_via_api", lambda: apps)
+    assert lc._app_from_run_id("run-1")["id"] == "app-A"
+    assert lc._app_from_run_id("run-2")["id"] == "app-B"
 
 
 # ---------------------------------------------------------------------------

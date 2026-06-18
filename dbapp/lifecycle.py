@@ -29,16 +29,20 @@ import time
 from pathlib import Path
 
 def find_config() -> dict:
-    """Locate this App's config — happy path only.
+    """Locate this App's config.
 
-    The wizard stashes the config as a base64-JSON project env var keyed by this
-    App instance's id: DD_CFG_<DOMINO_RUN_ID>. It is set right after start, so it
-    is already in the container's env by the time this runs. We read it directly
-    — no Domino API call, no file scan, no app-id matching, no fallbacks.
+    The wizard stashes the config as a base64-JSON project env var keyed by the
+    App's STABLE id: DD_CFG_<app_id>, set at create time (before the container
+    exists). At boot we resolve our own app_id from DOMINO_RUN_ID via the Domino
+    API and read that var.
+
+    Why not key by run_id: the run/instance id is only assigned when the
+    container launches, changes on every (re)start, and the wizard can't know it
+    ahead of time — so it can't be the key. The app_id is stable.
 
     DD_CONFIG_JSON (inline) is honored first for manual / self-contained runs.
     """
-    sys.stderr.write("[lifecycle] find_config build=projenv-v2 (run-id env)\n")
+    sys.stderr.write("[lifecycle] find_config build=appid-v3\n")
 
     inline = os.environ.get("DD_CONFIG_JSON", "").strip()
     if inline:
@@ -46,17 +50,17 @@ def find_config() -> dict:
         return json.loads(inline)
 
     run_id = os.environ.get("DOMINO_RUN_ID", "")
-    cfg = _decode_cfg_env(f"DD_CFG_{run_id.upper()}") if run_id else None
-    if cfg is not None:
-        sys.stderr.write(f"[lifecycle] config from project env DD_CFG_{run_id}\n")
-        return cfg
+    app_id = _resolve_app_id(run_id) if run_id else ""
+    if app_id:
+        cfg = _decode_cfg_env(f"DD_CFG_{app_id.upper()}")
+        if cfg is not None:
+            sys.stderr.write(f"[lifecycle] config from project env DD_CFG_{app_id}\n")
+            return cfg
 
-    present = sorted(k for k in os.environ if k.startswith("DD_CFG_"))
+    sys.stderr.write(_config_diagnostics(run_id, app_id) + "\n")
     raise RuntimeError(
-        f"No config: DD_CFG_{run_id.upper()} is not set "
-        f"(DOMINO_RUN_ID={run_id or '<unset>'}). DD_CFG_* present={present or '<none>'}. "
-        f"The wizard sets DD_CFG_<instance_id> right after start — confirm the "
-        f"create flow reached the start step and set it on this project."
+        f"No config: could not resolve a config for run_id={run_id or '<unset>'} "
+        f"(resolved app_id={app_id or '<none>'}). See diagnostics above."
     )
 
 
@@ -72,6 +76,106 @@ def _decode_cfg_env(var_name: str) -> dict | None:
     except Exception as e:
         sys.stderr.write(f"[lifecycle] {var_name} present but undecodable: {e}\n")
         return None
+
+
+def _domino_api_bases() -> list[str]:
+    """Domino API base URLs to try, in order: the in-pod proxy first, then the
+    public nucleus host (reachable over the network, independent of the local
+    sidecar's startup timing)."""
+    bases: list[str] = []
+    proxy = os.environ.get("DOMINO_API_PROXY", "http://localhost:8899")
+    if proxy:
+        bases.append(proxy.rstrip("/"))
+    host = (os.environ.get("DOMINO_API_HOST")
+            or os.environ.get("DOMINO_PUBLIC_HOST", "")).rstrip("/")
+    if host and host not in bases:
+        bases.append(host)
+    return bases
+
+
+def _fetch_apps_via_api() -> list[dict]:
+    """List this project's Apps via the Domino API (self-contained: `requests`
+    + standard DOMINO_* env vars, no domino_api import)."""
+    api_key = os.environ.get("DOMINO_USER_API_KEY", "")
+    project_id = os.environ.get("DOMINO_PROJECT_ID", "")
+    if not (api_key and project_id):
+        return []
+    import requests
+    for base in _domino_api_bases():
+        try:
+            r = requests.get(
+                f"{base}/v4/modelProducts",
+                params={"projectId": project_id},
+                headers={"X-Domino-Api-Key": api_key},
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            sys.stderr.write(f"[lifecycle] app list via API failed ({base}): {e}\n")
+            continue
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for k in ("data", "items", "results"):
+                if isinstance(data.get(k), list):
+                    return data[k]
+        return []
+    return []
+
+
+def _app_id_from_apps(apps: list[dict], run_id: str) -> str:
+    """Find the app whose running instance matches `run_id`. In the
+    /v4/modelProducts schema the instance id is `latestAppInstanceId`."""
+    for a in apps:
+        if a.get("latestAppInstanceId") == run_id:
+            return a.get("id", "")
+        for key in ("runningInstanceId", "currentInstanceId", "appInstanceId"):
+            if a.get(key) == run_id:
+                return a.get("id", "")
+    return ""
+
+
+def _resolve_app_id(run_id: str, timeout_s: float = 60, poll_s: float = 3) -> str:
+    """Map DOMINO_RUN_ID -> app_id via the Domino API. The in-pod proxy may not
+    be listening yet at boot, so retry until it (or the public host) answers and
+    this app appears in the listing."""
+    import time as _time
+    deadline = _time.monotonic() + timeout_s
+    while True:
+        app_id = _app_id_from_apps(_fetch_apps_via_api(), run_id)
+        if app_id:
+            return app_id
+        if _time.monotonic() >= deadline:
+            return ""
+        sys.stderr.write("[lifecycle] API not ready / app not listed yet — waiting…\n")
+        _time.sleep(poll_s)
+
+
+def _config_diagnostics(run_id: str, app_id: str) -> str:
+    """Dump everything find_config used, for the boot log."""
+    L = ["[lifecycle] ---- config diagnostics ----"]
+    L.append(
+        f"  ids: DOMINO_RUN_ID={run_id or '<unset>'} resolved_app_id={app_id or '<none>'} "
+        f"DOMINO_PROJECT_ID={'set' if os.environ.get('DOMINO_PROJECT_ID') else '<unset>'} "
+        f"DOMINO_USER_API_KEY={'set' if os.environ.get('DOMINO_USER_API_KEY') else '<unset>'}"
+    )
+    cfg_vars = sorted(k for k in os.environ if k.startswith("DD_CFG_"))
+    L.append(f"  DD_CFG_* present={cfg_vars or '<none>'}")
+    if app_id:
+        want = f"DD_CFG_{app_id.upper()}"
+        L.append(f"  expected var {want} "
+                 f"{'PRESENT' if os.environ.get(want) else 'MISSING — wizard did not set it'}")
+    try:
+        apps = _fetch_apps_via_api()
+        L.append(f"  API returned {len(apps)} app(s); looking for run_id={run_id}:")
+        for a in apps[:12]:
+            L.append(f"      app id={a.get('id')} latestAppInstanceId={a.get('latestAppInstanceId')} "
+                     f"status={a.get('status')}")
+    except Exception as e:
+        L.append(f"  API probe errored: {e}")
+    L.append("[lifecycle] ---- end diagnostics ----")
+    return "\n".join(L)
 
 
 # --------------------------------------------------------------------------

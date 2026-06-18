@@ -172,7 +172,7 @@ def test_create_makes_dataset_in_target_project(wizard_client, fake_domino):
     assert "error" not in kinds
 
 
-def test_create_delivers_config_via_instance_env_var(wizard_client, fake_domino):
+def test_create_delivers_config_via_app_id_env_var(wizard_client, fake_domino):
     resp = wizard_client.post("/api/databases", json={
         "engine": "postgres", "name": "market",
         "environmentId": "env-1", "hardwareTierId": "hw-1",
@@ -180,13 +180,13 @@ def test_create_delivers_config_via_instance_env_var(wizard_client, fake_domino)
     })
     _collect_sse(resp)  # consume the stream so the generator runs
 
-    # Config is delivered as DD_CFG_<instance_id> (uppercased), in the target
+    # Config is delivered as DD_CFG_<app_id> (uppercased), in the target
     # project, carrying snapshot_dir + db_id.
     cfg_sets = [c for c in fake_domino["set_project_env_var"]
                 if c["name"].startswith("DD_CFG_")]
     assert len(cfg_sets) == 1
     var = cfg_sets[0]
-    assert var["name"] == "DD_CFG_INST-9"  # instance id "inst-9" uppercased
+    assert var["name"] == "DD_CFG_APP-1"  # app id "app-1" uppercased
     assert var["project_id"] == "target-proj"
     cfg = json.loads(base64.b64decode(var["value"]).decode())
     assert cfg["snapshot_dir"] == "/mnt/data/db-pg-market"

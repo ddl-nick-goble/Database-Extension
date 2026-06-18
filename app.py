@@ -508,12 +508,27 @@ def api_create_database():
         except Exception as e:
             yield sse("warn", msg=f"Could not set {snap_var} on project: {e}")
 
+        # Config delivery: stash the config as a project env var keyed by the
+        # app's STABLE id. Done now (before start), so it's in the container's
+        # env snapshot at boot. The container resolves its app_id from
+        # DOMINO_RUN_ID via the Domino API and reads this var.
+        if app_id_str:
+            cfg_var = f"DD_CFG_{app_id_str.upper()}"
+            try:
+                dapi.set_project_env_var(
+                    target_project_id, cfg_var,
+                    base64.b64encode(json.dumps(cfg).encode()).decode(),
+                )
+                yield sse("ok", msg=f"Config delivered via project env {cfg_var}")
+            except Exception as e:
+                yield sse("error", msg=f"Could not set {cfg_var}: {e} — DB will not boot")
+                return
+
         yield sse("ok", msg="Config finalised", ms=since(t4))
 
         # 6. Start — env+hw must be passed explicitly (create's version fields
         #    are silently dropped on some Domino builds). Retry up to 3×.
         start_ok = False
-        run_cfg_set = False  # have we stashed DD_CFG_<instance_id> yet?
         for attempt in (1, 2, 3):
             yield sse("step", msg=f"/start attempt {attempt}", phase="start", attempt=attempt)
             try:
@@ -544,28 +559,7 @@ def api_create_database():
             except Exception as e:
                 yield sse("warn", msg=f"attempt {attempt}: status probe failed: {e}")
                 continue
-            current_ci = (current.get("currentVersion", {}) or {}).get("currentInstance", {}) or {}
-            ci_status = current_ci.get("status", "")
-
-            # Config delivery: the instant this instance has an id, stash the
-            # config keyed by it as a project env var. The container reads
-            # DD_CFG_<DOMINO_RUN_ID> directly at boot — no API, no listing, no
-            # matching. We set it now, while the container is still pulling its
-            # image / running setup (~30-60s), so it's in the env snapshot by the
-            # time the entry script runs.
-            ci_id = current_ci.get("id") or ""
-            if ci_id and not run_cfg_set:
-                rid_var = f"DD_CFG_{ci_id.upper()}"
-                try:
-                    dapi.set_project_env_var(
-                        target_project_id, rid_var,
-                        base64.b64encode(json.dumps(cfg).encode()).decode(),
-                    )
-                    run_cfg_set = True
-                    yield sse("ok", msg=f"Config bound to instance via {rid_var}")
-                except Exception as e:
-                    yield sse("error", msg=f"Could not set {rid_var}: {e} — DB will not boot")
-
+            ci_status = (current.get("currentVersion", {}) or {}).get("currentInstance", {}).get("status", "")
             if ci_status.lower() in ("queued", "pending", "preparing", "running"):
                 log.info("attempt %d: instance reached %s", attempt, ci_status)
                 yield sse("ok", msg=f"attempt {attempt}: instance status={ci_status}", ms=0, attempt=attempt)

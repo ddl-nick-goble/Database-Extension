@@ -444,6 +444,12 @@ def api_config():
 # --------------------------------------------------------------------------
 # Wire-protocol tunnel (WebSocket ↔ TCP) — engine-agnostic
 # --------------------------------------------------------------------------
+# Big pipes: 1 MiB kernel socket buffers + 256 KiB userspace read chunks.
+# Overridable via env for ops tuning without a code change.
+_WIRE_SOCK_BUF = int(os.environ.get("DD_WIRE_SOCK_BUF", str(1 << 20)))
+_WIRE_CHUNK = int(os.environ.get("DD_WIRE_CHUNK", str(256 * 1024)))
+
+
 @sock.route("/wire")
 def wire(ws):
     """Byte-transparent relay between an incoming WebSocket and the local
@@ -459,6 +465,15 @@ def wire(ws):
         # cleaned up instead of lingering as zombie threads.
         tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         tcp.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # Big pipes: widen the kernel socket buffers so bulk transfers
+        # (Redis pipelines / large GETs, Postgres COPY, mongodump) aren't
+        # throttled by a small default window. Best-effort — the kernel
+        # clamps to net.core.{r,w}mem_max, so a failure here is non-fatal.
+        for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+            try:
+                tcp.setsockopt(socket.SOL_SOCKET, opt, _WIRE_SOCK_BUF)
+            except OSError:
+                pass
         tcp.connect(("127.0.0.1", ENGINE_PORT))
         tcp.settimeout(None)
     except OSError as e:
@@ -470,7 +485,7 @@ def wire(ws):
     def tcp_to_ws():
         try:
             while not stop.is_set():
-                chunk = tcp.recv(65536)
+                chunk = tcp.recv(_WIRE_CHUNK)
                 if not chunk:
                     return
                 ws.send(chunk)

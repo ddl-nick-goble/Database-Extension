@@ -38,7 +38,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg curl ca-c
 RUN curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb.gpg && echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" > /etc/apt/sources.list.d/mongodb-org-7.0.list && apt-get update && apt-get install -y --no-install-recommends mongodb-mongosh && rm -rf /var/lib/apt/lists/*
 
 # Install dd auto-connect scripts from the Database-Extension repo.
-RUN mkdir -p /opt/dd && curl -fsSL https://codeload.github.com/ddl-nick-goble/Database-Extension/tar.gz/refs/heads/main -o /tmp/dd-src.tar.gz && tar -xzf /tmp/dd-src.tar.gz -C /tmp && cp /tmp/Database-Extension-main/client/domino-db-tunnel.py /opt/dd/domino-db-tunnel.py && cp /tmp/Database-Extension-main/client/dd-workspace-setup.py /opt/dd/workspace-setup.py && chmod +x /opt/dd/domino-db-tunnel.py /opt/dd/workspace-setup.py && rm -rf /tmp/dd-src.tar.gz /tmp/Database-Extension-main
+# Client auto-connect scripts baked as a FALLBACK. A workspace in THIS
+# project can point its preRunScript at /mnt/code/client/dd-workspace-setup.py
+# instead, so a failed fetch (private repo without a token) must NOT abort the
+# build. Pass --build-arg GITHUB_TOKEN=<pat> for a private repo.
+ARG GITHUB_TOKEN=
+RUN mkdir -p /opt/dd && ( set -e; if [ -n "$GITHUB_TOKEN" ]; then curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://codeload.github.com/ddl-nick-goble/Database-Extension/tar.gz/refs/heads/main -o /tmp/dd-src.tar.gz; else curl -fsSL https://codeload.github.com/ddl-nick-goble/Database-Extension/tar.gz/refs/heads/main -o /tmp/dd-src.tar.gz; fi && tar -xzf /tmp/dd-src.tar.gz -C /tmp && cp /tmp/Database-Extension-main/client/domino-db-tunnel.py /opt/dd/domino-db-tunnel.py && cp /tmp/Database-Extension-main/client/dd-workspace-setup.py /opt/dd/workspace-setup.py && chmod +x /opt/dd/domino-db-tunnel.py /opt/dd/workspace-setup.py && rm -rf /tmp/dd-src.tar.gz /tmp/Database-Extension-main ) || echo "[dd] WARN: could not bake client scripts from GitHub at build time (private repo without GITHUB_TOKEN, or no network). In THIS project, point preRunScript at /mnt/code/client/dd-workspace-setup.py. For cross-project drop-in, rebuild with --build-arg GITHUB_TOKEN=<pat> or make the repo public."
 
 RUN mkdir -p /var/log/dd && chown -R ubuntu:ubuntu /var/log/dd /opt/dd
 

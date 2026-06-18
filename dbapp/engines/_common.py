@@ -33,6 +33,57 @@ def data_path(cfg: dict, engine: str, default: str | None = None) -> Path:
 
 
 # --------------------------------------------------------------------------
+# Container memory detection — used to size engine memory budgets to the
+# hardware tier instead of a flat constant. "Big pipe": a DB on a 64 GB
+# tier should be allowed to use the box, not an arbitrary 1 GB.
+# --------------------------------------------------------------------------
+def container_memory_bytes() -> int | None:
+    """Best-effort detection of this container's memory limit, in bytes.
+
+    Order: cgroup v2 (memory.max) → cgroup v1 (memory.limit_in_bytes) →
+    /proc/meminfo MemTotal. Returns None if nothing is readable or the
+    limit is effectively unbounded (so the caller can fall back to a
+    conservative default rather than handing Redis all of host RAM).
+    """
+    # cgroup v2
+    for path in ("/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            raw = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if raw == "max":
+            continue  # unbounded cgroup → fall through to MemTotal
+        try:
+            val = int(raw)
+        except ValueError:
+            continue
+        # cgroup v1 reports a sentinel close to INT64_MAX when unlimited.
+        if 0 < val < (1 << 62):
+            return val
+
+    # Host memory as a last resort.
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                kb = int(line.split()[1])
+                return kb * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def human_bytes(n: int) -> str:
+    """Render a byte count as a redis-conf-friendly size (e.g. '4096mb').
+
+    Redis accepts mb/gb suffixes; we emit whole megabytes to avoid float
+    formatting surprises in the generated config.
+    """
+    mb = max(1, n // (1024 * 1024))
+    return f"{mb}mb"
+
+
+# --------------------------------------------------------------------------
 # Process-launch + wait-for-ready
 # --------------------------------------------------------------------------
 def wait_for_port(port: int, timeout_s: int = 30, host: str = "127.0.0.1") -> bool:

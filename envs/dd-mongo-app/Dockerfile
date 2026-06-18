@@ -43,7 +43,8 @@ RUN pip install --no-cache-dir 'flask>=3.0' 'flask-sock>=0.7' 'flask-cors>=4.0' 
 
 # Bake in dbapp/ and snapshotter/ so this env works in ANY Domino project,
 # not just Database-Extension. Same shape as dd-postgres-app.
-RUN mkdir -p /opt/dd && curl -fsSL https://codeload.github.com/ddl-nick-goble/Database-Extension/tar.gz/refs/heads/main -o /tmp/dd-src.tar.gz && tar -xzf /tmp/dd-src.tar.gz -C /tmp && cp -r /tmp/Database-Extension-main/dbapp /opt/dd/dbapp && cp -r /tmp/Database-Extension-main/snapshotter /opt/dd/snapshotter && cp /tmp/Database-Extension-main/dbapp/app.sh /opt/dd/app.sh && chmod +x /opt/dd/app.sh && rm -rf /tmp/dd-src.tar.gz /tmp/Database-Extension-main
+ARG GITHUB_TOKEN=
+RUN mkdir -p /opt/dd && ( set -e; if [ -n "$GITHUB_TOKEN" ]; then curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://codeload.github.com/ddl-nick-goble/Database-Extension/tar.gz/refs/heads/main -o /tmp/dd-src.tar.gz; else curl -fsSL https://codeload.github.com/ddl-nick-goble/Database-Extension/tar.gz/refs/heads/main -o /tmp/dd-src.tar.gz; fi && tar -xzf /tmp/dd-src.tar.gz -C /tmp && cp -r /tmp/Database-Extension-main/dbapp /opt/dd/dbapp && cp -r /tmp/Database-Extension-main/snapshotter /opt/dd/snapshotter && cp /tmp/Database-Extension-main/dbapp/app.sh /opt/dd/app.sh && chmod +x /opt/dd/app.sh && rm -rf /tmp/dd-src.tar.gz /tmp/Database-Extension-main ) || echo "[dd] WARN: could not bake dbapp/ from GitHub at build time (private repo without GITHUB_TOKEN, or no network). Image is still valid: DB Apps in THIS project run from /mnt/code/dbapp. For cross-project drop-in, rebuild with --build-arg GITHUB_TOKEN=<pat> or make the repo public."
 
 RUN mkdir -p /mnt/db /var/log/dd && chown -R ubuntu:ubuntu /mnt/db /var/log/dd /opt/dd
 

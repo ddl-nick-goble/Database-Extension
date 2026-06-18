@@ -100,19 +100,6 @@ def _pin_dockerfile_to_commit(dockerfile: str) -> tuple[str, str]:
     return df, f"main (cachebust {token})"
 
 
-def _launcher_pre_run_script() -> str:
-    """Pre-run script for the DB App: write the entry launcher that boots into
-    /opt/dd/app.sh. Config is delivered out-of-band via the DD_CFG_<instance_id>
-    project env var (set in the create flow right after start), so nothing else
-    is written here.
-    """
-    return (
-        "echo '#!/usr/bin/env bash' > /mnt/code/dd-db-launcher.sh\n"
-        "echo 'exec /opt/dd/app.sh \"$@\"' >> /mnt/code/dd-db-launcher.sh\n"
-        "chmod +x /mnt/code/dd-db-launcher.sh\n"
-    )
-
-
 # --------------------------------------------------------------------------
 # Static front-end
 # --------------------------------------------------------------------------
@@ -459,15 +446,30 @@ def api_create_database():
         }
 
         # The pre-run script only writes the entry launcher; the config is
-        # delivered via the DD_CFG_<instance_id> project env var after start.
-        config_script = _launcher_pre_run_script()
-
         yield sse("ok", msg="Config built", ms=since(t2))
 
-        # 4. Create the Domino App with the pre-run script baked in.
+        # 3b. Pin the env's LATEST revision so the App uses the freshly-built
+        #     one — the revision carrying the pre-run script that writes
+        #     /mnt/code/dd-db-launcher.sh. Without pinning, Domino may bind an
+        #     older revision and the launcher never gets written ("entry script
+        #     not found"). The launcher comes ONLY from the env revision; the
+        #     App version has no pre-run-script field.
+        env_rev_id = ""
+        try:
+            env_rev_id = (dapi.environment_latest_revision(env_id) or {}).get("id", "")
+        except Exception as e:
+            yield sse("warn", msg=f"Could not resolve latest env revision: {e}")
+        if env_rev_id:
+            yield sse("ok", msg=f"Pinning env revision {env_rev_id}")
+        else:
+            yield sse("warn", msg="No env revision id — Domino will pick the default "
+                                  "(if it's an old revision the DB may fail to boot; "
+                                  "rebuild the env from the Environments tab)")
+
+        # 4. Create the Domino App, pinned to that revision.
         t3 = time.monotonic()
         yield sse("step", msg=f"Creating app (engine={engine})", phase="create")
-        log.info("provisioning %s engine=%s env=%s hw=%s", full_name, engine, env_id, hw_id)
+        log.info("provisioning %s engine=%s env=%s hw=%s rev=%s", full_name, engine, env_id, hw_id, env_rev_id)
         try:
             a = dapi.create_app(
                 name=full_name,
@@ -476,7 +478,7 @@ def api_create_database():
                 hardware_tier_id=hw_id,
                 entry_point="dd-db-launcher.sh",
                 project_id=target_project_id,
-                pre_run_script=config_script,
+                environment_revision_id=env_rev_id,
             )
         except dapi.DominoApiError as e:
             log.warning("create failed: %s", e)

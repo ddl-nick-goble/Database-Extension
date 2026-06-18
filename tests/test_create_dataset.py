@@ -81,23 +81,6 @@ def test_backup_dataset_path_is_scannable_by_lifecycle(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _launcher_pre_run_script — writes only the entry launcher (no config)
-# ---------------------------------------------------------------------------
-def test_launcher_pre_run_script_writes_launcher():
-    script = app._launcher_pre_run_script()
-    assert "dd-db-launcher.sh" in script
-    assert "exec /opt/dd/app.sh" in script
-
-
-def test_launcher_pre_run_script_carries_no_config():
-    # Config is delivered via DD_CFG_<instance_id>, never baked into the script.
-    script = app._launcher_pre_run_script()
-    assert "DD_CFG" not in script
-    assert "_dd_configs" not in script
-    assert "base64" not in script
-
-
-# ---------------------------------------------------------------------------
 # api_create_database — end-to-end create flow (SSE generator)
 # ---------------------------------------------------------------------------
 def _collect_sse(resp):
@@ -160,6 +143,9 @@ def fake_domino(monkeypatch):
     monkeypatch.setattr(dapi, "start_app", _start_app)
     monkeypatch.setattr(dapi, "get_app", _get_app)
     monkeypatch.setattr(dapi, "set_project_env_var", _set_env)
+    # Latest env revision — the create flow pins it so the App uses the build
+    # that carries the launcher pre-run script.
+    monkeypatch.setattr(dapi, "environment_latest_revision", lambda env_id: {"id": "rev-46"})
     # Skip the 8s-per-attempt start wait.
     monkeypatch.setattr(app.time, "sleep", lambda *_a, **_k: None)
     return calls
@@ -206,10 +192,21 @@ def test_create_delivers_config_via_instance_env_var(wizard_client, fake_domino)
     assert cfg["snapshot_dir"] == "/mnt/data/db-pg-market"
     assert cfg["db_id"] == "pg-market"
 
-    # The app's pre-run script is launcher-only — no config baked in.
+    # The app is created in the target project, pinned to the latest env
+    # revision (which carries the launcher pre-run script).
     create_kwargs = fake_domino["create_app"][0]
-    assert "DD_CFG" not in create_kwargs["pre_run_script"]
     assert create_kwargs["project_id"] == "target-proj"
+    assert create_kwargs["environment_revision_id"] == "rev-46"
+
+
+def test_create_pins_latest_env_revision(wizard_client, fake_domino):
+    resp = wizard_client.post("/api/databases", json={
+        "engine": "postgres", "name": "market",
+        "environmentId": "env-1", "hardwareTierId": "hw-1",
+        "password": "secret", "projectId": "target-proj",
+    })
+    _collect_sse(resp)
+    assert fake_domino["create_app"][0]["environment_revision_id"] == "rev-46"
 
 
 def test_create_sets_snapshot_env_var_to_dataset(wizard_client, fake_domino):

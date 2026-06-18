@@ -450,21 +450,24 @@ def create_app(
     visibility: str = "GRANT_BASED",
     entry_point: str = "dd-db-launcher.sh",
     project_id: str | None = None,
-    pre_run_script: str = "",
+    environment_revision_id: str = "",
 ) -> dict:
     """Create the App and bind it to the chosen environment.
 
-    pre_run_script is embedded in the version definition so it runs before
-    the entry script on every start — this is the only reliable cross-project
-    config delivery mechanism (start-time environmentVariables/preRunScript
-    are silently ignored by some Domino versions).
+    environment_revision_id PINS a specific env revision. Pass the latest one
+    so the App uses the freshly-built revision — the one carrying the env
+    pre-run script that writes /mnt/code/dd-db-launcher.sh. Without it, Domino
+    may bind an older revision (created before the pre-run script existed), and
+    the launcher never gets written → "entry script not found" at boot.
+    (Note: AppVersionCreationRequest has no preRunScript field — the launcher
+    comes solely from the ENV revision's pre-run script.)
     """
     version: dict = {
         "hardwareTierId": hardware_tier_id,
         "environmentId": environment_id,
     }
-    if pre_run_script:
-        version["preRunScript"] = pre_run_script
+    if environment_revision_id:
+        version["environmentRevisionId"] = environment_revision_id
     return _post("/api/apps/beta/apps", json={
         "projectId": project_id or PROJECT_ID,
         "name": name,

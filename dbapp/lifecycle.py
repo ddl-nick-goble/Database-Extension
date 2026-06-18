@@ -172,39 +172,60 @@ def find_config() -> dict:
     return json.loads(candidates[0].read_text())
 
 
+def _domino_api_bases() -> list[str]:
+    """API base URLs to try, in order. The in-pod auth proxy (localhost:8899)
+    is preferred, but it isn't always listening yet when an App's entry script
+    runs at boot — so we also fall back to the public nucleus host, reachable
+    over the network and authenticated by DOMINO_USER_API_KEY, independent of
+    the local sidecar's startup timing.
+    """
+    bases: list[str] = []
+    proxy = os.environ.get("DOMINO_API_PROXY", "http://localhost:8899")
+    if proxy:
+        bases.append(proxy.rstrip("/"))
+    host = (os.environ.get("DOMINO_API_HOST")
+            or os.environ.get("DOMINO_PUBLIC_HOST", "")).rstrip("/")
+    if host and host not in bases:
+        bases.append(host)
+    return bases
+
+
 def _fetch_apps_via_api() -> list[dict]:
-    """List this project's Apps via a direct call to the in-pod auth proxy.
+    """List this project's Apps via a direct Domino API call.
 
     Self-contained on purpose: uses `requests` (baked into every DB image) and
     the standard DOMINO_* env vars, NOT the project's domino_api.py — that
     module only exists in the Database-Extension repo, so importing it failed
     in every other project (the "No module named 'domino_api'" you saw).
+
+    Tries the in-pod proxy first, then the public host (see _domino_api_bases).
     """
-    proxy = os.environ.get("DOMINO_API_PROXY", "http://localhost:8899")
     api_key = os.environ.get("DOMINO_USER_API_KEY", "")
     project_id = os.environ.get("DOMINO_PROJECT_ID", "")
     if not (api_key and project_id):
         sys.stderr.write("[lifecycle] no API key / project id — skipping API lookup\n")
         return []
-    try:
-        import requests
-        r = requests.get(
-            f"{proxy}/v4/modelProducts",
-            params={"projectId": project_id},
-            headers={"X-Domino-Api-Key": api_key},
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        sys.stderr.write(f"[lifecycle] app list via API failed: {e}\n")
+    import requests
+    for base in _domino_api_bases():
+        try:
+            r = requests.get(
+                f"{base}/v4/modelProducts",
+                params={"projectId": project_id},
+                headers={"X-Domino-Api-Key": api_key},
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            sys.stderr.write(f"[lifecycle] app list via API failed ({base}): {e}\n")
+            continue
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for k in ("data", "items", "results"):
+                if isinstance(data.get(k), list):
+                    return data[k]
         return []
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for k in ("data", "items", "results"):
-            if isinstance(data.get(k), list):
-                return data[k]
     return []
 
 
@@ -217,17 +238,43 @@ def _app_from_run_id(run_id: str) -> dict | None:
     return None
 
 
-def _config_from_project_env(run_id: str) -> dict | None:
+def _config_from_project_env(run_id: str, timeout_s: float = 45, poll_s: float = 3) -> dict | None:
     """Resolve our app_id from `run_id`, then decode the base64 config the
-    wizard stashed as project env var DD_CFG_<app_id>. Returns None if the app
-    can't be resolved or no such var is set (caller falls through)."""
+    wizard stashed as project env var DD_CFG_<app_id>.
+
+    The app_id lookup needs the Domino API, and the in-pod proxy may not be
+    listening yet when this runs at App boot (Connection refused) — so we retry
+    with a short backoff for up to `timeout_s` while it (or the public host)
+    comes up. Returns None if the app still can't be resolved or no var is set.
+    """
     import base64
-    app = _app_from_run_id(run_id)
-    if not app:
-        return None
+    import time as _time
+
+    deadline = _time.monotonic() + timeout_s
+    attempt = 0
+    app = None
+    while True:
+        attempt += 1
+        app = _app_from_run_id(run_id)
+        if app is not None:
+            break
+        if _time.monotonic() >= deadline:
+            sys.stderr.write(
+                f"[lifecycle] could not resolve app_id from run_id={run_id} via API "
+                f"after {attempt} attempts (proxy/public host unreachable)\n"
+            )
+            return None
+        sys.stderr.write(
+            f"[lifecycle] API not ready (attempt {attempt}) — waiting for app_id resolution…\n"
+        )
+        _time.sleep(3)
+
     app_id = app.get("id", "")
     raw = os.environ.get(f"DD_CFG_{app_id.upper()}", "") if app_id else ""
     if not raw:
+        sys.stderr.write(
+            f"[lifecycle] resolved app_id={app_id} but no DD_CFG_{app_id.upper()} env var set\n"
+        )
         return None
     try:
         cfg = json.loads(base64.b64decode(raw).decode())
